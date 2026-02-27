@@ -405,9 +405,10 @@ export function createBrowserTool(opts?: {
             return formatTabsToolResult(tabs);
           }
         case "open": {
-          const targetUrl = readStringParam(params, "targetUrl", {
-            required: true,
-          });
+          // Accept both "targetUrl" and "url" for compatibility (url is a common alias)
+          const targetUrl =
+            readStringParam(params, "targetUrl") ??
+            readStringParam(params, "url", { required: true, label: "targetUrl" });
           if (proxyRequest) {
             const result = await proxyRequest({
               method: "POST",
@@ -635,9 +636,10 @@ export function createBrowserTool(opts?: {
           });
         }
         case "navigate": {
-          const targetUrl = readStringParam(params, "targetUrl", {
-            required: true,
-          });
+          // Accept both "targetUrl" and "url" for compatibility (url is a common alias)
+          const targetUrl =
+            readStringParam(params, "targetUrl") ??
+            readStringParam(params, "url", { required: true, label: "targetUrl" });
           const targetId = readStringParam(params, "targetId");
           if (proxyRequest) {
             const result = await proxyRequest({
