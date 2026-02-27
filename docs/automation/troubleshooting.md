@@ -29,6 +29,35 @@ openclaw cron list
 openclaw system heartbeat last
 ```
 
+## Cron validation errors (cron.add fails)
+
+When `cron.add` fails with validation errors, check these common issues:
+
+```bash
+# Check recent logs for validation errors
+openclaw logs --tail 50 | grep -i "validation\|required\|invalid"
+```
+
+Common validation error signatures:
+
+- `must have required property 'name'` → Job object missing `name` field.
+- `must have required property 'sessionTarget'` → Missing `sessionTarget: "main"` or `"isolated"`.
+- `must have required property 'payload'` → Missing `payload` object.
+- `at /schedule: must have required property 'kind'` → Schedule must be an object with `kind` field.
+- `at /payload: must have required property 'text'` → systemEvent payload needs `text` field.
+- `at /payload: must have required property 'message'` → agentTurn payload needs `message` field.
+
+**Quick fix checklist:**
+
+1. Is `schedule` an object (not a string)? → `{ "kind": "cron", "expr": "..." }`
+2. Does `schedule` have a `kind` field? → `"at"`, `"every"`, or `"cron"`
+3. Is `sessionTarget` present? → `"main"` or `"isolated"`
+4. Does payload text field match payload kind?
+   - `systemEvent` → `payload.text`
+   - `agentTurn` → `payload.message`
+
+See [cron-jobs.md#common-mistakes](/automation/cron-jobs#common-mistakes) for examples.
+
 ## Cron not firing
 
 ```bash
