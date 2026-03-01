@@ -1,3 +1,20 @@
+/**
+ * Cron Tool - Schedule and manage recurring jobs via the gateway.
+ *
+ * This tool provides a comprehensive interface for managing cron jobs:
+ * - `status`: Check cron service status and statistics
+ * - `list`: List all scheduled jobs (optionally including disabled)
+ * - `add`: Create a new cron job with schedule and delivery config
+ * - `update`: Modify an existing job's properties
+ * - `remove`: Delete a scheduled job
+ * - `run`: Manually trigger a job (due or forced)
+ * - `runs`: View job execution history
+ * - `wake`: Wake up the cron service
+ *
+ * Jobs can deliver messages to channels, sessions, or webhooks on schedule.
+ *
+ * @module agents/tools/cron-tool
+ */
 import { Type } from "@sinclair/typebox";
 import { loadConfig } from "../../config/config.js";
 import { normalizeCronJobCreate, normalizeCronJobPatch } from "../../cron/normalize.js";
@@ -61,7 +78,11 @@ type ChatMessage = {
   content?: unknown;
 };
 
-function stripExistingContext(text: string) {
+/**
+ * Strip any existing context marker and content from reminder text.
+ * This prevents context from accumulating across multiple job updates.
+ */
+function stripExistingContext(text: string): string {
   const index = text.indexOf(REMINDER_CONTEXT_MARKER);
   if (index === -1) {
     return text;
@@ -69,7 +90,11 @@ function stripExistingContext(text: string) {
   return text.slice(0, index).trim();
 }
 
-function truncateText(input: string, maxLen: number) {
+/**
+ * Truncate text to a maximum length, adding ellipsis if needed.
+ * Handles UTF-16 surrogate pairs correctly to avoid corruption.
+ */
+function truncateText(input: string, maxLen: number): string {
   if (input.length <= maxLen) {
     return input;
   }
@@ -77,6 +102,10 @@ function truncateText(input: string, maxLen: number) {
   return `${truncated}...`;
 }
 
+/**
+ * Extract text content from a chat message for context building.
+ * Only processes user and assistant messages; ignores system/tool messages.
+ */
 function extractMessageText(message: ChatMessage): { role: string; text: string } | null {
   const role = typeof message.role === "string" ? message.role : "";
   if (role !== "user" && role !== "assistant") {
@@ -204,6 +233,27 @@ function inferDeliveryFromSessionKey(agentSessionKey?: string): CronDelivery | n
   return delivery;
 }
 
+/**
+ * Create the cron management tool for agent use.
+ *
+ * The cron tool allows agents to schedule recurring tasks, manage existing jobs,
+ * and view execution history. It communicates with the gateway service to perform
+ * actual cron operations.
+ *
+ * @param opts - Optional configuration for the tool
+ * @param opts.agentSessionKey - Session key for context injection into reminders
+ * @param deps - Optional dependency injection (primarily for testing)
+ * @param deps.callGatewayTool - Custom gateway caller implementation
+ * @returns An agent tool instance configured for cron management
+ *
+ * @example
+ * // Create a basic cron tool
+ * const cronTool = createCronTool();
+ *
+ * @example
+ * // Create with session context for reminders
+ * const cronTool = createCronTool({ agentSessionKey: 'telegram:user:123' });
+ */
 export function createCronTool(opts?: CronToolOptions, deps?: CronToolDeps): AnyAgentTool {
   const callGateway = deps?.callGatewayTool ?? callGatewayTool;
   return {
