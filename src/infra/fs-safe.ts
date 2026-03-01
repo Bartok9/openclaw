@@ -16,12 +16,32 @@ export type SafeOpenErrorCode =
   | "path-mismatch"
   | "too-large";
 
+/**
+ * Provides user-friendly descriptions for SafeOpenError codes.
+ * These descriptions help users understand what went wrong and how to fix it.
+ */
+export const SAFE_OPEN_ERROR_DESCRIPTIONS: Record<SafeOpenErrorCode, string> = {
+  "invalid-path":
+    "The path is invalid or not allowed (may contain prohibited characters or patterns)",
+  "not-found": "The file or directory does not exist at the specified path",
+  "outside-workspace":
+    "Access denied: the path resolves outside the allowed workspace boundary. " +
+    "Use a path within your workspace directory.",
+  symlink: "Symbolic links are not allowed for security reasons",
+  "not-file": "The path exists but is not a regular file (may be a directory or special file)",
+  "path-mismatch": "The file path changed unexpectedly during the operation (possible race condition)",
+  "too-large": "The file exceeds the maximum allowed size limit",
+};
+
 export class SafeOpenError extends Error {
   code: SafeOpenErrorCode;
+  /** User-friendly description of the error */
+  description: string;
 
   constructor(code: SafeOpenErrorCode, message: string, options?: ErrorOptions) {
     super(message, options);
     this.code = code;
+    this.description = SAFE_OPEN_ERROR_DESCRIPTIONS[code];
     this.name = "SafeOpenError";
   }
 }
@@ -37,6 +57,17 @@ export type SafeLocalReadResult = {
   realPath: string;
   stat: Stats;
 };
+
+/**
+ * Generate a descriptive error message for outside-workspace errors.
+ * Includes the attempted path and workspace root for debugging.
+ */
+function outsideWorkspaceMessage(attemptedPath: string, workspaceRoot: string): string {
+  return (
+    `Path "${attemptedPath}" is outside the allowed workspace boundary "${workspaceRoot}". ` +
+    `For security, file operations are restricted to paths within your workspace.`
+  );
+}
 
 const SUPPORTS_NOFOLLOW = process.platform !== "win32" && "O_NOFOLLOW" in fsConstants;
 const OPEN_READ_FLAGS = fsConstants.O_RDONLY | (SUPPORTS_NOFOLLOW ? fsConstants.O_NOFOLLOW : 0);
@@ -121,7 +152,10 @@ export async function openFileWithinRoot(params: {
   const rootWithSep = ensureTrailingSep(rootReal);
   const resolved = path.resolve(rootWithSep, params.relativePath);
   if (!isPathInside(rootWithSep, resolved)) {
-    throw new SafeOpenError("outside-workspace", "file is outside workspace root");
+    throw new SafeOpenError(
+      "outside-workspace",
+      outsideWorkspaceMessage(params.relativePath, params.rootDir),
+    );
   }
 
   let opened: SafeOpenResult;
@@ -146,7 +180,10 @@ export async function openFileWithinRoot(params: {
 
   if (!isPathInside(rootWithSep, opened.realPath)) {
     await opened.handle.close().catch(() => {});
-    throw new SafeOpenError("outside-workspace", "file is outside workspace root");
+    throw new SafeOpenError(
+      "outside-workspace",
+      outsideWorkspaceMessage(opened.realPath, params.rootDir),
+    );
   }
 
   return opened;
@@ -190,7 +227,10 @@ export async function writeFileWithinRoot(params: {
   const rootWithSep = ensureTrailingSep(rootReal);
   const resolved = path.resolve(rootWithSep, params.relativePath);
   if (!isPathInside(rootWithSep, resolved)) {
-    throw new SafeOpenError("outside-workspace", "file is outside workspace root");
+    throw new SafeOpenError(
+      "outside-workspace",
+      outsideWorkspaceMessage(params.relativePath, params.rootDir),
+    );
   }
   try {
     await assertNoPathAliasEscape({
@@ -209,7 +249,10 @@ export async function writeFileWithinRoot(params: {
   try {
     const resolvedRealPath = await fs.realpath(resolved);
     if (!isPathInside(rootWithSep, resolvedRealPath)) {
-      throw new SafeOpenError("outside-workspace", "file is outside workspace root");
+      throw new SafeOpenError(
+        "outside-workspace",
+        outsideWorkspaceMessage(resolvedRealPath, params.rootDir),
+      );
     }
     ioPath = resolvedRealPath;
   } catch (err) {
@@ -255,7 +298,10 @@ export async function writeFileWithinRoot(params: {
       throw new SafeOpenError("invalid-path", "hardlinked path not allowed");
     }
     if (!isPathInside(rootWithSep, realPath)) {
-      throw new SafeOpenError("outside-workspace", "file is outside workspace root");
+      throw new SafeOpenError(
+        "outside-workspace",
+        outsideWorkspaceMessage(realPath, params.rootDir),
+      );
     }
 
     if (typeof params.data === "string") {
