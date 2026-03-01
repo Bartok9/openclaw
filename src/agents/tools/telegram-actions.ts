@@ -11,9 +11,11 @@ import {
   createForumTopicTelegram,
   deleteMessageTelegram,
   editMessageTelegram,
+  pinMessageTelegram,
   reactMessageTelegram,
   sendMessageTelegram,
   sendStickerTelegram,
+  unpinMessageTelegram,
 } from "../../telegram/send.js";
 import { getCacheStats, searchStickers } from "../../telegram/sticker-cache.js";
 import { resolveTelegramToken } from "../../telegram/token.js";
@@ -265,6 +267,66 @@ export async function handleTelegramAction(
       accountId: accountId ?? undefined,
     });
     return jsonResult({ ok: true, deleted: true });
+  }
+
+  if (action === "pin") {
+    if (!isActionEnabled("pin")) {
+      throw new Error("Telegram pin is disabled.");
+    }
+    const chatId = readStringOrNumberParam(params, "chatId", {
+      required: true,
+    });
+    const messageId = readNumberParam(params, "messageId", {
+      required: true,
+      integer: true,
+    });
+    const disableNotification =
+      params.disableNotification === true ||
+      params.disableNotification === "true" ||
+      params.silent === true ||
+      params.silent === "true";
+    const token = resolveTelegramToken(cfg, { accountId }).token;
+    if (!token) {
+      throw new Error(
+        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
+      );
+    }
+    await pinMessageTelegram(chatId ?? "", messageId ?? 0, {
+      token,
+      accountId: accountId ?? undefined,
+      disableNotification,
+    });
+    return jsonResult({ ok: true, pinned: true, messageId });
+  }
+
+  if (action === "unpin") {
+    if (!isActionEnabled("unpin")) {
+      throw new Error("Telegram unpin is disabled.");
+    }
+    const chatId = readStringOrNumberParam(params, "chatId", {
+      required: true,
+    });
+    // messageId is optional for unpin - if not provided, unpins all messages
+    const messageId = readNumberParam(params, "messageId", {
+      required: false,
+      integer: true,
+    });
+    const token = resolveTelegramToken(cfg, { accountId }).token;
+    if (!token) {
+      throw new Error(
+        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
+      );
+    }
+    await unpinMessageTelegram(chatId ?? "", messageId ?? undefined, {
+      token,
+      accountId: accountId ?? undefined,
+    });
+    const unpinnedAll = messageId == null || messageId === 0;
+    return jsonResult({
+      ok: true,
+      unpinned: true,
+      ...(unpinnedAll ? { all: true } : { messageId }),
+    });
   }
 
   if (action === "editMessage") {

@@ -829,6 +829,113 @@ export async function deleteMessageTelegram(
   return { ok: true };
 }
 
+type TelegramPinOpts = {
+  token?: string;
+  accountId?: string;
+  verbose?: boolean;
+  api?: TelegramApiOverride;
+  retry?: RetryConfig;
+  /** Send notification to all chat members about the pinned message. Defaults to true. */
+  disableNotification?: boolean;
+};
+
+/**
+ * Pin a message in a Telegram chat.
+ * Requires the bot to have `can_pin_messages` permission in groups/supergroups,
+ * or `can_edit_messages` in channels.
+ *
+ * @param chatIdInput - Chat ID where the message is located
+ * @param messageIdInput - ID of the message to pin
+ * @param opts - Optional configuration
+ */
+export async function pinMessageTelegram(
+  chatIdInput: string | number,
+  messageIdInput: string | number,
+  opts: TelegramPinOpts = {},
+): Promise<{ ok: true }> {
+  const { cfg, account, api } = resolveTelegramApiContext(opts);
+  const rawTarget = String(chatIdInput);
+  const chatId = await resolveAndPersistChatId({
+    cfg,
+    api,
+    lookupTarget: rawTarget,
+    persistTarget: rawTarget,
+    verbose: opts.verbose,
+  });
+  const messageId = normalizeMessageId(messageIdInput);
+  const requestWithDiag = createTelegramRequestWithDiag({
+    cfg,
+    account,
+    retry: opts.retry,
+    verbose: opts.verbose,
+    shouldRetry: (err) => isRecoverableTelegramNetworkError(err, { context: "send" }),
+  });
+
+  const extra = opts.disableNotification === true ? { disable_notification: true } : undefined;
+  await requestWithDiag(() => api.pinChatMessage(chatId, messageId, extra), "pinChatMessage");
+  logVerbose(`[telegram] Pinned message ${messageId} in chat ${chatId}`);
+  return { ok: true };
+}
+
+type TelegramUnpinOpts = {
+  token?: string;
+  accountId?: string;
+  verbose?: boolean;
+  api?: TelegramApiOverride;
+  retry?: RetryConfig;
+};
+
+/**
+ * Unpin a message in a Telegram chat.
+ * If messageId is provided, unpins that specific message.
+ * If messageId is omitted or 0, unpins all messages in the chat.
+ *
+ * Requires the bot to have `can_pin_messages` permission in groups/supergroups,
+ * or `can_edit_messages` in channels.
+ *
+ * @param chatIdInput - Chat ID where the message is located
+ * @param messageIdInput - ID of the message to unpin, or 0/undefined to unpin all
+ * @param opts - Optional configuration
+ */
+export async function unpinMessageTelegram(
+  chatIdInput: string | number,
+  messageIdInput?: string | number,
+  opts: TelegramUnpinOpts = {},
+): Promise<{ ok: true }> {
+  const { cfg, account, api } = resolveTelegramApiContext(opts);
+  const rawTarget = String(chatIdInput);
+  const chatId = await resolveAndPersistChatId({
+    cfg,
+    api,
+    lookupTarget: rawTarget,
+    persistTarget: rawTarget,
+    verbose: opts.verbose,
+  });
+  const requestWithDiag = createTelegramRequestWithDiag({
+    cfg,
+    account,
+    retry: opts.retry,
+    verbose: opts.verbose,
+    shouldRetry: (err) => isRecoverableTelegramNetworkError(err, { context: "send" }),
+  });
+
+  const messageId = messageIdInput != null ? normalizeMessageId(messageIdInput) : 0;
+
+  if (messageId === 0) {
+    // Unpin all messages
+    await requestWithDiag(() => api.unpinAllChatMessages(chatId), "unpinAllChatMessages");
+    logVerbose(`[telegram] Unpinned all messages in chat ${chatId}`);
+  } else {
+    // Unpin specific message
+    await requestWithDiag(
+      () => api.unpinChatMessage(chatId, { message_id: messageId }),
+      "unpinChatMessage",
+    );
+    logVerbose(`[telegram] Unpinned message ${messageId} in chat ${chatId}`);
+  }
+  return { ok: true };
+}
+
 type TelegramEditOpts = {
   token?: string;
   accountId?: string;
