@@ -10,7 +10,12 @@ import {
 } from "./infra/home-dir.js";
 import { isPlainObject } from "./infra/plain-object.js";
 
-export async function ensureDir(dir: string) {
+/**
+ * Ensure a directory exists, creating it and any parent directories if needed.
+ *
+ * @param dir - Path to the directory to create
+ */
+export async function ensureDir(dir: string): Promise<void> {
   await fs.promises.mkdir(dir, { recursive: true });
 }
 
@@ -26,10 +31,31 @@ export async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Clamp a number to a specified range [min, max].
+ *
+ * @param value - The number to clamp
+ * @param min - Minimum allowed value
+ * @param max - Maximum allowed value
+ * @returns The clamped value
+ *
+ * @example
+ * clampNumber(15, 0, 10) // Returns: 10
+ * clampNumber(-5, 0, 10) // Returns: 0
+ * clampNumber(5, 0, 10)  // Returns: 5
+ */
 export function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * Clamp a number to an integer range [min, max], flooring the value first.
+ *
+ * @param value - The number to clamp (will be floored)
+ * @param min - Minimum allowed integer value
+ * @param max - Maximum allowed integer value
+ * @returns The clamped integer value
+ */
 export function clampInt(value: number, min: number, max: number): number {
   return clampNumber(Math.floor(value), min, max);
 }
@@ -73,6 +99,12 @@ export function assertWebChannel(input: string): asserts input is WebChannel {
   }
 }
 
+/**
+ * Normalize a path to ensure it starts with a forward slash.
+ *
+ * @param p - Path to normalize
+ * @returns Path with leading slash
+ */
 export function normalizePath(p: string): string {
   if (!p.startsWith("/")) {
     return `/${p}`;
@@ -80,10 +112,28 @@ export function normalizePath(p: string): string {
   return p;
 }
 
+/**
+ * Add WhatsApp prefix to a phone number if not already present.
+ *
+ * @param number - Phone number (with or without prefix)
+ * @returns Phone number with "whatsapp:" prefix
+ */
 export function withWhatsAppPrefix(number: string): string {
   return number.startsWith("whatsapp:") ? number : `whatsapp:${number}`;
 }
 
+/**
+ * Normalize a phone number to E.164 format (international standard).
+ *
+ * Strips any "whatsapp:" prefix and non-digit characters, then ensures
+ * the number starts with a "+" sign.
+ *
+ * @param number - Phone number in any format
+ * @returns Phone number in E.164 format (e.g., "+14155551234")
+ *
+ * @example
+ * normalizeE164("whatsapp:+1 (415) 555-1234") // Returns: "+14155551234"
+ */
 export function normalizeE164(number: string): string {
   const withoutPrefix = number.replace(/^whatsapp:/, "").trim();
   const digits = withoutPrefix.replace(/[^\d+]/g, "");
