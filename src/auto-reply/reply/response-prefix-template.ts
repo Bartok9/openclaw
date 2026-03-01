@@ -99,3 +99,64 @@ export function hasTemplateVariables(template: string | undefined): boolean {
   TEMPLATE_VAR_PATTERN.lastIndex = 0;
   return TEMPLATE_VAR_PATTERN.test(template);
 }
+
+/** All supported template variable names (lowercase normalized) */
+export const SUPPORTED_TEMPLATE_VARS = [
+  "model",
+  "modelfull",
+  "provider",
+  "thinkinglevel",
+  "think",
+  "identity.name",
+  "identityname",
+] as const;
+
+export type SupportedTemplateVar = (typeof SUPPORTED_TEMPLATE_VARS)[number];
+
+/**
+ * Extract all template variable names from a template string.
+ *
+ * @param template - The template string to analyze
+ * @returns Array of variable names found in the template (case-preserved)
+ *
+ * @example
+ * listTemplateVariables("[{model} | {Provider}]")
+ * // Returns: ["model", "Provider"]
+ */
+export function listTemplateVariables(template: string | undefined): string[] {
+  if (!template) {
+    return [];
+  }
+  const variables: string[] = [];
+  // Use a fresh regex to avoid lastIndex issues
+  const pattern = /\{([a-zA-Z][a-zA-Z0-9.]*)\}/g;
+  let match;
+  while ((match = pattern.exec(template)) !== null) {
+    variables.push(match[1]);
+  }
+  return variables;
+}
+
+/**
+ * Validate a template string and return any unrecognized variables.
+ *
+ * @param template - The template string to validate
+ * @returns Object with validation result and list of unknown variables
+ *
+ * @example
+ * validateResponsePrefixTemplate("[{model} | {unknown}]")
+ * // Returns: { valid: false, unknownVars: ["unknown"] }
+ */
+export function validateResponsePrefixTemplate(template: string | undefined): {
+  valid: boolean;
+  unknownVars: string[];
+} {
+  const variables = listTemplateVariables(template);
+  const unknownVars = variables.filter(
+    (v) => !SUPPORTED_TEMPLATE_VARS.includes(v.toLowerCase() as SupportedTemplateVar),
+  );
+  return {
+    valid: unknownVars.length === 0,
+    unknownVars,
+  };
+}
