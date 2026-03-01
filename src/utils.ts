@@ -233,7 +233,13 @@ export async function resolveJidToE164(
   }
 }
 
-export function sleep(ms: number) {
+/**
+ * Sleep for a specified number of milliseconds.
+ *
+ * @param ms - Milliseconds to sleep
+ * @returns Promise that resolves after the delay
+ */
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -366,14 +372,35 @@ export function shortenHomeInString(input: string): string {
   return input.split(display.home).join(display.prefix);
 }
 
+/**
+ * Shorten a path by replacing home directory with ~ or $OPENCLAW_HOME.
+ */
 export function displayPath(input: string): string {
   return shortenHomePath(input);
 }
 
+/**
+ * Shorten all occurrences of home directory in a string.
+ */
 export function displayString(input: string): string {
   return shortenHomeInString(input);
 }
 
+/**
+ * Format a clickable terminal hyperlink using OSC 8 escape sequences.
+ *
+ * @param label - Display text for the link
+ * @param url - URL to link to
+ * @param opts - Options for fallback behavior
+ * @param opts.fallback - Fallback text when terminal doesn't support links
+ * @param opts.force - Force link formatting (true) or plain text (false)
+ * @returns Formatted terminal link or fallback text
+ *
+ * @example
+ * formatTerminalLink("OpenClaw", "https://openclaw.dev")
+ * // In TTY: clickable "OpenClaw" link
+ * // Outside TTY: "OpenClaw (https://openclaw.dev)"
+ */
 export function formatTerminalLink(
   label: string,
   url: string,
