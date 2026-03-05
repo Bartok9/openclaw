@@ -492,12 +492,34 @@ Successfully processed 1 files`;
       expectTrustedOnly([aclEntry({ principal: "AUTORIDAD NT\\SYSTEM" })]);
     });
 
+    it("classifies Russian SYSTEM (NT AUTHORITY\\СИСТЕМА) as trusted", () => {
+      // Russian Cyrillic СИСТЕМА = SYSTEM
+      expectTrustedOnly([aclEntry({ principal: "NT AUTHORITY\\СИСТЕМА" })]);
+    });
+
+    it("classifies standalone Russian СИСТЕМА as trusted", () => {
+      expectTrustedOnly([aclEntry({ principal: "СИСТЕМА" })]);
+    });
+
     it("French Windows full scenario: user + Système only → no untrusted", () => {
       const entries: WindowsAclEntry[] = [
         aclEntry({ principal: "MYPC\\Pierre" }),
         aclEntry({ principal: "AUTORITE NT\\Système" }),
       ];
       const env = { USERNAME: "Pierre", USERDOMAIN: "MYPC" };
+      const { trusted, untrustedWorld, untrustedGroup } = summarizeWindowsAcl(entries, env);
+      expect(trusted).toHaveLength(2);
+      expect(untrustedWorld).toHaveLength(0);
+      expect(untrustedGroup).toHaveLength(0);
+    });
+
+    it("Russian Windows full scenario: user + СИСТЕМА only → no untrusted (issue #35834)", () => {
+      // Reproduces the false positive reported in issue #35834 on Russian Windows
+      const entries: WindowsAclEntry[] = [
+        aclEntry({ principal: "WIN-1OJ4F69CGN3\\user" }),
+        aclEntry({ principal: "NT AUTHORITY\\СИСТЕМА", rawRights: "(OI)(CI)(F)" }),
+      ];
+      const env = { USERNAME: "user", USERDOMAIN: "WIN-1OJ4F69CGN3" };
       const { trusted, untrustedWorld, untrustedGroup } = summarizeWindowsAcl(entries, env);
       expect(trusted).toHaveLength(2);
       expect(untrustedWorld).toHaveLength(0);
