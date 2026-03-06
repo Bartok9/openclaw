@@ -14,6 +14,67 @@ import {
 
 type ModelsConfig = NonNullable<OpenClawConfig["models"]>;
 
+/**
+ * Check if a string looks like an environment variable name rather than a
+ * resolved secret value. Env var names are UPPER_SNAKE_CASE. Resolved secrets
+ * are typically longer and contain mixed-case alphanumeric characters, dashes,
+ * underscores in non-UPPER_SNAKE_CASE patterns.
+ *
+ * Special cases:
+ * - "ollama-local" and similar synthetic markers are preserved
+ * - "aws-sdk" auth mode markers are preserved
+ */
+function isEnvVarNameOrMarker(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  // Synthetic local provider markers (e.g., "ollama-local")
+  if (trimmed === "ollama-local") {
+    return true;
+  }
+
+  // AWS SDK auth marker
+  if (trimmed === "aws-sdk") {
+    return true;
+  }
+
+  // Environment variable name pattern: UPPER_SNAKE_CASE
+  // Must start with letter, contain only uppercase letters, digits, underscores
+  // Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, AWS_ACCESS_KEY_ID
+  return /^[A-Z][A-Z0-9_]*$/.test(trimmed);
+}
+
+/**
+ * Redact resolved secret values from provider configs before writing to disk.
+ * Preserves env var names (UPPER_SNAKE_CASE) and special markers, but strips
+ * actual resolved API keys to prevent plaintext secrets in models.json.
+ */
+function redactResolvedSecrets(
+  providers: Record<string, ProviderConfig>,
+): Record<string, ProviderConfig> {
+  const redacted: Record<string, ProviderConfig> = {};
+
+  for (const [key, provider] of Object.entries(providers)) {
+    const { apiKey, ...rest } = provider;
+
+    // If apiKey is undefined or empty, or looks like an env var name/marker, preserve it
+    if (
+      apiKey === undefined ||
+      apiKey === "" ||
+      (typeof apiKey === "string" && isEnvVarNameOrMarker(apiKey))
+    ) {
+      redacted[key] = provider;
+    } else {
+      // apiKey looks like a resolved secret - strip it
+      redacted[key] = rest as ProviderConfig;
+    }
+  }
+
+  return redacted;
+}
+
 const DEFAULT_MODE: NonNullable<ModelsConfig["mode"]> = "merge";
 
 function resolvePreferredTokenLimit(explicitValue: number, implicitValue: number): number {
@@ -231,7 +292,13 @@ export async function ensureOpenClawModelsJson(
     providers: mergedProviders,
     agentDir,
   });
-  const next = `${JSON.stringify({ providers: normalizedProviders }, null, 2)}\n`;
+
+  // Redact resolved secrets before writing to disk. This ensures that
+  // regardless of how secrets were resolved (env vars, SecretRef providers,
+  // etc.), only env var names are persisted, not plaintext API keys.
+  // See: https://github.com/OpenClaw/openclaw/issues/37512
+  const safeProviders = redactResolvedSecrets(normalizedProviders);
+  const next = `${JSON.stringify({ providers: safeProviders }, null, 2)}\n`;
   const existingRaw = await readRawFile(targetPath);
 
   if (existingRaw === next) {
