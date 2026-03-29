@@ -266,8 +266,14 @@ export function applyWindowsSpawnProgramPolicy(params: {
     };
   }
   if (params.allowShellFallback !== false) {
+    // Quote the command if it contains spaces to prevent shell parsing issues on Windows.
+    // Without quoting, Windows cmd.exe splits the path at spaces (e.g., "C:\Users\Bipul Nandi\..."
+    // becomes "C:\Users\Bipul" which fails with "not recognized as an internal or external command").
+    const command = params.candidate.command.includes(" ")
+      ? `"${params.candidate.command}"`
+      : params.candidate.command;
     return {
-      command: params.candidate.command,
+      command,
       leadingArgv: [],
       resolution: "shell-fallback",
       shell: true,
