@@ -185,4 +185,33 @@ describe("telegramOutbound", () => {
       }),
     );
   });
+
+  it("registered plugin sendPayload forwards audioAsVoice as asVoice (channel.ts path)", async () => {
+    // Regression guard for the channel.ts telegramPlugin registered-plugin path.
+    // ClawSweeper noted channel.ts was the second place audioAsVoice was dropped;
+    // this test ensures the plugin-registered sendPayload handler propagates the
+    // flag through buildTelegramSendOptions as asVoice.
+    sendMessageTelegramMock.mockResolvedValueOnce({ messageId: "tg-voice-plugin", chatId: "12345" });
+
+    await telegramOutbound.sendPayload!({
+      cfg: {} as never,
+      to: "12345",
+      text: "",
+      payload: {
+        text: "voice note via plugin path",
+        mediaUrls: ["https://example.com/note.ogg"],
+      },
+      audioAsVoice: true,
+      accountId: "ops",
+      deps: { sendTelegram: sendMessageTelegramMock },
+    });
+
+    expect(sendMessageTelegramMock).toHaveBeenCalledWith(
+      "12345",
+      expect.any(String),
+      expect.objectContaining({
+        asVoice: true,
+      }),
+    );
+  });
 });
