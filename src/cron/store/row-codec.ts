@@ -6,6 +6,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
 import { normalizeOptionalAccountId } from "../../routing/account-id.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
+import { normalizeCronJobPrecheck } from "../job-precheck.js";
 import { normalizeCronJobIdentityFields } from "../normalize-job-identity.js";
 import { normalizeCronJobInput } from "../normalize.js";
 import { getInvalidPersistedCronJobReason } from "../persisted-shape.js";
@@ -351,6 +352,11 @@ function rowToCronJob(row: CronJobRow, jobJson: Record<string, unknown>): CronSt
     payload,
     ...(delivery ? { delivery } : {}),
     ...(failureAlert !== undefined ? { failureAlert } : {}),
+    ...(() => {
+      const cfg = tryParseJsonObject(row.job_json) ?? {};
+      const precheck = normalizeCronJobPrecheck((cfg as Record<string, unknown>).precheck);
+      return precheck ? { precheck } : {};
+    })(),
     state: stateFromRow(row),
   };
 }
