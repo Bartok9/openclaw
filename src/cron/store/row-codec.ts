@@ -14,6 +14,7 @@ import {
 import { normalizeSqliteNumber as normalizeNumber } from "../../infra/sqlite-number.js";
 import { tableExists } from "../../state/openclaw-state-db-schema-helpers.js";
 import { hashCronJobDefinition } from "../definition-hash.js";
+import { normalizeCronJobPrecheck } from "../job-precheck.js";
 import { normalizeCronJobInput } from "../normalize.js";
 import { getInvalidPersistedCronJobReason } from "../persisted-shape.js";
 import { tryCronScheduleIdentity } from "../schedule-identity.js";
@@ -203,6 +204,11 @@ export function rowToCronJob(
     createdAtMs,
     updatedAtMs:
       normalizeNumber(row.runtime_updated_at_ms) ?? normalizeNumber(row.updated_at) ?? createdAtMs,
+    ...(() => {
+      const cfg = tryParseJsonObject(row.job_json) ?? {};
+      const precheck = normalizeCronJobPrecheck((cfg as Record<string, unknown>).precheck);
+      return precheck ? { precheck } : {};
+    })(),
     state,
   } as CronStoredJob;
 }

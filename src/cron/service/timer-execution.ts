@@ -9,6 +9,8 @@ import {
 } from "../active-jobs.js";
 import { resolveCronJobEffectiveAgentId } from "../agent-id.js";
 import { isHeartbeatTaskCronJob } from "../heartbeat-task.js";
+/** Executes a cron job without mutating persisted job state. */
+import { cronRunOutcomeFromPrecheck, runCronJobPrecheck } from "../job-precheck.js";
 import { createCronRunDiagnosticsFromError } from "../run-diagnostics.js";
 import { resolveCronToolsAllowExecTargetRecoveryError } from "../scheduled-tool-policy.js";
 import { cronScriptFailureMetadata } from "../script-failure.js";
@@ -34,7 +36,6 @@ import {
   removeQueuedSystemEventHandle,
 } from "./timer-trigger.js";
 
-/** Executes a cron job without mutating persisted job state. */
 export async function executeJobCore(
   state: CronServiceState,
   job: CronStoredJob,
@@ -62,6 +63,27 @@ export async function executeJobCore(
         nowMs: state.deps.nowMs,
       }),
     };
+  }
+  // Optional shell precheck: cheapest gate, no model call when there is no work.
+  if (job.precheck?.command) {
+    const precheckResult = await runCronJobPrecheck(job.precheck, {
+      abortSignal,
+      authz: {
+        triggersEnabled: state.deps.cronConfig?.triggers?.enabled === true,
+        agentId: job.agentId,
+      },
+    });
+    if (precheckResult.decision !== "run") {
+      state.deps.log.debug(
+        {
+          jobId: job.id,
+          decision: precheckResult.decision,
+          exitCode: precheckResult.exitCode,
+        },
+        `cron: precheck ${precheckResult.decision} — skipping payload without a model call`,
+      );
+      return cronRunOutcomeFromPrecheck(precheckResult, () => state.deps.nowMs());
+    }
   }
   if (options?.streamScheduleKey !== undefined || options?.streamSourceIdentity !== undefined) {
     // Defense in depth over the locked admission checks: stream-origin work must

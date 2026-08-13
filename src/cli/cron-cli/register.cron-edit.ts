@@ -73,6 +73,11 @@ export function registerCronEditCommand(cron: Command) {
       .option("--clear-session-key", "Unset session key", false)
       .option("--clear-pacing", "Remove dynamic-cadence bounds", false)
       .option("--clear-trigger", "Remove the condition trigger", false)
+      .option("--precheck-command <shell>", "Set zero-token shell precheck gate (see #112371)")
+      .option("--precheck-timeout-ms <n>", "Set precheck timeout in milliseconds")
+      .option("--precheck-cwd <path>", "Set precheck working directory")
+      .option("--clear-precheck", "Remove the precheck gate", false)
+>>>>>>> ae8ca5d5b15 (feat(cron): shell precheck gate to skip LLM when no work)
       .option(
         "--clear-thinking",
         "Remove the per-job thinking override (restore normal cron thinking precedence)",
@@ -253,6 +258,27 @@ export function registerCronEditCommand(cron: Command) {
               ...existing.pacing,
               ...(pacingMin ? { min: pacingMin } : {}),
               ...(pacingMax ? { max: pacingMax } : {}),
+            };
+          }
+
+          const precheckCommand = normalizeOptionalString(opts.precheckCommand);
+          if (opts.clearPrecheck && precheckCommand) {
+            throw new Error("Use --clear-precheck or --precheck-command, not both");
+          }
+          if (opts.clearPrecheck) {
+            patch.precheck = null;
+          } else if (precheckCommand) {
+            const timeoutRaw = normalizeOptionalString(opts.precheckTimeoutMs);
+            const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
+            patch.precheck = {
+              kind: "exec",
+              command: precheckCommand,
+              ...(timeoutMs !== undefined && Number.isFinite(timeoutMs)
+                ? { timeoutMs: Math.floor(timeoutMs) }
+                : {}),
+              ...(normalizeOptionalString(opts.precheckCwd)
+                ? { cwd: normalizeOptionalString(opts.precheckCwd) }
+                : {}),
             };
           }
           if (opts.clearTrigger) {
