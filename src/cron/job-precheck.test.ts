@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   PRECHECK_NO_WORK_REASON,
@@ -219,9 +221,6 @@ describe("runCronJobPrecheck", () => {
   });
 
   it("terminates precheck process tree on timeout", async () => {
-    const fs = await import("node:fs");
-    const os = await import("node:os");
-    const path = await import("node:path");
     const marker = path.join(os.tmpdir(), `oc-precheck-tree-${process.pid}-${Date.now()}.pid`);
     // Background sleep should die with process-tree termination, not only the shell root.
     const command = `sleep 600 & echo $! > "${marker}"; wait`;
@@ -230,7 +229,9 @@ describe("runCronJobPrecheck", () => {
     if (result.decision === "error") {
       expect(result.reason).toMatch(/precheck-timeout/);
     }
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise<void>((r) => {
+      setTimeout(r, 400);
+    });
     if (fs.existsSync(marker)) {
       const pid = Number(fs.readFileSync(marker, "utf8").trim());
       try {
