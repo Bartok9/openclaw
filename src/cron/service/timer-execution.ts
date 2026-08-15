@@ -1,6 +1,7 @@
 /** Executes a cron job without mutating persisted job state. */
 import { resolveAgentConfig } from "../../agents/agent-scope-config.js";
-import { loadConfig } from "../../config/io.runtime.js";
+import { getRuntimeConfig } from "../../config/io.runtime.js";
+import type { ExecAsk, ExecMode, ExecSecurity } from "../../infra/exec-approvals-core.js";
 import {
   HEARTBEAT_IDLE_RETRY_GRACE_MS,
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
@@ -113,10 +114,15 @@ export async function executeJobCore(
     // Resolve effective tools.exec (global + per-agent) the same way system.run does.
     // Approvals alone default to security=full; without this layer, tools.exec.security=deny
     // would be bypassed for unattended prechecks (ClawSweeper P1 on #112375).
-    let toolsExec: { mode?: string; security?: string; ask?: string } | undefined;
-    let agentToolsExec: typeof toolsExec;
+    type PrecheckExecLayer = {
+      mode?: ExecMode;
+      security?: ExecSecurity;
+      ask?: ExecAsk;
+    };
+    let toolsExec: PrecheckExecLayer | undefined;
+    let agentToolsExec: PrecheckExecLayer | undefined;
     try {
-      const cfg = loadConfig();
+      const cfg = getRuntimeConfig();
       toolsExec = cfg.tools?.exec;
       const agentId =
         job.agentId ?? state.deps.resolveDefaultAgentId?.() ?? state.deps.defaultAgentId;
