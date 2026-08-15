@@ -11,8 +11,6 @@ import { normalizeCronStaggerMs, resolveDefaultCronStaggerMs } from "../stagger.
 import { createCronStreamSourceIdentity } from "../stream-schedule.js";
 import { applyDefaultCronToolsAllow, cronJobUsesToolRuntime } from "../tools-allow.js";
 import type {
-  CronDelivery,
-  CronFailureAlert,
   CronJobCreate,
   CronJobPatch,
   CronJobState,
