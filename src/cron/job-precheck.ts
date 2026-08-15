@@ -5,6 +5,7 @@ import {
   resolveExecApprovalsLocked,
   resolveExecModePolicy,
   minSecurity,
+  requiresExecApproval,
   type ExecAsk,
   type ExecMode,
   type ExecSecurity,
@@ -15,20 +16,36 @@ import { resolveExecSafeBinRuntimePolicy } from "../infra/exec-safe-bin-runtime-
 import { sanitizeHostExecEnv } from "../infra/host-env-security.js";
 import { evaluateSystemRunPolicy } from "../node-host/exec-policy.js";
 import { killProcessTree } from "../process/kill-tree.js";
+import { resolveTrustedWindowsCmdExe } from "../process/windows-command.js";
 import { createCronRunDiagnosticsFromError } from "./run-diagnostics.js";
 import type { CronJobPrecheck } from "./types-shared.js";
 import type { CronRunDiagnostics, CronRunOutcome } from "./types.js";
 
 /** Default shell for precheck command strings. */
 const IS_WINDOWS = process.platform === "win32";
+/** Fixed POSIX transport shell — never honor inherited SHELL (dangerous env). */
+const TRUSTED_POSIX_SHELL = "/bin/sh";
 
-function resolveShellCommand(command: string): { shell: string; args: string[] } {
-  if (IS_WINDOWS) {
-    const shell = process.env.ComSpec?.trim() || "cmd.exe";
+/**
+ * Resolve a trusted shell executable for unattended precheck.
+ * Do not select from raw SHELL/ComSpec after authorization — poisoned Gateway
+ * env must not replace the authorized transport.
+ */
+export function resolveTrustedPrecheckShellCommand(
+  command: string,
+  _env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): { shell: string; args: string[] } {
+  if (platform === "win32") {
+    // Fixed System32 cmd.exe (or cmd.exe off-Windows); ignore ComSpec.
+    const shell = resolveTrustedWindowsCmdExe(platform);
     return { shell, args: ["/d", "/s", "/c", command] };
   }
-  const shell = process.env.SHELL?.trim() || "/bin/sh";
-  return { shell, args: ["-c", command] };
+  return { shell: TRUSTED_POSIX_SHELL, args: ["-c", command] };
+}
+
+function resolveShellCommand(command: string): { shell: string; args: string[] } {
+  return resolveTrustedPrecheckShellCommand(command);
 }
 
 /** Canonical host-exec env for precheck analysis + spawn (same as system.run). */
@@ -223,7 +240,8 @@ function normalizeExecSecurity(value: unknown): ExecSecurity | undefined {
  * Authorize a cron precheck command under the same host-shell policy surface as
  * the gateway exec tool: `cron.triggers.enabled` plus exec security
  * deny|allowlist|full (allowlist analysis via evaluateShellAllowlist*).
- * Unattended cron never prompts for approvals — ask paths deny.
+ * Unattended cron never prompts for approvals — effective ask that would
+ * require a prompt fails closed (policy-denied).
  */
 export async function authorizeCronJobPrecheckCommand(params: {
   command: string;
@@ -285,11 +303,17 @@ export async function authorizeCronJobPrecheckCommand(params: {
   }
 
   // Mirror resolveEffectiveSystemRunExecPolicy / resolveExecHostApprovalContext:
-  // 1) start from OpenClaw defaults (full/off) or an explicit security ceiling
-  // 2) layer global + per-agent tools.exec (canonical system.run path)
-  // 3) resolveExecModePolicy
-  // 4) approvals file may only tighten via minSecurity
-  // Unattended cron → ask="off" (no interactive path).
+  // 1) start from OpenClaw defaults (allowlist/off) or an explicit security ceiling
+  // 2) layer global + per-agent tools.exec (canonical system.run path) — including ask
+  // 3) resolveExecModePolicy with effective ask (not forced off)
+  // 4) approvals file may only tighten via minSecurity / ask max-strictness
+  // Unattended cron cannot prompt: if effective ask would require approval, deny.
+  const normalizeAsk = (value: unknown): ExecAsk | undefined => {
+    if (value === "off" || value === "on-miss" || value === "always") {
+      return value;
+    }
+    return undefined;
+  };
   const normalizeLayer = (
     layer: ExecToolConfigLayer | undefined,
   ): ExecToolConfigLayer | undefined => {
@@ -306,10 +330,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
           ? layer.mode
           : undefined,
       security: normalizeExecSecurity(layer.security),
-      ask:
-        layer.ask === "off" || layer.ask === "on-miss" || layer.ask === "always"
-          ? layer.ask
-          : undefined,
+      ask: normalizeAsk(layer.ask),
     };
   };
   const toolsExecLayer = normalizeLayer(params.authz.toolsExec);
@@ -319,7 +340,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
   // (node-host/invoke.ts). Do not widen unconfigured prechecks to full.
   const basePolicy = {
     security: (requested ?? "allowlist") as ExecSecurity,
-    ask: "off" as const,
+    ask: "off" as ExecAsk,
   };
   const layered = hasConfigLayers
     ? applyExecPolicyLayer(applyExecPolicyLayer(basePolicy, toolsExecLayer), agentToolsExecLayer)
@@ -338,19 +359,25 @@ export async function authorizeCronJobPrecheckCommand(params: {
       layered.mode === "full")
       ? layered.mode
       : undefined;
+  const layeredAsk = normalizeAsk(layered.ask) ?? "off";
   const modePolicy = resolveExecModePolicy({
     mode: layeredMode,
     security: ceilingSecurity ?? "allowlist",
-    ask: "off",
+    ask: layeredAsk,
   });
   const approvals = await resolveExecApprovalsLocked(params.authz.agentId, {
     security: modePolicy.security,
-    ask: "off",
+    ask: modePolicy.ask,
   });
   const hostSecurity = minSecurity(
     modePolicy.security,
     normalizeExecSecurity(approvals.agent.security) ?? "deny",
   );
+  // Ask max-strictness: always > on-miss > off (approvals file can only tighten).
+  const askRank = (ask: ExecAsk): number => (ask === "always" ? 2 : ask === "on-miss" ? 1 : 0);
+  const approvalsAsk = normalizeAsk(approvals.agent.ask) ?? "off";
+  const effectiveAsk: ExecAsk =
+    askRank(approvalsAsk) >= askRank(modePolicy.ask) ? approvalsAsk : modePolicy.ask;
 
   if (hostSecurity === "deny") {
     return {
@@ -375,11 +402,29 @@ export async function authorizeCronJobPrecheckCommand(params: {
   });
 
   const isWindows = process.platform === "win32";
+  const allowlistSatisfied = hostSecurity === "allowlist" ? allowlistEval.allowlistSatisfied : true;
+  // Unattended cron has no interactive approval path. Fail closed when the
+  // effective ask policy would require a prompt (tools.exec.ask or approvals).
+  if (
+    requiresExecApproval({
+      ask: effectiveAsk,
+      security: hostSecurity,
+      analysisOk: allowlistEval.analysisOk,
+      allowlistSatisfied,
+      durableApprovalSatisfied: false,
+    })
+  ) {
+    return {
+      allowed: false,
+      reason: `${PRECHECK_POLICY_DENIED_REASON}: exec ask=${effectiveAsk} requires approval (unattended cron cannot prompt)`,
+    };
+  }
+
   const decision = evaluateSystemRunPolicy({
     security: hostSecurity,
-    ask: "off",
+    ask: effectiveAsk,
     analysisOk: allowlistEval.analysisOk,
-    allowlistSatisfied: hostSecurity === "allowlist" ? allowlistEval.allowlistSatisfied : true,
+    allowlistSatisfied,
     durableApprovalSatisfied: false,
     approvalDecision: null,
     isWindows,
