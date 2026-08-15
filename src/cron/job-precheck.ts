@@ -21,8 +21,6 @@ import { createCronRunDiagnosticsFromError } from "./run-diagnostics.js";
 import type { CronJobPrecheck } from "./types-shared.js";
 import type { CronRunDiagnostics, CronRunOutcome } from "./types.js";
 
-/** Default shell for precheck command strings. */
-const IS_WINDOWS = process.platform === "win32";
 /** Fixed POSIX transport shell — never honor inherited SHELL (dangerous env). */
 const TRUSTED_POSIX_SHELL = "/bin/sh";
 
