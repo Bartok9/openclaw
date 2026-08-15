@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
@@ -245,6 +246,53 @@ describe("runCronJobPrecheck", () => {
           alive = false;
         }
         expect(alive).toBe(false);
+      }
+    }
+  });
+
+  it("strips dangerous inherited env (BASH_ENV) before spawn", async () => {
+    const prev = process.env.BASH_ENV;
+    process.env.BASH_ENV = "/tmp/should-not-reach-precheck-shell";
+    let sawEnv: NodeJS.ProcessEnv | undefined;
+    try {
+      const spawnImpl = ((cmd: unknown, args: unknown, opts: { env?: NodeJS.ProcessEnv }) => {
+        sawEnv = opts?.env;
+        // Minimal child mock that exits 0 immediately
+        const makeStream = () => {
+          const s = new EventEmitter() as EventEmitter & {
+            setEncoding: (enc: string) => void;
+          };
+          s.setEncoding = () => {};
+          return s;
+        };
+        const ee = new EventEmitter() as EventEmitter & {
+          stdout: ReturnType<typeof makeStream>;
+          stderr: ReturnType<typeof makeStream>;
+          kill: () => boolean;
+          pid: number;
+        };
+        ee.stdout = makeStream();
+        ee.stderr = makeStream();
+        ee.kill = () => true;
+        ee.pid = 424242;
+        queueMicrotask(() => {
+          ee.stdout.emit("data", "WORK_NEEDED\n");
+          ee.emit("close", 0);
+        });
+        return ee;
+      }) as unknown as typeof import("node:child_process").spawn;
+      const result = await runCronJobPrecheck(
+        { command: "echo WORK_NEEDED" },
+        { authz: AUTH_FULL, spawnImpl },
+      );
+      expect(result.decision).toBe("run");
+      expect(sawEnv).toBeDefined();
+      expect(sawEnv?.BASH_ENV).toBeUndefined();
+    } finally {
+      if (prev === undefined) {
+        delete process.env.BASH_ENV;
+      } else {
+        process.env.BASH_ENV = prev;
       }
     }
   });
