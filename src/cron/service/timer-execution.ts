@@ -83,8 +83,25 @@ export async function executeJobCore(
   if (abortSignal?.aborted) {
     return resolveAbortError();
   }
-  // Optional shell precheck #112371 runs first — cheapest gate, no code-mode
-  // executor and no trigger evaluation cost when there is no work.
+  // Stream identity fence first: never run host-shell precheck (or triggers/payload)
+  // for a stale queued stream snapshot whose source was replaced/disabled.
+  if (options?.streamScheduleKey !== undefined || options?.streamSourceIdentity !== undefined) {
+    // Defense in depth over the locked admission checks: stream-origin work must
+    // carry both the source definition and logical identity, and both must still
+    // match the execution snapshot.
+    const currentKey =
+      job.schedule.kind === "stream" ? cronStreamScheduleKey(job.schedule) : undefined;
+    if (
+      options.streamScheduleKey === undefined ||
+      options.streamSourceIdentity === undefined ||
+      currentKey !== options.streamScheduleKey ||
+      job.state.streamSourceIdentity !== options.streamSourceIdentity
+    ) {
+      return { status: "skipped", error: "stream batch source no longer current" };
+    }
+  }
+  // Optional shell precheck #112371 — cheapest gate after stream admission, no
+  // code-mode executor and no trigger evaluation cost when there is no work.
   //
   // Precheck host-shell execution is authorized through the SAME policy surface
   // as the exec tool / system-run path: `cron.triggers.enabled` PLUS exec
@@ -108,21 +125,6 @@ export async function executeJobCore(
         `cron: precheck ${precheckResult.decision} — skipping payload without a model call`,
       );
       return cronRunOutcomeFromPrecheck(precheckResult, () => state.deps.nowMs());
-    }
-  }
-  if (options?.streamScheduleKey !== undefined || options?.streamSourceIdentity !== undefined) {
-    // Defense in depth over the locked admission checks: stream-origin work must
-    // carry both the source definition and logical identity, and both must still
-    // match the execution snapshot.
-    const currentKey =
-      job.schedule.kind === "stream" ? cronStreamScheduleKey(job.schedule) : undefined;
-    if (
-      options.streamScheduleKey === undefined ||
-      options.streamSourceIdentity === undefined ||
-      currentKey !== options.streamScheduleKey ||
-      job.state.streamSourceIdentity !== options.streamSourceIdentity
-    ) {
-      return { status: "skipped", error: "stream batch source no longer current" };
     }
   }
   let effectiveJob = job;
