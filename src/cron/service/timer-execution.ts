@@ -126,6 +126,7 @@ export async function executeJobCore(
       mode?: ExecMode;
       security?: ExecSecurity;
       ask?: ExecAsk;
+      strictInlineEval?: boolean;
       safeBins?: string[] | null;
       safeBinProfiles?: import("../../infra/exec-safe-bin-policy.js").SafeBinProfileFixtures | null;
       safeBinTrustedDirs?: string[] | null;

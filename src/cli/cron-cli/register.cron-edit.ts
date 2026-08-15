@@ -346,23 +346,35 @@ export function registerCronEditCommand(cron: Command) {
           }
 
           const precheckCommand = normalizeOptionalString(opts.precheckCommand);
-          if (opts.clearPrecheck && precheckCommand) {
-            throw new Error("Use --clear-precheck or --precheck-command, not both");
+          const precheckTimeoutRaw = normalizeOptionalString(opts.precheckTimeoutMs);
+          const precheckCwd = normalizeOptionalString(opts.precheckCwd);
+          const hasPrecheckAncillary =
+            precheckTimeoutRaw !== undefined || precheckCwd !== undefined;
+          if (opts.clearPrecheck && (precheckCommand || hasPrecheckAncillary)) {
+            throw new Error("Use --clear-precheck alone, not with other --precheck-* flags");
           }
           if (opts.clearPrecheck) {
             patch.precheck = null;
-          } else if (precheckCommand) {
-            const timeoutRaw = normalizeOptionalString(opts.precheckTimeoutMs);
-            const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
+          } else if (precheckCommand || hasPrecheckAncillary) {
+            const existing = await readExistingCronJob();
+            const prev =
+              existing.precheck && typeof existing.precheck === "object"
+                ? existing.precheck
+                : undefined;
+            if (!precheckCommand && !prev) {
+              throw new Error(
+                "--precheck-timeout-ms/--precheck-cwd require an existing precheck or --precheck-command",
+              );
+            }
+            const timeoutMs = precheckTimeoutRaw ? Number(precheckTimeoutRaw) : undefined;
             patch.precheck = {
               kind: "exec",
-              command: precheckCommand,
+              ...prev,
+              command: precheckCommand ?? prev?.command ?? "",
               ...(timeoutMs !== undefined && Number.isFinite(timeoutMs)
                 ? { timeoutMs: Math.floor(timeoutMs) }
                 : {}),
-              ...(normalizeOptionalString(opts.precheckCwd)
-                ? { cwd: normalizeOptionalString(opts.precheckCwd) }
-                : {}),
+              ...(precheckCwd ? { cwd: precheckCwd } : {}),
             };
           }
           if (opts.clearTrigger) {
