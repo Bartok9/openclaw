@@ -10,6 +10,7 @@ import {
   cronRunOutcomeFromPrecheck,
   interpretPrecheckOutput,
   normalizeCronJobPrecheck,
+  resolveTrustedPrecheckShellCommand,
   runCronJobPrecheck,
 } from "./job-precheck.js";
 
@@ -174,6 +175,37 @@ describe("authorizeCronJobPrecheckCommand", () => {
       expect(result.reason).toContain(PRECHECK_POLICY_DENIED_REASON);
     }
   });
+  it("denies when tools.exec.ask is always (unattended cannot prompt)", async () => {
+    const result = await authorizeCronJobPrecheckCommand({
+      command: "echo WORK_NEEDED",
+      authz: {
+        triggersEnabled: true,
+        security: "full",
+        securityOverrideOnly: false,
+        toolsExec: { ask: "always", security: "full" },
+      },
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.reason).toMatch(/ask=always|requires approval/);
+    }
+  });
+
+  it("denies when agent tools.exec.ask is always", async () => {
+    const result = await authorizeCronJobPrecheckCommand({
+      command: "echo WORK_NEEDED",
+      authz: {
+        triggersEnabled: true,
+        security: "full",
+        toolsExec: { ask: "off", security: "full" },
+        agentToolsExec: { ask: "always" },
+      },
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.reason).toMatch(/ask=always|requires approval/);
+    }
+  });
 });
 
 describe("runCronJobPrecheck", () => {
@@ -294,6 +326,65 @@ describe("runCronJobPrecheck", () => {
         delete process.env.BASH_ENV;
       } else {
         process.env.BASH_ENV = prev;
+      }
+    }
+  });
+
+  it("ignores poisoned SHELL when resolving precheck executable", () => {
+    const poisoned = {
+      ...process.env,
+      SHELL: "/tmp/evil-shell-should-not-run",
+      ComSpec: "C:\\\\evil\\\\cmd.exe",
+    };
+    const resolved = resolveTrustedPrecheckShellCommand("echo hi", poisoned, "linux");
+    expect(resolved.shell).toBe("/bin/sh");
+    expect(resolved.args).toEqual(["-c", "echo hi"]);
+    const win = resolveTrustedPrecheckShellCommand("echo hi", poisoned, "win32");
+    expect(win.shell.toLowerCase()).not.toContain("evil");
+    expect(win.args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+  });
+
+  it("spawns trusted /bin/sh even when process.env.SHELL is poisoned", async () => {
+    const prev = process.env.SHELL;
+    process.env.SHELL = "/tmp/evil-precheck-shell";
+    let sawCmd: string | undefined;
+    try {
+      const spawnImpl = ((cmd: unknown) => {
+        sawCmd = String(cmd);
+        const makeStream = () => {
+          const s = new EventEmitter() as EventEmitter & {
+            setEncoding: (enc: string) => void;
+          };
+          s.setEncoding = () => {};
+          return s;
+        };
+        const ee = new EventEmitter() as EventEmitter & {
+          stdout: ReturnType<typeof makeStream>;
+          stderr: ReturnType<typeof makeStream>;
+          kill: () => boolean;
+          pid: number;
+        };
+        ee.stdout = makeStream();
+        ee.stderr = makeStream();
+        ee.kill = () => true;
+        ee.pid = 424243;
+        queueMicrotask(() => {
+          ee.stdout.emit("data", "WORK_NEEDED\n");
+          ee.emit("close", 0);
+        });
+        return ee;
+      }) as unknown as typeof import("node:child_process").spawn;
+      const result = await runCronJobPrecheck(
+        { command: "echo WORK_NEEDED" },
+        { authz: AUTH_FULL, spawnImpl },
+      );
+      expect(result.decision).toBe("run");
+      expect(sawCmd).toBe("/bin/sh");
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SHELL;
+      } else {
+        process.env.SHELL = prev;
       }
     }
   });
