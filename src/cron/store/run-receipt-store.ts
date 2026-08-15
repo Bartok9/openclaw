@@ -13,10 +13,7 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../state/openclaw-state-schema.js";
-import {
-  resolveCronJobConfigRevision,
-  resolveCronJobPrecheckRevision,
-} from "../config-revision.js";
+import { resolveCronJobPrecheckRevision } from "../config-revision.js";
 import type { CronJob } from "../types.js";
 import { cronStoreKey } from "./key.js";
 import { loadedCronStoreFromRows, loadCronRows } from "./row-codec.js";
