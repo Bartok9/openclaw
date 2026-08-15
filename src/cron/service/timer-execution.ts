@@ -103,6 +103,9 @@ export async function executeJobCore(
       return { status: "skipped", error: "stream batch source no longer current" };
     }
   }
+  // Durable run-receipt fence before host-shell precheck: a replaced/stale run
+  // must not execute a host command before rejection (ClawSweeper P1).
+  options?.assertRunCurrent?.();
   // Optional shell precheck #112371 — cheapest gate after stream admission, no
   // code-mode executor and no trigger evaluation cost when there is no work.
   //
@@ -168,6 +171,11 @@ export async function executeJobCore(
         `cron: precheck ${precheckResult.decision} — skipping payload without a model call`,
       );
       return cronRunOutcomeFromPrecheck(precheckResult, () => state.deps.nowMs());
+    }
+    // Revalidate currency after awaited precheck before triggers/payload.
+    options?.assertRunCurrent?.();
+    if (abortSignal?.aborted) {
+      return resolveAbortError();
     }
   }
   let effectiveJob = job;
