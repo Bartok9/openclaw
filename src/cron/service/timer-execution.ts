@@ -64,7 +64,21 @@ export async function executeJobCore(
       }),
     };
   }
-  // Optional shell precheck: cheapest gate, no model call when there is no work.
+  // Stream identity fence first: never run host-shell precheck (or triggers/payload)
+  // for a stale queued stream snapshot whose source was replaced/disabled.
+  if (options?.streamScheduleKey !== undefined || options?.streamSourceIdentity !== undefined) {
+    const currentKey =
+      job.schedule.kind === "stream" ? cronStreamScheduleKey(job.schedule) : undefined;
+    if (
+      options.streamScheduleKey === undefined ||
+      options.streamSourceIdentity === undefined ||
+      currentKey !== options.streamScheduleKey ||
+      job.state.streamSourceIdentity !== options.streamSourceIdentity
+    ) {
+      return { status: "skipped", error: "stream batch source no longer current" };
+    }
+  }
+  // Optional shell precheck after stream admission: cheapest gate, no model call when no work.
   if (job.precheck?.command) {
     const precheckResult = await runCronJobPrecheck(job.precheck, {
       abortSignal,
@@ -83,21 +97,6 @@ export async function executeJobCore(
         `cron: precheck ${precheckResult.decision} — skipping payload without a model call`,
       );
       return cronRunOutcomeFromPrecheck(precheckResult, () => state.deps.nowMs());
-    }
-  }
-  if (options?.streamScheduleKey !== undefined || options?.streamSourceIdentity !== undefined) {
-    // Defense in depth over the locked admission checks: stream-origin work must
-    // carry both the source definition and logical identity, and both must still
-    // match the execution snapshot.
-    const currentKey =
-      job.schedule.kind === "stream" ? cronStreamScheduleKey(job.schedule) : undefined;
-    if (
-      options.streamScheduleKey === undefined ||
-      options.streamSourceIdentity === undefined ||
-      currentKey !== options.streamScheduleKey ||
-      job.state.streamSourceIdentity !== options.streamSourceIdentity
-    ) {
-      return { status: "skipped", error: "stream batch source no longer current" };
     }
   }
   let effectiveJob = job;
