@@ -53,6 +53,8 @@ function resolvePrecheckExecEnv(env?: NodeJS.ProcessEnv): Record<string, string>
 
 /** Stable skip / error reason codes for run logs and operators. */
 export const PRECHECK_NO_WORK_REASON = "precheck-no-work";
+/** onError=skip for unexpected probe failures — distinct from quiet no-work. */
+export const PRECHECK_SKIPPED_ERROR_REASON = "precheck-skipped-error";
 export const PRECHECK_POLICY_DENIED_REASON = "precheck-policy-denied";
 const PRECHECK_ERROR_REASON = "precheck-error";
 const PRECHECK_TIMEOUT_REASON = "precheck-timeout";
@@ -69,7 +71,7 @@ type CronJobPrecheckResult =
   | { decision: "run"; exitCode: number | null; stdout: string; stderr: string }
   | {
       decision: "skip";
-      reason: typeof PRECHECK_NO_WORK_REASON;
+      reason: typeof PRECHECK_NO_WORK_REASON | typeof PRECHECK_SKIPPED_ERROR_REASON;
       exitCode: number | null;
       stdout: string;
       stderr: string;
@@ -174,7 +176,7 @@ export function interpretPrecheckOutput(params: {
   if (onError === "skip") {
     return {
       decision: "skip",
-      reason: PRECHECK_NO_WORK_REASON,
+      reason: PRECHECK_SKIPPED_ERROR_REASON,
       exitCode: code,
       stdout,
       stderr,
