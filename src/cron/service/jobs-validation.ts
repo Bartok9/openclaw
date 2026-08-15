@@ -5,6 +5,7 @@ import type { CronConfig } from "../../config/types.cron.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { compileSafeRegexDetailed } from "../../security/safe-regex.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
+import { normalizeCronJobPrecheck } from "../job-precheck.js";
 import { parseCronPacingBounds } from "../pacing.js";
 import { parseAbsoluteTimeMs } from "../parse.js";
 import { assertSafeCronSessionTargetId } from "../session-target.js";
@@ -116,8 +117,16 @@ export function assertPrecheckSupport(
   if (!job.precheck) {
     return;
   }
-  const command = typeof job.precheck.command === "string" ? job.precheck.command.trim() : "";
-  if (!command) {
+  // Reject the full precheck contract before persistence (overlap, empty
+  // prefixes, blank command). normalizeCronJobPrecheck throws on invalid shapes.
+  let normalized;
+  try {
+    normalized = normalizeCronJobPrecheck(job.precheck);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`cron precheck is invalid: ${message}`);
+  }
+  if (!normalized) {
     throw new Error("cron precheck requires a non-empty command");
   }
   if (opts?.requireEnabled && opts.cronConfig?.triggers?.enabled !== true) {
