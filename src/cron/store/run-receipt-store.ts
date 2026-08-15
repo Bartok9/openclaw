@@ -8,6 +8,7 @@ import {
 } from "../../infra/kysely-sync.js";
 import { createSqliteSchemaEnsurer } from "../../infra/sqlite-schema-ensure.js";
 import { getOpenClawStateFeatureSchemaSql } from "../../state/openclaw-state-feature-schema.js";
+import { resolveCronJobPrecheckRevision } from "../config-revision.js";
 import type { CronJob } from "../types.js";
 import {
   CRON_DELIVERY_REPAIR_REQUIRED_MESSAGE,
@@ -89,14 +90,14 @@ function validateCurrentReceiptJob<Job>(
   if (params.resolveAgentId(job) !== params.handle.agentId) {
     throw new CronRunReceiptRevisionError(params.handle.receiptId);
   }
-  // Fence host-shell precheck / payload against post-admission config mutation
-  // (e.g. precheck command changed or cleared after claim). Receipts store
-  // configRevision at claim time; without this check, assertRunCurrent only
-  // verified job existence + agent identity (ClawSweeper P1 on #112375).
-  if (resolveCronJobConfigRevision(job) !== params.handle.configRevision) {
+  // Fence host-shell precheck only against post-admission precheck mutation
+  // (command change/clear). Do NOT hash the full job definition here: mid-run
+  // delivery writeback and operator disable must not supersede as "config changed"
+  // (ClawSweeper P1 on #112375; narrowed after CI catch-up/disable regressions).
+  if (resolveCronJobPrecheckRevision(job) !== params.handle.configRevision) {
     throw new CronRunReceiptRevisionError(
       params.handle.receiptId,
-      "cron job configuration changed",
+      "cron job precheck configuration changed",
     );
   }
   return job;
