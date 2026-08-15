@@ -38,14 +38,6 @@ export function resolveCronJobConfigRevision(job: CronJob): string {
   return `sha256:${sha256Base64Url(fingerprint)}`;
 }
 
-/** Opaque token for host-shell precheck admission only (not full job definition). */
-export function resolveCronJobPrecheckRevision(job: CronJob): string {
-  const projected = projectCronJobThroughStorageCodec({ ...job, updatedAtMs: 0, state: {} });
-  const precheck = projected.precheck ?? null;
-  const fingerprint = stableStringify(precheck);
-  return `precheck-sha256:${sha256Base64Url(fingerprint)}`;
-}
-
 /**
  * Receipt execution fence: full job definition except fields that legitimately
  * mutate mid-run without superseding the admitted payload snapshot.
