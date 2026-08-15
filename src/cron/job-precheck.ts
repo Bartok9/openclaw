@@ -775,7 +775,7 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
     const overlap = workExitCodes.filter((code) => noWork.has(code));
     if (overlap.length > 0) {
       throw new Error(
-        `precheck.workExitCodes and precheck.noWorkExitCodes must not overlap (shared: ${[...new Set(overlap)].sort((a, b) => a - b).join(", ")})`,
+        `precheck.workExitCodes and precheck.noWorkExitCodes must not overlap (shared: ${[...new Set(overlap)].toSorted((a, b) => a - b).join(", ")})`,
       );
     }
   }
