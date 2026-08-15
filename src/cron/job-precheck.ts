@@ -12,6 +12,7 @@ import {
 import { applyExecPolicyLayer } from "../infra/exec-policy.js";
 import type { SafeBinProfileFixtures } from "../infra/exec-safe-bin-policy.js";
 import { resolveExecSafeBinRuntimePolicy } from "../infra/exec-safe-bin-runtime-policy.js";
+import { sanitizeHostExecEnv } from "../infra/host-env-security.js";
 import { evaluateSystemRunPolicy } from "../node-host/exec-policy.js";
 import { killProcessTree } from "../process/kill-tree.js";
 import { createCronRunDiagnosticsFromError } from "./run-diagnostics.js";
@@ -28,6 +29,11 @@ function resolveShellCommand(command: string): { shell: string; args: string[] }
   }
   const shell = process.env.SHELL?.trim() || "/bin/sh";
   return { shell, args: ["-c", command] };
+}
+
+/** Canonical host-exec env for precheck analysis + spawn (same as system.run). */
+function resolvePrecheckExecEnv(env?: NodeJS.ProcessEnv): Record<string, string> {
+  return sanitizeHostExecEnv({ baseEnv: env ?? process.env });
 }
 
 /** Stable skip / error reason codes for run logs and operators. */
@@ -254,7 +260,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
       safeBinProfiles: safeBinPolicy.safeBinProfiles,
       trustedSafeBinDirs: safeBinPolicy.trustedSafeBinDirs,
       cwd: params.cwd,
-      env: params.env ?? process.env,
+      env: resolvePrecheckExecEnv(params.env),
       platform: process.platform,
     });
     const isWindows = process.platform === "win32";
@@ -364,7 +370,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
     safeBinProfiles: safeBinPolicy.safeBinProfiles,
     trustedSafeBinDirs: safeBinPolicy.trustedSafeBinDirs,
     cwd: params.cwd,
-    env: params.env ?? process.env,
+    env: resolvePrecheckExecEnv(params.env),
     platform: process.platform,
   });
 
@@ -472,7 +478,7 @@ export async function runCronJobPrecheck(
     // (shell + background descendants), matching system-run lifecycle.
     const child = spawnFn(shell, shellArgs, {
       cwd,
-      env: process.env,
+      env: resolvePrecheckExecEnv(),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
