@@ -126,6 +126,9 @@ export async function executeJobCore(
       mode?: ExecMode;
       security?: ExecSecurity;
       ask?: ExecAsk;
+      safeBins?: string[] | null;
+      safeBinProfiles?: import("../../infra/exec-safe-bin-policy.js").SafeBinProfileFixtures | null;
+      safeBinTrustedDirs?: string[] | null;
     };
     let toolsExec: PrecheckExecLayer | undefined;
     let agentToolsExec: PrecheckExecLayer | undefined;

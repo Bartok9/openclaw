@@ -109,6 +109,24 @@ export function assertTriggerSupport(
   }
 }
 
+export function assertPrecheckSupport(
+  job: Pick<CronJob, "precheck">,
+  opts?: { cronConfig?: CronConfig; requireEnabled?: boolean },
+) {
+  if (!job.precheck) {
+    return;
+  }
+  const command = typeof job.precheck.command === "string" ? job.precheck.command.trim() : "";
+  if (!command) {
+    throw new Error("cron precheck requires a non-empty command");
+  }
+  if (opts?.requireEnabled && opts.cronConfig?.triggers?.enabled !== true) {
+    throw new Error(
+      "cron precheck is a host-shell command and is disabled; set cron.triggers.enabled=true to allow unattended precheck scripts",
+    );
+  }
+}
+
 export function assertPacingSupport(job: Pick<CronJob, "schedule" | "pacing">) {
   if (job.pacing === undefined) {
     return;

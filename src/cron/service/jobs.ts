@@ -47,6 +47,7 @@ import {
   assertStreamScheduleSupport,
   assertSupportedJobSpec,
   assertTriggerSupport,
+  assertPrecheckSupport,
   hasConcreteFailureDestination,
 } from "./jobs-validation.js";
 import { normalizeOptionalAgentId, normalizeRequiredName } from "./normalize.js";
@@ -158,6 +159,12 @@ function validateFullJob(
       : context.kind === "patch"
         ? context.patch.trigger != null
         : context.input.trigger !== undefined;
+  const precheckTouched =
+    context.kind === "create"
+      ? job.precheck !== undefined
+      : context.kind === "patch"
+        ? context.patch.precheck != null
+        : context.input.precheck !== undefined;
   const scriptTouched =
     context.kind === "create"
       ? job.payload.kind === "script"
@@ -170,6 +177,7 @@ function validateFullJob(
     context.patch.schedule?.kind === "stream";
   const validateCapabilities = () => {
     assertTriggerSupport(job, { cronConfig, requireEnabled: triggerTouched });
+    assertPrecheckSupport(job, { cronConfig, requireEnabled: precheckTouched });
     assertScriptPayloadSupport(job, {
       cronConfig,
       requireEnabled: scriptTouched,
@@ -515,6 +523,11 @@ export function applyDeclarativeJobSpec(
     job.trigger = structuredClone(input.trigger);
   } else {
     delete job.trigger;
+  }
+  if (input.precheck) {
+    job.precheck = structuredClone(input.precheck);
+  } else {
+    delete job.precheck;
   }
   if (cronJobUsesToolRuntime(job) && job.payload.toolsAllow === undefined) {
     if (previousToolsAllow !== undefined) {
