@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   PRECHECK_NO_WORK_REASON,
@@ -146,6 +147,14 @@ describe("authorizeCronJobPrecheckCommand", () => {
     if (!result.allowed) {
       expect(result.reason).toMatch(/security=deny/i);
     }
+  });
+
+  it("passes tools.exec layers into resolveExecSafeBinRuntimePolicy (source contract)", () => {
+    // ClawSweeper P1: empty {} dropped global/agent safeBins. Keep the call site wired.
+    const src = fs.readFileSync(new URL("./job-precheck.ts", import.meta.url), "utf8");
+    expect(src).toContain("global: params.authz.toolsExec");
+    expect(src).toContain("local: params.authz.agentToolsExec");
+    expect(src).not.toMatch(/resolveExecSafeBinRuntimePolicy\(\{\s*\}\)/);
   });
 
   it("defaults unconfigured exec policy to allowlist (not full)", async () => {

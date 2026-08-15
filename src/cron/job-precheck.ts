@@ -10,6 +10,7 @@ import {
   type ExecSecurity,
 } from "../infra/exec-approvals.js";
 import { applyExecPolicyLayer } from "../infra/exec-policy.js";
+import type { SafeBinProfileFixtures } from "../infra/exec-safe-bin-policy.js";
 import { resolveExecSafeBinRuntimePolicy } from "../infra/exec-safe-bin-runtime-policy.js";
 import { evaluateSystemRunPolicy } from "../node-host/exec-policy.js";
 import { killProcessTree } from "../process/kill-tree.js";
@@ -171,6 +172,10 @@ type ExecToolConfigLayer = {
   mode?: ExecMode;
   security?: ExecSecurity;
   ask?: ExecAsk;
+  /** Global/agent tools.exec.safeBins — same surface as system.run. */
+  safeBins?: string[] | null;
+  safeBinProfiles?: SafeBinProfileFixtures | null;
+  safeBinTrustedDirs?: string[] | null;
 };
 
 type CronJobPrecheckAuthz = {
@@ -238,7 +243,10 @@ export async function authorizeCronJobPrecheckCommand(params: {
       return { allowed: true };
     }
     // allowlist without live file → evaluate command against empty allowlist
-    const safeBinPolicy = resolveExecSafeBinRuntimePolicy({});
+    const safeBinPolicy = resolveExecSafeBinRuntimePolicy({
+      global: params.authz.toolsExec,
+      local: params.authz.agentToolsExec,
+    });
     const allowlistEval = await evaluateShellAllowlistWithAuthorization({
       command: params.command,
       allowlist: [],
@@ -345,7 +353,10 @@ export async function authorizeCronJobPrecheckCommand(params: {
     };
   }
 
-  const safeBinPolicy = resolveExecSafeBinRuntimePolicy({});
+  const safeBinPolicy = resolveExecSafeBinRuntimePolicy({
+    global: params.authz.toolsExec,
+    local: params.authz.agentToolsExec,
+  });
   const allowlistEval = await evaluateShellAllowlistWithAuthorization({
     command: params.command,
     allowlist: approvals.allowlist,
