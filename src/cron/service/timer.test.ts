@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import * as jobPrecheck from "../../cron/job-precheck.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "../../cron/service.test-harness.js";
 import { createCronServiceState as createCronServiceStateBase } from "../../cron/service/state.js";
 import { executeJobCore, onTimer } from "../../cron/service/timer.test-support.js";
@@ -589,6 +590,48 @@ describe("cron service timer seam coverage", () => {
     expect(persisted?.state.lastStatus).toBe("skipped");
     expect(persisted?.state.lastError ?? "").toContain("precheck-no-work");
     expect(persisted?.state.consecutiveSkipped ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
+  it("passes canonical effective cron owner into precheck authz (sessionKey-owned)", async () => {
+    // ClawSweeper P1: agent-less jobs owned via sessionKey must not pass undefined
+    // job.agentId into exec approvals (generic default entry). Timer must resolve
+    // resolveCronJobEffectiveAgentId and forward that owner for tools + approvals.
+    const { storePath } = await makeStorePath();
+    const now = Date.parse("2026-08-15T04:00:00.000Z");
+    const spy = vi.spyOn(jobPrecheck, "runCronJobPrecheck").mockResolvedValue({
+      decision: "skip",
+      reason: "precheck-no-work",
+      exitCode: 2,
+      stdout: "NO_WORK\n",
+      stderr: "",
+    } as Awaited<ReturnType<typeof jobPrecheck.runCronJobPrecheck>>);
+    try {
+      const state = createCronServiceState({
+        storePath,
+        cronEnabled: true,
+        cronConfig: { triggers: { enabled: true } },
+        log: logger,
+        nowMs: () => now,
+        enqueueSystemEvent: vi.fn(),
+        requestHeartbeat: vi.fn(),
+        runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+        defaultAgentId: "main",
+      });
+      const job: CronJob = {
+        ...createDueMainJob({ now, wakeMode: "now" }),
+        // Explicit agent-less: ownership comes from sessionKey agent:ops:...
+        agentId: undefined,
+        sessionKey: "agent:ops:main",
+        precheck: { kind: "exec", command: "exit 2" },
+      };
+      const result = await executeJobCore(state, job);
+      expect(spy).toHaveBeenCalled();
+      const authz = spy.mock.calls[0]?.[1]?.authz as { agentId?: string } | undefined;
+      expect(authz?.agentId).toBe("ops");
+      expect(result).toMatchObject({ status: "skipped", error: "precheck-no-work" });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("persists precheck-policy-denied through onTimer without an agent turn", async () => {

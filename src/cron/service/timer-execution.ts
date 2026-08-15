@@ -11,7 +11,7 @@ import {
 } from "../../infra/heartbeat-wake.js";
 import type { CommandLaneTaskMarker } from "../../process/command-queue.js";
 import { type CronActiveJobMarker, isCronActiveJobMarkerCurrent } from "../active-jobs.js";
-import { resolveCronJobEffectiveAgentId } from "../agent-id.js";
+import { resolveCronJobEffectiveAgentId, tryResolveCronDefaultAgentId } from "../agent-id.js";
 import { isHeartbeatTaskCronJob } from "../heartbeat-task.js";
 import { cronRunOutcomeFromPrecheck, runCronJobPrecheck } from "../job-precheck.js";
 import { createCronRunDiagnosticsFromError } from "../run-diagnostics.js";
@@ -114,6 +114,11 @@ export async function executeJobCore(
     // Resolve effective tools.exec (global + per-agent) the same way system.run does.
     // Approvals alone default to security=full; without this layer, tools.exec.security=deny
     // would be bypassed for unattended prechecks (ClawSweeper P1 on #112375).
+    //
+    // Canonical cron owner (job.agentId → sessionKey agent → configured default) must
+    // drive BOTH per-agent tools.exec lookup AND exec-approval resolution. Passing only
+    // job.agentId lets agent-less / session-key-owned jobs fall through to the generic
+    // approvals "default" entry (ClawSweeper P1 on #112375).
     type PrecheckExecLayer = {
       mode?: ExecMode;
       security?: ExecSecurity;
@@ -121,13 +126,23 @@ export async function executeJobCore(
     };
     let toolsExec: PrecheckExecLayer | undefined;
     let agentToolsExec: PrecheckExecLayer | undefined;
+    let effectiveAgentId: string | undefined;
     try {
       const cfg = getRuntimeConfig();
       toolsExec = cfg.tools?.exec;
-      const agentId =
-        job.agentId ?? state.deps.resolveDefaultAgentId?.() ?? state.deps.defaultAgentId;
-      if (agentId) {
-        agentToolsExec = resolveAgentConfig(cfg, agentId)?.tools?.exec;
+      const configuredDefault =
+        tryResolveCronDefaultAgentId(cfg) ??
+        state.deps.resolveDefaultAgentId?.() ??
+        state.deps.defaultAgentId;
+      try {
+        effectiveAgentId = resolveCronJobEffectiveAgentId(job, configuredDefault);
+      } catch {
+        // Agent-less job with no resolvable owner: keep agentId undefined so approvals
+        // fail closed via whatever default path remains; do not invent an owner.
+        effectiveAgentId = undefined;
+      }
+      if (effectiveAgentId) {
+        agentToolsExec = resolveAgentConfig(cfg, effectiveAgentId)?.tools?.exec;
       }
     } catch {
       // Fail closed on config read errors: deny host-shell precheck rather than
@@ -138,7 +153,7 @@ export async function executeJobCore(
       abortSignal,
       authz: {
         triggersEnabled: state.deps.cronConfig?.triggers?.enabled === true,
-        agentId: job.agentId,
+        agentId: effectiveAgentId,
         toolsExec,
         agentToolsExec,
       },
