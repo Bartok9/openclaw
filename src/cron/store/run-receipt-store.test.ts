@@ -240,7 +240,7 @@ describe("cron run receipt store", () => {
       error: "configuration changed",
     });
 
-    // Non-precheck definition drift (delivery writeback / disable) must not fence.
+    // Delivery writeback / operator disable must not fence (mid-run allowed drift).
     await saveCronStore(storePath, { version: 1, jobs: [admitted] });
     const receipt3 = claim(storePath, admitted, 430);
     await saveCronStore(storePath, {
@@ -264,6 +264,32 @@ describe("cron run receipt store", () => {
       handle: receipt3,
       status: "ok",
       finishedAtMs: 431,
+    });
+
+    // Payload mutation after admission MUST fence (execution revision includes payload).
+    await saveCronStore(storePath, { version: 1, jobs: [admitted] });
+    const receipt4 = claim(storePath, admitted, 440);
+    await saveCronStore(storePath, {
+      version: 1,
+      jobs: [
+        {
+          ...admitted,
+          payload: { kind: "agentTurn", message: "mutated-after-admit" },
+          updatedAtMs: 6,
+        },
+      ],
+    });
+    expect(() =>
+      assertCronRunReceiptCurrent({
+        handle: receipt4,
+        resolveAgentId: (job) => job.agentId!,
+      }),
+    ).toThrow(CronRunReceiptRevisionError);
+    finishCronRunReceipt({
+      handle: receipt4,
+      status: "superseded",
+      finishedAtMs: 441,
+      error: "configuration changed",
     });
   });
 });

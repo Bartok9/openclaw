@@ -12,7 +12,10 @@ export type CronRunCostRollup = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
-  /** Runs that recorded any token usage (i.e. actually called a model). */
+  /**
+   * Finished runs that invoked a model. Counted when telemetry records a model/provider
+   * or a usage object (including zero tokens) — never inferred from positive tokens only.
+   */
   modelRuns: number;
   /** Fraction of runs that skipped (0..1); 0 when there are no runs. */
   skipRate: number;
@@ -69,7 +72,10 @@ export function rollupCronRunCost(entries: readonly CronRunLogEntry[]): CronRunC
     const input = entry.usage?.input_tokens ?? 0;
     const output = entry.usage?.output_tokens ?? 0;
     const total = entry.usage?.total_tokens ?? input + output;
-    if (total > 0 || input > 0 || output > 0) {
+    // Authoritative-ish model invoke signal: model/provider set, or usage object present
+    // (even when all token fields are 0/absent). Do not require positive tokens.
+    const hasUsageObject = entry.usage != null && typeof entry.usage === "object";
+    if (entry.model || entry.provider || hasUsageObject) {
       rollup.modelRuns += 1;
     }
     rollup.inputTokens += input;

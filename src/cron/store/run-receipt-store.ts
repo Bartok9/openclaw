@@ -13,7 +13,7 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../state/openclaw-state-schema.js";
-import { resolveCronJobPrecheckRevision } from "../config-revision.js";
+import { resolveCronJobExecutionRevision } from "../config-revision.js";
 import type { CronJob } from "../types.js";
 import { cronStoreKey } from "./key.js";
 import { loadedCronStoreFromRows, loadCronRows } from "./row-codec.js";
@@ -296,14 +296,13 @@ function validateCurrentJob(params: {
   if (params.resolveAgentId(job) !== params.handle.agentId) {
     throw new CronRunReceiptRevisionError(params.handle.receiptId);
   }
-  // Fence host-shell precheck only against post-admission precheck mutation
-  // (command change/clear). Do NOT hash the full job definition here: mid-run
-  // delivery writeback and operator disable must not supersede as "config changed"
-  // (ClawSweeper P1 on #112375; narrowed after CI catch-up/disable regressions).
-  if (resolveCronJobPrecheckRevision(job) !== params.handle.configRevision) {
+  // Fence admitted execution snapshot (payload/precheck/session/...) while
+  // allowing mid-run delivery writeback and operator disable (excluded from
+  // resolveCronJobExecutionRevision). ClawSweeper P1 on #112375.
+  if (resolveCronJobExecutionRevision(job) !== params.handle.configRevision) {
     throw new CronRunReceiptRevisionError(
       params.handle.receiptId,
-      "cron job precheck configuration changed",
+      "cron job configuration changed",
     );
   }
   return job;
@@ -391,7 +390,7 @@ export function prepareCronRunReceiptClaim(params: {
     receiptId: crypto.randomUUID(),
     storeKey,
     jobId: params.job.id,
-    configRevision: resolveCronJobPrecheckRevision(params.job),
+    configRevision: resolveCronJobExecutionRevision(params.job),
     agentId: params.agentId,
     ownerPid: process.pid,
     ownerStartTime,
