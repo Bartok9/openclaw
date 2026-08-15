@@ -1,3 +1,6 @@
+/** Executes a cron job without mutating persisted job state. */
+import { resolveAgentConfig } from "../../agents/agent-scope-config.js";
+import { loadConfig } from "../../config/io.runtime.js";
 import {
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
   type HeartbeatRunResult,
@@ -9,7 +12,6 @@ import {
 } from "../active-jobs.js";
 import { resolveCronJobEffectiveAgentId } from "../agent-id.js";
 import { isHeartbeatTaskCronJob } from "../heartbeat-task.js";
-/** Executes a cron job without mutating persisted job state. */
 import { cronRunOutcomeFromPrecheck, runCronJobPrecheck } from "../job-precheck.js";
 import { createCronRunDiagnosticsFromError } from "../run-diagnostics.js";
 import { resolveCronToolsAllowExecTargetRecoveryError } from "../scheduled-tool-policy.js";
@@ -80,11 +82,31 @@ export async function executeJobCore(
   }
   // Optional shell precheck after stream admission: cheapest gate, no model call when no work.
   if (job.precheck?.command) {
+    // Resolve effective tools.exec (global + per-agent) the same way system.run does.
+    // Approvals alone default to security=full; without this layer, tools.exec.security=deny
+    // would be bypassed for unattended prechecks (ClawSweeper P1 on #112375).
+    let toolsExec: { mode?: string; security?: string; ask?: string } | undefined;
+    let agentToolsExec: typeof toolsExec;
+    try {
+      const cfg = loadConfig();
+      toolsExec = cfg.tools?.exec;
+      const agentId =
+        job.agentId ?? state.deps.resolveDefaultAgentId?.() ?? state.deps.defaultAgentId;
+      if (agentId) {
+        agentToolsExec = resolveAgentConfig(cfg, agentId)?.tools?.exec;
+      }
+    } catch {
+      // Fail closed on config read errors: deny host-shell precheck rather than
+      // falling through to approval-file defaults (security=full).
+      toolsExec = { security: "deny" };
+    }
     const precheckResult = await runCronJobPrecheck(job.precheck, {
       abortSignal,
       authz: {
         triggersEnabled: state.deps.cronConfig?.triggers?.enabled === true,
         agentId: job.agentId,
+        toolsExec,
+        agentToolsExec,
       },
     });
     if (precheckResult.decision !== "run") {
