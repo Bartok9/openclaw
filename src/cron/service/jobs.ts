@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines -- precheck dual-contract + validation context grew this module; split later. */
 /** Cron job scheduling, validation, creation, and patch helpers. */
 import crypto from "node:crypto";
 import {
