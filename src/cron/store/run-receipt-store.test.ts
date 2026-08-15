@@ -239,5 +239,31 @@ describe("cron run receipt store", () => {
       finishedAtMs: 421,
       error: "configuration changed",
     });
+
+    // Non-precheck definition drift (delivery writeback / disable) must not fence.
+    await saveCronStore(storePath, { version: 1, jobs: [admitted] });
+    const receipt3 = claim(storePath, admitted, 430);
+    await saveCronStore(storePath, {
+      version: 1,
+      jobs: [
+        {
+          ...admitted,
+          enabled: false,
+          delivery: { mode: "announce", channel: "telegram", to: "-100/1" },
+          updatedAtMs: 5,
+        },
+      ],
+    });
+    expect(() =>
+      assertCronRunReceiptCurrent({
+        handle: receipt3,
+        resolveAgentId: (job) => job.agentId!,
+      }),
+    ).not.toThrow();
+    finishCronRunReceipt({
+      handle: receipt3,
+      status: "ok",
+      finishedAtMs: 431,
+    });
   });
 });
