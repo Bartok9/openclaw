@@ -49,6 +49,21 @@ describe("rollupCronRunCost", () => {
     expect(r.totalTokens).toBe(15);
     expect(r.modelRuns).toBe(1);
   });
+
+  it("counts modelRuns from model/provider or usage object, not positive tokens only", () => {
+    const zeroUsage = rollupCronRunCost([
+      entry({ status: "ok", usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } }),
+    ]);
+    expect(zeroUsage.modelRuns).toBe(1);
+    const byModel = rollupCronRunCost([entry({ status: "ok", model: "gpt-test" })]);
+    expect(byModel.modelRuns).toBe(1);
+    const noSignal = rollupCronRunCost([entry({ status: "ok" })]);
+    expect(noSignal.modelRuns).toBe(0);
+    const skipped = rollupCronRunCost([
+      entry({ status: "skipped", error: "precheck-no-work", summary: "precheck-no-work" }),
+    ]);
+    expect(skipped.modelRuns).toBe(0);
+  });
 });
 
 describe("mergeCronRunCostRollups", () => {
