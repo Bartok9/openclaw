@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { describeInterpreterInlineEval } from "../infra/command-analysis/inline-eval.js";
+import { detectPolicyInlineEval } from "../infra/command-analysis/policy.js";
 import {
   evaluateShellAllowlistWithAuthorization,
   resolveExecApprovalsLocked,
@@ -117,10 +119,13 @@ export function interpretPrecheckOutput(params: {
   const stdout = params.stdout ?? "";
   const stderr = params.stderr ?? "";
   const head = stdout.trimStart();
-  const workPrefix = params.workStdoutPrefix ?? "WORK_NEEDED";
-  const noWorkPrefix = params.noWorkStdoutPrefix ?? "NO_WORK";
+  // Empty prefixes must never match (String#startsWith("") is always true).
+  const workPrefixRaw = params.workStdoutPrefix ?? "WORK_NEEDED";
+  const noWorkPrefixRaw = params.noWorkStdoutPrefix ?? "NO_WORK";
+  const workPrefix = workPrefixRaw.trim().length > 0 ? workPrefixRaw : "WORK_NEEDED";
+  const noWorkPrefix = noWorkPrefixRaw.trim().length > 0 ? noWorkPrefixRaw : "NO_WORK";
 
-  if (head.startsWith(noWorkPrefix)) {
+  if (noWorkPrefix.length > 0 && head.startsWith(noWorkPrefix)) {
     return {
       decision: "skip",
       reason: PRECHECK_NO_WORK_REASON,
@@ -129,7 +134,7 @@ export function interpretPrecheckOutput(params: {
       stderr,
     };
   }
-  if (head.startsWith(workPrefix)) {
+  if (workPrefix.length > 0 && head.startsWith(workPrefix)) {
     return { decision: "run", exitCode: params.exitCode, stdout, stderr };
   }
 
@@ -195,6 +200,8 @@ type ExecToolConfigLayer = {
   mode?: ExecMode;
   security?: ExecSecurity;
   ask?: ExecAsk;
+  /** Require approval for interpreter inline-eval carriers (python -c, etc.). */
+  strictInlineEval?: boolean;
   /** Global/agent tools.exec.safeBins — same surface as system.run. */
   safeBins?: string[] | null;
   safeBinProfiles?: SafeBinProfileFixtures | null;
@@ -221,6 +228,11 @@ type CronJobPrecheckAuthz = {
    * Per-agent `agents.entries.<id>.tools.exec` config layer (same as system.run).
    */
   agentToolsExec?: ExecToolConfigLayer;
+  /**
+   * Explicit strictInlineEval override (tests). When omitted, OR of global/agent
+   * tools.exec.strictInlineEval layers (same as system.run).
+   */
+  strictInlineEval?: boolean;
   /**
    * When true, skip live approvals resolution and use `security` (or deny) only.
    * Tests inject this to assert policy denial without host file side effects.
@@ -264,6 +276,36 @@ export async function authorizeCronJobPrecheckCommand(params: {
       };
     }
     if (security === "full") {
+      const strictInlineEval =
+        params.authz.strictInlineEval === true ||
+        params.authz.toolsExec?.strictInlineEval === true ||
+        params.authz.agentToolsExec?.strictInlineEval === true;
+      if (strictInlineEval) {
+        const safeBinPolicy = resolveExecSafeBinRuntimePolicy({
+          global: params.authz.toolsExec,
+          local: params.authz.agentToolsExec,
+        });
+        const allowlistEval = await evaluateShellAllowlistWithAuthorization({
+          command: params.command,
+          allowlist: [],
+          safeBins: safeBinPolicy.safeBins,
+          safeBinProfiles: safeBinPolicy.safeBinProfiles,
+          trustedSafeBinDirs: safeBinPolicy.trustedSafeBinDirs,
+          cwd: params.cwd,
+          env: resolvePrecheckExecEnv(params.env),
+          platform: process.platform,
+        });
+        const inlineEvalHit = detectPolicyInlineEval(allowlistEval.segments ?? []);
+        if (inlineEvalHit !== null) {
+          return {
+            allowed: false,
+            reason:
+              `${PRECHECK_POLICY_DENIED_REASON}: ` +
+              `${describeInterpreterInlineEval(inlineEvalHit)} requires explicit approval in strictInlineEval mode ` +
+              `(unattended cron cannot prompt)`,
+          };
+        }
+      }
       return { allowed: true };
     }
     // allowlist without live file → evaluate command against empty allowlist
@@ -331,6 +373,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
           : undefined,
       security: normalizeExecSecurity(layer.security),
       ask: normalizeAsk(layer.ask),
+      ...(layer.strictInlineEval === true ? { strictInlineEval: true as const } : {}),
     };
   };
   const toolsExecLayer = normalizeLayer(params.authz.toolsExec);
@@ -403,6 +446,24 @@ export async function authorizeCronJobPrecheckCommand(params: {
 
   const isWindows = process.platform === "win32";
   const allowlistSatisfied = hostSecurity === "allowlist" ? allowlistEval.allowlistSatisfied : true;
+  // Honor tools.exec.strictInlineEval (system.run parity): unattended precheck cannot
+  // prompt, so inline-eval carriers fail closed when the policy is enabled.
+  const strictInlineEval =
+    params.authz.strictInlineEval === true ||
+    params.authz.toolsExec?.strictInlineEval === true ||
+    params.authz.agentToolsExec?.strictInlineEval === true;
+  if (strictInlineEval) {
+    const inlineEvalHit = detectPolicyInlineEval(allowlistEval.segments ?? []);
+    if (inlineEvalHit !== null) {
+      return {
+        allowed: false,
+        reason:
+          `${PRECHECK_POLICY_DENIED_REASON}: ` +
+          `${describeInterpreterInlineEval(inlineEvalHit)} requires explicit approval in strictInlineEval mode ` +
+          `(unattended cron cannot prompt)`,
+      };
+    }
+  }
   // Unattended cron has no interactive approval path. Fail closed when the
   // effective ask policy would require a prompt (tools.exec.ask or approvals).
   if (
@@ -712,6 +773,12 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
   const cwd = normalizeOptionalString(rec.cwd);
   const workStdoutPrefix = normalizeOptionalString(rec.workStdoutPrefix);
   const noWorkStdoutPrefix = normalizeOptionalString(rec.noWorkStdoutPrefix);
+  if (workStdoutPrefix !== undefined && workStdoutPrefix.trim().length === 0) {
+    throw new Error("precheck.workStdoutPrefix must be non-empty when set");
+  }
+  if (noWorkStdoutPrefix !== undefined && noWorkStdoutPrefix.trim().length === 0) {
+    throw new Error("precheck.noWorkStdoutPrefix must be non-empty when set");
+  }
   return {
     kind: "exec",
     command,

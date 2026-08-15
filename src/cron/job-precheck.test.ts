@@ -42,6 +42,19 @@ describe("interpretPrecheckOutput", () => {
     ).toBe("skip");
   });
 
+  it("does not treat empty noWorkStdoutPrefix as universal skip", () => {
+    // ClawSweeper P1: startsWith("") is always true — empty prefixes must not match.
+    const result = interpretPrecheckOutput({
+      exitCode: 0,
+      stdout: "anything",
+      stderr: "",
+      workStdoutPrefix: "",
+      noWorkStdoutPrefix: "",
+      contract: "exit-code",
+    });
+    expect(result.decision).toBe("run");
+  });
+
   it("maps unexpected exits to error (or skip when onError=skip)", () => {
     expect(interpretPrecheckOutput({ exitCode: 7, stdout: "", stderr: "boom" }).decision).toBe(
       "error",
@@ -222,6 +235,24 @@ describe("authorizeCronJobPrecheckCommand", () => {
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
       expect(result.reason).toMatch(/ask=always|requires approval/);
+    }
+  });
+
+  it("denies inline-eval carriers when tools.exec.strictInlineEval is true", async () => {
+    // ClawSweeper P1: unattended precheck must fail closed on strictInlineEval
+    // (no prompt path), matching system.run.
+    const result = await authorizeCronJobPrecheckCommand({
+      command: "python3 -c 'print(1)'",
+      authz: {
+        triggersEnabled: true,
+        security: "full",
+        securityOverrideOnly: true,
+        toolsExec: { strictInlineEval: true, security: "full" },
+      },
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.reason).toMatch(/strictInlineEval/i);
     }
   });
 });
