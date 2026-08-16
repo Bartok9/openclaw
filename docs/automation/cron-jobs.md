@@ -934,12 +934,12 @@ openclaw cron add --name inbox-poll --cron "*/15 * * * *" \
 **Security (durable contract):** the precheck command is a **persisted Gateway-host shell admission step**. It runs unattended with a bounded timeout (default 30s, capped at 5m) in the Gateway environment:
 
 - **POSIX:** fixed trusted `/bin/sh -c` (inherited `$SHELL` is ignored)
-- **Windows:** fixed trusted `cmd.exe` via `resolveTrustedWindowsCmdExe` with `/d /s /c` (inherited `%ComSpec%` is ignored)
+- **Windows:** fixed trusted `cmd.exe` via `resolveTrustedWindowsCmdExe` with `/d /s /c` (inherited `%ComSpec%` is ignored). The trusted `cmd.exe` wrapper is **transport only**; allowlist analysis applies to the inner precheck command string (same model as POSIX `/bin/sh -c`), so default `security=allowlist` remains usable without weakening to `full`.
 
 Host-shell authorization reuses the **same surface as exec / system-run**:
 
 1. `cron.triggers.enabled` must be **true** (unattended host-shell switch), and
-2. exec security `deny|allowlist|full` (approvals file + shell allowlist analysis).
+2. exec security `deny|allowlist|full` (approvals file + shell allowlist analysis on the inner command).
 
 Denied prechecks record `status=error` with reason `precheck-policy-denied` and **do not** start a payload/model turn. Treat commands like any other unattended shell you schedule — only trusted scripts, secrets in files/env (not inline), known directory preferred over ad-hoc one-liners.
 
