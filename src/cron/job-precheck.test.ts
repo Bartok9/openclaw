@@ -448,3 +448,56 @@ describe("runCronJobPrecheck", () => {
     }
   });
 });
+
+describe("Windows allowlist transport (precheck)", () => {
+  it("does not treat trusted cmd.exe transport as a blocked shell wrapper under allowlist", async () => {
+    const { evaluateSystemRunPolicy } = await import("../node-host/exec-policy.js");
+    // Mirror authorizeCronJobPrecheckCommand flags: transport is not a blocked wrapper.
+    const decision = evaluateSystemRunPolicy({
+      security: "allowlist",
+      ask: "off",
+      analysisOk: true,
+      allowlistSatisfied: true,
+      approvalDecision: null,
+      isWindows: true,
+      cmdInvocation: false,
+      shellWrapperInvocation: false,
+    });
+    expect(decision.allowed).toBe(true);
+    expect(decision.shellWrapperBlocked).toBe(false);
+
+    const blocked = evaluateSystemRunPolicy({
+      security: "allowlist",
+      ask: "off",
+      analysisOk: true,
+      allowlistSatisfied: true,
+      approvalDecision: null,
+      isWindows: true,
+      cmdInvocation: true,
+      shellWrapperInvocation: true,
+    });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.shellWrapperBlocked).toBe(true);
+  });
+
+  it("allowlists an allowlisted command on Windows platform with override-only allowlist", async () => {
+    const prev = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      const result = await authorizeCronJobPrecheckCommand({
+        command: "echo NO_WORK",
+        authz: {
+          triggersEnabled: true,
+          security: "allowlist",
+          securityOverrideOnly: true,
+        },
+      });
+      // Empty allowlist → miss is OK; must NOT be windows shell-wrapper blocked reason.
+      if (!result.allowed) {
+        expect(result.reason).not.toMatch(/cmd\.exe|shell wrapper|Windows shell/i);
+      }
+    } finally {
+      Object.defineProperty(process, "platform", { value: prev });
+    }
+  });
+});

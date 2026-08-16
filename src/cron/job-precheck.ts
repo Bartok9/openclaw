@@ -324,6 +324,14 @@ export async function authorizeCronJobPrecheckCommand(params: {
       platform: process.platform,
     });
     const isWindows = process.platform === "win32";
+    // Precheck uses a fixed trusted shell *transport* (POSIX /bin/sh -c, Windows
+    // trusted cmd.exe /d /s /c). Allowlist decisions are on the analyzed *inner*
+    // command string — same model as POSIX system.run shell transport. Do NOT set
+    // shellWrapperInvocation+cmdInvocation on Windows: that combination is reserved
+    // for unattended cmd wrappers that change builtins/quoting semantics and is
+    // intentionally blocked under allowlist without approval (unattended cron cannot
+    // prompt). Classifying transport as a blocked shell wrapper made every Windows
+    // precheck unusable under the default allowlist security.
     const decision = evaluateSystemRunPolicy({
       security: "allowlist",
       ask: "off",
@@ -331,9 +339,8 @@ export async function authorizeCronJobPrecheckCommand(params: {
       allowlistSatisfied: allowlistEval.allowlistSatisfied,
       approvalDecision: null,
       isWindows,
-      // Precheck always launches via cmd.exe /d /s /c on Windows — classify as such.
-      cmdInvocation: isWindows,
-      shellWrapperInvocation: isWindows,
+      cmdInvocation: false,
+      shellWrapperInvocation: false,
     });
     if (!decision.allowed) {
       return {
@@ -489,9 +496,10 @@ export async function authorizeCronJobPrecheckCommand(params: {
     durableApprovalSatisfied: false,
     approvalDecision: null,
     isWindows,
-    // Precheck always launches via cmd.exe /d /s /c on Windows — classify as such.
-    cmdInvocation: isWindows,
-    shellWrapperInvocation: isWindows,
+    // Trusted shell is transport only; allowlist applies to the inner command.
+    // See securityOverrideOnly allowlist branch comment above.
+    cmdInvocation: false,
+    shellWrapperInvocation: false,
   });
 
   if (!decision.allowed) {
