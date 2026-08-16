@@ -159,7 +159,7 @@ export function assertPrecheckSupport(
     normalized = normalizeCronJobPrecheck(job.precheck);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`cron precheck is invalid: ${message}`);
+    throw new Error(`cron precheck is invalid: ${message}`, { cause: err });
   }
   if (!normalized) {
     throw new Error("cron precheck requires a non-empty command");
