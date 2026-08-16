@@ -64,6 +64,46 @@ const PRECHECK_INVALID_REASON = "precheck-invalid";
 const PRECHECK_TRIGGERS_DISABLED =
   "cron precheck is a host-shell command and is disabled; set cron.triggers.enabled=true to allow unattended precheck scripts";
 
+/** Shell tool names that must appear in job.payload.toolsAllow for host-shell precheck. */
+const PRECHECK_SHELL_TOOL_NAMES = new Set(["exec", "bash", "shell", "system.run", "system_run"]);
+
+/**
+ * Job-scoped toolsAllow must permit exec/shell for precheck. Undefined allowlist = unrestricted.
+ * Empty or non-matching cap denies (same idea as payload tool construction).
+ */
+export function cronToolsAllowPermitsPrecheckExec(
+  toolsAllow: readonly string[] | undefined | null,
+): boolean {
+  if (toolsAllow === undefined || toolsAllow === null) {
+    return true;
+  }
+  return toolsAllow.some((tool) => {
+    if (typeof tool !== "string") {
+      return false;
+    }
+    const normalized = tool.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+    if (normalized === "*" || normalized === "exec" || normalized.endsWith(".exec")) {
+      return true;
+    }
+    // Common shell aliases + simple glob suffix (e.g. "sys*")
+    if (PRECHECK_SHELL_TOOL_NAMES.has(normalized)) {
+      return true;
+    }
+    if (normalized.endsWith("*")) {
+      const prefix = normalized.slice(0, -1);
+      return (
+        !prefix ||
+        "exec".startsWith(prefix) ||
+        [...PRECHECK_SHELL_TOOL_NAMES].some((name) => name.startsWith(prefix))
+      );
+    }
+    return false;
+  });
+}
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 5 * 60_000;
 const MAX_CAPTURE_CHARS = 4_000;
@@ -238,6 +278,12 @@ type CronJobPrecheckAuthz = {
    * Tests inject this to assert policy denial without host file side effects.
    */
   securityOverrideOnly?: boolean;
+  /**
+   * Job payload toolsAllow (caller-scoped cron tool cap). When set and it does not
+   * permit exec/shell, precheck is denied even if global/agent tools.exec allows it.
+   * Undefined = unrestricted (legacy jobs without an explicit cap).
+   */
+  toolsAllow?: readonly string[] | null;
 };
 
 /** Normalize security strings; invalid values fail closed to deny. */
@@ -263,6 +309,13 @@ export async function authorizeCronJobPrecheckCommand(params: {
 }): Promise<{ allowed: true } | { allowed: false; reason: string }> {
   if (!params.authz.triggersEnabled) {
     return { allowed: false, reason: PRECHECK_TRIGGERS_DISABLED };
+  }
+
+  if (!cronToolsAllowPermitsPrecheckExec(params.authz.toolsAllow)) {
+    return {
+      allowed: false,
+      reason: `${PRECHECK_POLICY_DENIED_REASON}: job toolsAllow does not permit exec (host-shell precheck requires exec in the job tool cap)`,
+    };
   }
 
   const requested = normalizeExecSecurity(params.authz.security);
@@ -788,14 +841,16 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
     }
   }
   const cwd = normalizeOptionalString(rec.cwd);
-  const workStdoutPrefix = normalizeOptionalString(rec.workStdoutPrefix);
-  const noWorkStdoutPrefix = normalizeOptionalString(rec.noWorkStdoutPrefix);
-  if (workStdoutPrefix !== undefined && workStdoutPrefix.trim().length === 0) {
+  // Reject whitespace-only prefixes before normalizeOptionalString collapses them
+  // to absent (which would silently restore default WORK_NEEDED/NO_WORK).
+  if (typeof rec.workStdoutPrefix === "string" && rec.workStdoutPrefix.trim().length === 0) {
     throw new Error("precheck.workStdoutPrefix must be non-empty when set");
   }
-  if (noWorkStdoutPrefix !== undefined && noWorkStdoutPrefix.trim().length === 0) {
+  if (typeof rec.noWorkStdoutPrefix === "string" && rec.noWorkStdoutPrefix.trim().length === 0) {
     throw new Error("precheck.noWorkStdoutPrefix must be non-empty when set");
   }
+  const workStdoutPrefix = normalizeOptionalString(rec.workStdoutPrefix);
+  const noWorkStdoutPrefix = normalizeOptionalString(rec.noWorkStdoutPrefix);
   return {
     kind: "exec",
     command,

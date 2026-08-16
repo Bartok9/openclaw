@@ -501,3 +501,56 @@ describe("Windows allowlist transport (precheck)", () => {
     }
   });
 });
+
+describe("cronToolsAllowPermitsPrecheckExec / job toolsAllow authz", () => {
+  it("denies precheck when job toolsAllow omits exec", async () => {
+    const result = await authorizeCronJobPrecheckCommand({
+      command: "echo hi",
+      authz: {
+        triggersEnabled: true,
+        security: "full",
+        securityOverrideOnly: true,
+        toolsAllow: ["read"],
+      },
+    });
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) {
+      expect(result.reason).toContain("toolsAllow");
+      expect(result.reason).toContain("exec");
+    }
+  });
+
+  it("allows precheck when toolsAllow includes exec or wildcard", async () => {
+    for (const toolsAllow of [["exec"], ["*"], ["read", "exec"], undefined] as const) {
+      const result = await authorizeCronJobPrecheckCommand({
+        command: "echo hi",
+        authz: {
+          triggersEnabled: true,
+          security: "full",
+          securityOverrideOnly: true,
+          toolsAllow,
+        },
+      });
+      expect(result.allowed).toBe(true);
+    }
+  });
+});
+
+describe("normalizeCronJobPrecheck whitespace prefixes", () => {
+  it("rejects whitespace-only workStdoutPrefix / noWorkStdoutPrefix", () => {
+    expect(() =>
+      normalizeCronJobPrecheck({
+        kind: "exec",
+        command: "exit 0",
+        workStdoutPrefix: "   ",
+      }),
+    ).toThrow(/workStdoutPrefix/);
+    expect(() =>
+      normalizeCronJobPrecheck({
+        kind: "exec",
+        command: "exit 0",
+        noWorkStdoutPrefix: "\t",
+      }),
+    ).toThrow(/noWorkStdoutPrefix/);
+  });
+});
