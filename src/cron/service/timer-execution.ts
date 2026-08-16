@@ -163,6 +163,8 @@ export async function executeJobCore(
         agentId: effectiveAgentId,
         toolsExec,
         agentToolsExec,
+        // Honor job-scoped payload tool cap (ClawSweeper: no precheck when exec denied).
+        toolsAllow: job.payload?.toolsAllow,
       },
     });
     if (precheckResult.decision !== "run") {

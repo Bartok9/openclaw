@@ -581,8 +581,8 @@ export const CronJobPrecheckSchema = closedObject({
   ),
   workExitCodes: Type.Optional(Type.Array(Type.Integer())),
   noWorkExitCodes: Type.Optional(Type.Array(Type.Integer())),
-  workStdoutPrefix: Type.Optional(NonEmptyString),
-  noWorkStdoutPrefix: Type.Optional(NonEmptyString),
+  workStdoutPrefix: Type.Optional(Type.String({ minLength: 1, pattern: ".*\\S.*" })),
+  noWorkStdoutPrefix: Type.Optional(Type.String({ minLength: 1, pattern: ".*\\S.*" })),
   onError: Type.Optional(Type.Union([Type.Literal("fail"), Type.Literal("skip")])),
 });
 
