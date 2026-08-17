@@ -30,9 +30,9 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function readGatewayShape<T = unknown>(value: unknown): T {
-  // SAFETY: gateway CLI JSON is untyped; callers receive a narrowed shape.
-  return value as T;
+function readGatewayShape(value: unknown): unknown {
+  // SAFETY: gateway CLI JSON is untyped; callers narrow the returned shape.
+  return value;
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
@@ -101,7 +101,7 @@ async function waitForCronRunCompletion(params: {
       runId: params.runId,
       limit: 1,
     });
-    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(pageRaw);
+    const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntryResult[] };
     const entry = page.entries?.[0];
     if (entry?.status === "ok" || entry?.status === "error" || entry?.status === "skipped") {
       return entry;
@@ -266,11 +266,11 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
-              const listed = readGatewayShape<{
+              const listed = readGatewayShape(res) as {
                 jobs?: CronJob[];
                 hasMore?: boolean;
                 nextOffset?: number | null;
-              }>(res);
+              };
               for (const job of listed.jobs ?? []) {
                 jobIds.push(job.id);
                 if (jobIds.length >= CRON_STATS_MAX_JOBS) {
@@ -296,7 +296,7 @@ export function registerCronSimpleCommands(cron: Command) {
               id: jobId,
               limit,
             });
-            const page = readGatewayShape<{ entries?: CronRunLogEntry[] }>(pageRaw);
+            const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntry[] };
             const rollup = rollupCronRunCost(page.entries ?? []);
             if (rollup.totalRuns > 0) {
               perJob.push({ jobId, rollup });
@@ -354,7 +354,7 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
-          const result = readGatewayShape<CronRunCommandResult | undefined>(res);
+          const result = readGatewayShape(res) as CronRunCommandResult | undefined;
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
               throw new Error("cron run did not return a runId to wait for");
