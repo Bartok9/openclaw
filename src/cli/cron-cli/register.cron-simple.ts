@@ -30,8 +30,9 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function readGatewayShape<T>(value: unknown): T {
-  // SAFETY: gateway CLI JSON is untyped; callers request the expected shape.
+function readGatewayShape<T>(value: unknown, _shape?: T): T {
+  // SAFETY: gateway CLI JSON is untyped; callers request the expected shape via T.
+  // `_shape` keeps T referenced twice in the signature (oxlint no-unnecessary-type-parameters).
   return value as T; // SAFETY: untyped gateway CLI JSON narrowed by call-site T.
 }
 
