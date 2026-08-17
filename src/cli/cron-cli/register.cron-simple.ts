@@ -30,8 +30,9 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function unsafeGatewayCast<T>(value: unknown): T {
-  return value as T; // SAFETY: gateway CLI JSON shape checked at call sites.
+function unsafeGatewayCast(value: unknown): never {
+  // SAFETY: gateway CLI JSON shape checked at call sites; never lets callers assign without a type param.
+  return value as never;
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
