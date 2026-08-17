@@ -30,9 +30,9 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function readGatewayShape(value: unknown): unknown {
-  // SAFETY: gateway CLI JSON is untyped; callers narrow via assignment/assertion.
-  return value;
+function readGatewayShape<T>(value: unknown): T {
+  // SAFETY: gateway CLI JSON is untyped; callers request the expected shape.
+  return value as T; // SAFETY: untyped gateway CLI JSON narrowed by call-site T.
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
@@ -101,8 +101,7 @@ async function waitForCronRunCompletion(params: {
       runId: params.runId,
       limit: 1,
     });
-    // SAFETY: gateway cron.runs page for wait poll.
-    const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntryResult[] };
+    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(pageRaw);
     const entry = page.entries?.[0];
     if (entry?.status === "ok" || entry?.status === "error" || entry?.status === "skipped") {
       return entry;
@@ -267,12 +266,11 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
-              // SAFETY: gateway cron.list page.
-              const listed = readGatewayShape(res) as {
+              const listed = readGatewayShape<{
                 jobs?: CronJob[];
                 hasMore?: boolean;
                 nextOffset?: number | null;
-              };
+              }>(res);
               for (const job of listed.jobs ?? []) {
                 jobIds.push(job.id);
                 if (jobIds.length >= CRON_STATS_MAX_JOBS) {
@@ -298,8 +296,7 @@ export function registerCronSimpleCommands(cron: Command) {
               id: jobId,
               limit,
             });
-            // SAFETY: gateway cron.runs page for cost stats.
-            const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntry[] };
+            const page = readGatewayShape<{ entries?: CronRunLogEntry[] }>(pageRaw);
             const rollup = rollupCronRunCost(page.entries ?? []);
             if (rollup.totalRuns > 0) {
               perJob.push({ jobId, rollup });
@@ -357,8 +354,7 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
-          // SAFETY: gateway cron.run result.
-          const result = readGatewayShape(res) as CronRunCommandResult | undefined;
+          const result = readGatewayShape<CronRunCommandResult | undefined>(res);
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
               throw new Error("cron run did not return a runId to wait for");
