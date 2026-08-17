@@ -304,6 +304,7 @@ describe("cron service timer seam coverage", () => {
     });
     const job: CronJob = {
       ...createDueMainJob({ now, wakeMode: "now" }),
+      payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] as const },
       precheck: { kind: "exec", command: "exit 2" },
     };
 
@@ -337,6 +338,7 @@ describe("cron service timer seam coverage", () => {
     const job: CronJob = {
       ...createDueMainJob({ now, wakeMode: "now" }),
       // exit code 2 = NO_WORK under the default exit-code contract.
+      payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] as const },
       precheck: { kind: "exec", command: "exit 2" },
     };
 
@@ -376,6 +378,7 @@ describe("cron service timer seam coverage", () => {
       const job: CronJob = {
         ...createDueIsolatedAgentJob({ now }),
         id: "precheck-skipped-error-persist",
+        payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] },
         precheck: { kind: "exec", command: "exit 7", onError: "skip" },
       };
       await writeCronStoreSnapshot({ storePath, jobs: [job] });
@@ -410,6 +413,7 @@ describe("cron service timer seam coverage", () => {
     const job: CronJob = {
       ...createDueIsolatedAgentJob({ now }),
       id: "precheck-no-work-persist",
+      payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] as const },
       precheck: { kind: "exec", command: "exit 2" },
     };
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
@@ -469,6 +473,10 @@ describe("cron service timer seam coverage", () => {
         // Explicit agent-less: ownership comes from sessionKey agent:ops:...
         agentId: undefined,
         sessionKey: "agent:ops:main",
+        payload: {
+          ...createDueMainJob({ now, wakeMode: "now" }).payload,
+          toolsAllow: ["*"],
+        },
         precheck: { kind: "exec", command: "exit 2" },
       };
       const result = await executeJobCore(state, job);
@@ -481,6 +489,53 @@ describe("cron service timer seam coverage", () => {
     }
   });
 
+  it.each(["systemEvent", "heartbeat"] as const)(
+    "denies host-shell precheck for capless %s payload (no toolsAllow)",
+    async (kind) => {
+      // ClawSweeper P1: non-tool payloads used to keep toolsAllow undefined, which
+      // the precheck runner treated as unrestricted host exec. Fail closed instead.
+      const { storePath } = await makeStorePath();
+      const now = Date.parse("2026-08-17T04:00:00.000Z");
+      const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
+      const enqueueSystemEvent = vi.fn();
+      const requestHeartbeat = vi.fn();
+      const state = createCronServiceState({
+        storePath,
+        cronEnabled: true,
+        cronConfig: { triggers: { enabled: true } },
+        log: logger,
+        nowMs: () => now,
+        enqueueSystemEvent,
+        requestHeartbeat,
+        runIsolatedAgentJob,
+      });
+      const base =
+        kind === "heartbeat"
+          ? {
+              ...createDueMainJob({ now, wakeMode: "next-heartbeat" }),
+              payload: { kind: "heartbeat" as const },
+            }
+          : createDueMainJob({ now, wakeMode: "now" });
+      const job: CronJob = {
+        ...base,
+        id: `precheck-capless-${kind}`,
+        // Explicitly capless — no toolsAllow stamped on payload
+        payload: { ...base.payload },
+        precheck: { kind: "exec", command: "echo should-not-run; exit 0" },
+      };
+      delete (job.payload as { toolsAllow?: unknown }).toolsAllow;
+
+      const result = await executeJobCore(state, job);
+      expect(result.status).toBe("error");
+      expect(String((result as { error?: string }).error ?? "")).toMatch(
+        /toolsAllow|precheck-policy-denied/,
+      );
+      expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+      expect(enqueueSystemEvent).not.toHaveBeenCalled();
+      expect(requestHeartbeat).not.toHaveBeenCalled();
+    },
+  );
+
   it("persists precheck-policy-denied through onTimer without an agent turn", async () => {
     const { storePath } = await makeStorePath();
     const now = Date.parse("2026-07-25T12:30:00.000Z");
@@ -488,6 +543,7 @@ describe("cron service timer seam coverage", () => {
     const job: CronJob = {
       ...createDueIsolatedAgentJob({ now }),
       id: "precheck-denied-persist",
+      payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] },
       precheck: { kind: "exec", command: "exit 0" },
     };
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
