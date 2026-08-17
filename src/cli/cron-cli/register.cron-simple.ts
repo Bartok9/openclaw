@@ -9,7 +9,6 @@ import {
   rollupCronRunCost,
   type CronRunCostRollup,
 } from "../../cron/run-cost-rollup.js";
->>>>>>> ae8ca5d5b15 (feat(cron): shell precheck gate to skip LLM when no work)
 import { defaultRuntime } from "../../runtime.js";
 import { sleep } from "../../utils/sleep.js";
 import type { GatewayRpcOpts } from "../gateway-rpc.js";
@@ -31,9 +30,9 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function readGatewayShape<T = unknown>(value: unknown): T {
-  // SAFETY: gateway CLI JSON is untyped; callers receive a narrowed shape.
-  return value as T;
+function readGatewayShape(value: unknown): unknown {
+  // SAFETY: gateway CLI JSON is untyped; callers narrow the returned shape.
+  return value;
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
@@ -90,68 +89,13 @@ async function waitForCronRunCompletion(params: {
     // History reads share the wait deadline, but enqueue keeps its own RPC
     // timeout and a zero-duration wait still gets one immediate ledger poll.
     const pollOpts = { ...params.opts, timeout: String(pollTimeoutMs) };
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-    const page = (await callGatewayFromCli("cron.runs", pollOpts, {
-      id: params.jobId,
-      runId: params.runId,
-      limit: 1,
-<<<<<<< HEAD
-<<<<<<< HEAD
-    })) as { entries?: CronRunLogEntry[] };
-=======
-      // SAFETY: gateway cron.runs returns a page object with optional entries.
-    })) as { entries?: CronRunLogEntryResult[] };
->>>>>>> 2027c6e9d46 (fix(cron): place SAFETY comments on assertion operator lines)
-=======
-    })) as { entries?: CronRunLogEntryResult[] }; // SAFETY: cron.runs page with optional entries.
->>>>>>> f55edd1d42c (fix(cron): CI wake — SAFETY on as-lines, split timer max-lines)
-=======
-    const page = unsafeGatewayCast<{ entries?: CronRunLogEntryResult[] }>(
-=======
-    const page = unsafeGatewayCast(
->>>>>>> 916890b893f (fix(cron): restore gateway cast typing without type params)
-=======
-    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(
->>>>>>> 87fe19d9cfd (fix(cron): stamp toolsAllow when precheck is added to legacy jobs)
-      await callGatewayFromCli("cron.runs", pollOpts, {
-        id: params.jobId,
-        runId: params.runId,
-        limit: 1,
-      }),
-<<<<<<< HEAD
-<<<<<<< HEAD
-    );
->>>>>>> e35ec314496 (fix(cron): drop type assertions for baseline ratchet + oxfmt docs)
-=======
-    ) as { entries?: CronRunLogEntryResult[] };
->>>>>>> 916890b893f (fix(cron): restore gateway cast typing without type params)
-=======
-    );
->>>>>>> 87fe19d9cfd (fix(cron): stamp toolsAllow when precheck is added to legacy jobs)
-=======
     const pageRaw = await callGatewayFromCli("cron.runs", pollOpts, {
       id: params.jobId,
       runId: params.runId,
       limit: 1,
     });
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
     // SAFETY: gateway cron.runs page for wait poll.
-    const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntryResult[] };
->>>>>>> 807724a33e1 (fix(cron): drop unused unsafeGatewayCast in cron-simple CLI)
-=======
-    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(pageRaw);
->>>>>>> 7b622296712 (fix(cron): collapse cron-simple gateway casts to one SAFETY assert)
-=======
-    const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntryResult[] }; // SAFETY: untyped gateway CLI JSON
->>>>>>> ac0849108e1 (fix(cron): drop single-use type param on readGatewayShape)
-=======
-    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(pageRaw);
->>>>>>> dfa1056b921 (fix(cron): type-parameter gateway shape helper (assertion ratchet))
+    const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntry[] };
     const entry = page.entries?.[0];
     if (entry?.status === "ok" || entry?.status === "error" || entry?.status === "skipped") {
       return entry;
@@ -316,11 +260,11 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
-              const listed = readGatewayShape<{
+              const listed = readGatewayShape(res) as {
                 jobs?: CronJob[];
                 hasMore?: boolean;
                 nextOffset?: number | null;
-              }>(res);
+              };
               for (const job of listed.jobs ?? []) {
                 jobIds.push(job.id);
                 if (jobIds.length >= CRON_STATS_MAX_JOBS) {
@@ -346,7 +290,7 @@ export function registerCronSimpleCommands(cron: Command) {
               id: jobId,
               limit,
             });
-            const page = readGatewayShape<{ entries?: CronRunLogEntry[] }>(pageRaw);
+            const page = readGatewayShape(pageRaw) as { entries?: CronRunLogEntry[] };
             const rollup = rollupCronRunCost(page.entries ?? []);
             if (rollup.totalRuns > 0) {
               perJob.push({ jobId, rollup });
@@ -408,7 +352,7 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
-          const result = readGatewayShape<CronRunCommandResult | undefined>(res);
+          const result = readGatewayShape(res) as CronRunCommandResult | undefined;
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
               throw new Error("cron run did not return a runId to wait for");
