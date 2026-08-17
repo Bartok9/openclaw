@@ -35,14 +35,11 @@ import {
  * Honest cast boundary (no runtime schema): protocol responses are validated
  * only by field access at call sites. Kept as a single SAFETY site so the
  * assertion-safety ratchet does not grow free `as` casts in this file.
- *
- * `GatewayRpcShape<T>` is an identity alias so `T` is a real boundary in the
- * signature twice (parameterized alias + return), not a lint-only dummy arg.
  */
-type GatewayRpcShape<T> = T;
-function readGatewayShape<T>(value: unknown): GatewayRpcShape<T> {
+// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- CLI helper lets call sites ascribe untyped Gateway RPC JSON.
+function readGatewayShape<T>(value: unknown): T {
   // SAFETY: gateway CLI JSON is untyped; callers request the expected shape via T.
-  return value as GatewayRpcShape<T>;
+  return value as T;
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
