@@ -210,7 +210,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
 
   it("passes tools.exec layers into resolveExecSafeBinRuntimePolicy (source contract)", () => {
     // ClawSweeper P1: empty {} dropped global/agent safeBins. Keep the call site wired.
-    const src = fs.readFileSync(new URL("./job-precheck.ts", import.meta.url), "utf8");
+    const src = fs.readFileSync(new URL("./job-precheck-authz.ts", import.meta.url), "utf8");
     expect(src).toContain("global: params.authz.toolsExec");
     expect(src).toContain("local: params.authz.agentToolsExec");
     expect(src).not.toMatch(/resolveExecSafeBinRuntimePolicy\(\{\s*\}\)/);
@@ -595,22 +595,22 @@ describe("normalizeCronJobPrecheck whitespace prefixes", () => {
   });
 });
 
-
 describe("runCronJobPrecheck receipt fence after authz", () => {
   it("invokes assertRunCurrent after authorization and before spawn", async () => {
     const order: string[] = [];
     const spawnImpl = ((..._args: unknown[]) => {
       order.push("spawn");
-      const { EventEmitter } = require("node:events") as typeof import("node:events");
       const child = new EventEmitter() as import("node:events").EventEmitter & {
         pid: number;
-        stdout: import("node:events").EventEmitter;
-        stderr: import("node:events").EventEmitter;
+        stdout: import("node:events").EventEmitter & { setEncoding: (enc: string) => void };
+        stderr: import("node:events").EventEmitter & { setEncoding: (enc: string) => void };
         kill: () => boolean;
       };
       child.pid = 4242;
-      child.stdout = new EventEmitter();
-      child.stderr = new EventEmitter();
+      child.stdout = new EventEmitter() as typeof child.stdout;
+      child.stderr = new EventEmitter() as typeof child.stderr;
+      child.stdout.setEncoding = () => {};
+      child.stderr.setEncoding = () => {};
       child.kill = () => true;
       queueMicrotask(() => {
         child.stdout.emit("data", "ok\n");
@@ -627,6 +627,7 @@ describe("runCronJobPrecheck receipt fence after authz", () => {
           triggersEnabled: true,
           security: "full",
           securityOverrideOnly: true,
+          toolsAllow: ["*"],
         },
         assertRunCurrent: () => {
           order.push("assert");
@@ -653,6 +654,7 @@ describe("runCronJobPrecheck receipt fence after authz", () => {
             triggersEnabled: true,
             security: "full",
             securityOverrideOnly: true,
+            toolsAllow: ["*"],
           },
           assertRunCurrent: () => {
             throw new Error("receipt-stale");

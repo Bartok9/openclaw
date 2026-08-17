@@ -31,8 +31,7 @@ import {
 } from "./shared.js";
 
 function unsafeGatewayCast<T>(value: unknown): T {
-  const loose: any = value;
-  return loose;
+  return value as T; // SAFETY: gateway CLI JSON shape checked at call sites.
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
