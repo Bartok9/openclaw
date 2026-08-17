@@ -305,7 +305,7 @@ describe("runCronJobPrecheck", () => {
   });
 
   it("blocks host spawn when tools.exec.host is sandbox/node (no gateway bypass)", async () => {
-    let spawned = false;
+    let spawned!: boolean;
     const spawnImpl = ((..._args: unknown[]) => {
       spawned = true;
       throw new Error("should not spawn");
