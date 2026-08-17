@@ -329,7 +329,14 @@ function requiresExplicitAgentRuntimeToolsAllow(params: {
 }
 
 function cronPatchTouchesToolRuntime(patch: CronJobPatch): boolean {
-  return patch.payload !== undefined || Object.hasOwn(patch, "trigger");
+  // Host-shell precheck is an unattended executable surface. Precheck-only
+  // updates must take the same explicit-cap + caller-bound scheduled authority
+  // path as payload/trigger tool-runtime mutations.
+  return (
+    patch.payload !== undefined ||
+    Object.hasOwn(patch, "trigger") ||
+    Object.hasOwn(patch, "precheck")
+  );
 }
 
 function assertCronDoesNotTargetAgentHarness(input: {

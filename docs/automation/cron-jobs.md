@@ -931,7 +931,8 @@ openclaw cron add --name inbox-poll --cron "*/15 * * * *" \
 Host-shell authorization reuses the **same surface as exec / system-run**:
 
 1. `cron.triggers.enabled` must be **true** (unattended host-shell switch), and
-2. exec security `deny|allowlist|full` (approvals file + shell allowlist analysis on the inner command).
+2. exec security `deny|allowlist|full` (approvals file + shell allowlist analysis on the inner command), and
+3. the job payload must allow core **`exec`** via `payload.toolsAllow` (include `"exec"`, a matching group, or `"*"`). Absent/`toolsAllow` that omits `exec` fails closed at precheck authz with `precheck-policy-denied` — no shell spawn. Capless legacy agent jobs that **gain** a precheck via `cron.update` / CLI edit take the Gateway tool-runtime patch path (explicit-cap rules + caller-bound scheduled authority); create/edit helpers stamp default `toolsAllow: ["*"]` only when still undefined and do not widen an explicit narrower cap.
 
 Denied prechecks record `status=error` with reason `precheck-policy-denied` and **do not** start a payload/model turn. Treat commands like any other unattended shell you schedule — only trusted scripts, secrets in files/env (not inline), known directory preferred over ad-hoc one-liners.
 
