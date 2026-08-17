@@ -35,6 +35,11 @@ function unsafeGatewayCast(value: unknown): unknown {
   return value;
 }
 
+function readGatewayShape<T>(value: unknown): T {
+  // SAFETY: gateway CLI JSON is untyped; callers supply the expected wire shape.
+  return value as T;
+}
+
 const CRON_SHOW_PAGE_SIZE = 200;
 const CRON_SHOW_LOOKUP_MAX_PAGES = 50;
 /** Fleet-wide cron stats without --id: hard cap on jobs polled (avoids 10k sequential RPCs). */
@@ -96,13 +101,13 @@ async function waitForCronRunCompletion(params: {
     // History reads share the wait deadline, but enqueue keeps its own RPC
     // timeout and a zero-duration wait still gets one immediate ledger poll.
     const pollOpts = { ...params.opts, timeout: String(pollTimeoutMs) };
-    const page = unsafeGatewayCast(
+    const page = readGatewayShape<{ entries?: CronRunLogEntryResult[] }>(
       await callGatewayFromCli("cron.runs", pollOpts, {
         id: params.jobId,
         runId: params.runId,
         limit: 1,
       }),
-    ) as { entries?: CronRunLogEntryResult[] };
+    );
     const entry = page.entries?.[0];
     if (entry?.status === "ok" || entry?.status === "error" || entry?.status === "skipped") {
       return entry;
@@ -267,11 +272,12 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
-              const listed = unsafeGatewayCast(res) as {
+              // SAFETY: gateway cron.list page.
+              const listed = readGatewayShape<{
                 jobs?: CronJob[];
                 hasMore?: boolean;
                 nextOffset?: number | null;
-              };
+              }>(res);
               for (const job of listed.jobs ?? []) {
                 jobIds.push(job.id);
                 if (jobIds.length >= CRON_STATS_MAX_JOBS) {
@@ -293,12 +299,12 @@ export function registerCronSimpleCommands(cron: Command) {
 
           const perJob: Array<{ jobId: string; rollup: CronRunCostRollup }> = [];
           for (const jobId of jobIds) {
-            const page = unsafeGatewayCast(
+            const page = readGatewayShape<{ entries?: CronRunLogEntry[] }>(
               await callGatewayFromCli("cron.runs", opts, {
                 id: jobId,
                 limit,
               }),
-            ) as { entries?: CronRunLogEntry[] };
+            );
             const rollup = rollupCronRunCost(page.entries ?? []);
             if (rollup.totalRuns > 0) {
               perJob.push({ jobId, rollup });
@@ -356,7 +362,8 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
-          const result = unsafeGatewayCast(res) as CronRunCommandResult | undefined;
+          // SAFETY: gateway cron.run result.
+          const result = readGatewayShape<CronRunCommandResult | undefined>(res);
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
               throw new Error("cron run did not return a runId to wait for");

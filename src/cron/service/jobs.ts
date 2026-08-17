@@ -380,9 +380,24 @@ export function applyJobPatch(
       job.precheck = structuredClone(patch.precheck);
     }
   }
-  if (cronJobUsesToolRuntime(job) && (!previouslyUsedToolRuntime || explicitlyClearsToolsAllow)) {
+  // Introducing host-shell precheck is a new executable surface. Capless legacy
+  // agentTurn jobs already report previouslyUsedToolRuntime=true, so without this
+  // branch a documented --precheck-command edit would skip default stamping and
+  // fail closed at precheck authz (absent toolsAllow). applyDefaultCronToolsAllow
+  // only fills undefined — it does not widen explicit restrictions.
+  const introducedPrecheckCommand =
+    "precheck" in patch &&
+    patch.precheck !== null &&
+    patch.precheck !== undefined &&
+    typeof patch.precheck.command === "string" &&
+    patch.precheck.command.trim().length > 0;
+  if (
+    cronJobUsesToolRuntime(job) &&
+    (!previouslyUsedToolRuntime || explicitlyClearsToolsAllow || introducedPrecheckCommand)
+  ) {
     // `null` means unrestricted, not a return to ambiguous legacy semantics.
-    // Ordinary edits to an existing capless job intentionally remain legacy.
+    // Ordinary edits to an existing capless job intentionally remain legacy
+    // unless precheck is newly introduced (above).
     applyDefaultCronToolsAllow(job);
   }
   reconcileScheduledToolPolicy({

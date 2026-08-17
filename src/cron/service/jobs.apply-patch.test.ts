@@ -417,3 +417,46 @@ describe("applyJobPatch failure alert merge", () => {
     expect(projectCronJobThroughStorageCodec(job).failureAlert).toBeUndefined();
   });
 });
+
+describe("applyJobPatch precheck toolsAllow stamping", () => {
+  const cronConfig = { triggers: { enabled: true } };
+
+  it("stamps default toolsAllow when precheck is added to a legacy capless agentTurn job", () => {
+    const job = makeJob({
+      payload: { kind: "agentTurn", message: "poll queue" },
+    });
+    expect(job.payload.toolsAllow).toBeUndefined();
+    expect(job.precheck).toBeUndefined();
+
+    applyJobPatch(
+      job,
+      {
+        precheck: {
+          command: "echo NO_WORK; exit 2",
+        },
+      },
+      { cronConfig },
+    );
+
+    expect(job.precheck?.command).toBe("echo NO_WORK; exit 2");
+    expect(job.payload.toolsAllow).toEqual(["*"]);
+  });
+
+  it("does not widen an explicit toolsAllow when precheck is added", () => {
+    const job = makeJob({
+      payload: { kind: "agentTurn", message: "poll queue", toolsAllow: ["read"] },
+    });
+
+    applyJobPatch(
+      job,
+      {
+        precheck: {
+          command: "echo WORK; exit 0",
+        },
+      },
+      { cronConfig },
+    );
+
+    expect(job.payload.toolsAllow).toEqual(["read"]);
+  });
+});
