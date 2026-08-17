@@ -423,10 +423,8 @@ export async function authorizeCronJobPrecheckCommand(params: {
   // Canonical system.run default is allowlist when exec security is unspecified
   // (node-host/invoke.ts). Do not widen unconfigured prechecks to full.
   const basePolicy = {
-    // SAFETY: default allowlist when unset; requested already normalized upstream.
-    security: (requested ?? "allowlist") as ExecSecurity,
-    // SAFETY: precheck is unattended; never prompt (ask always off).
-    ask: "off" as ExecAsk,
+    security: (requested ?? "allowlist") as ExecSecurity, // SAFETY: default allowlist; requested normalized upstream.
+    ask: "off" as ExecAsk, // SAFETY: unattended precheck never prompts.
   };
   const layered = hasConfigLayers
     ? applyExecPolicyLayer(applyExecPolicyLayer(basePolicy, toolsExecLayer), agentToolsExecLayer)
@@ -789,8 +787,8 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
   if (typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
-  // SAFETY: value narrowed to non-null object above; index as bag for optional fields.
-  const rec = value as Record<string, unknown>;
+  const rec = value as Record<string, unknown>; // SAFETY: narrowed to non-null object above.
+
   const command = normalizeOptionalString(rec.command);
   if (!command) {
     return undefined;
