@@ -357,14 +357,10 @@ export async function authorizeCronJobPrecheckCommand(params: {
       platform: process.platform,
     });
     const isWindows = process.platform === "win32";
-    // Precheck uses a fixed trusted shell *transport* (POSIX /bin/sh -c, Windows
-    // trusted cmd.exe /d /s /c). Allowlist decisions are on the analyzed *inner*
-    // command string — same model as POSIX system.run shell transport. Do NOT set
-    // shellWrapperInvocation+cmdInvocation on Windows: that combination is reserved
-    // for unattended cmd wrappers that change builtins/quoting semantics and is
-    // intentionally blocked under allowlist without approval (unattended cron cannot
-    // prompt). Classifying transport as a blocked shell wrapper made every Windows
-    // precheck unusable under the default allowlist security.
+    // Pass actual Windows cmd transport facts into the shared evaluator. Current
+    // system.run policy requires approval for cmd.exe /c wrappers under allowlist
+    // (builtins/quoting). Unattended cron cannot prompt, so this fails closed —
+    // same as other host-shell gates. Do not lie about wrapper involvement.
     const decision = evaluateSystemRunPolicy({
       security: "allowlist",
       ask: "off",
@@ -372,8 +368,8 @@ export async function authorizeCronJobPrecheckCommand(params: {
       allowlistSatisfied: allowlistEval.allowlistSatisfied,
       approvalDecision: null,
       isWindows,
-      cmdInvocation: false,
-      shellWrapperInvocation: false,
+      cmdInvocation: isWindows,
+      shellWrapperInvocation: isWindows,
     });
     if (!decision.allowed) {
       return {
@@ -532,10 +528,9 @@ export async function authorizeCronJobPrecheckCommand(params: {
     durableApprovalSatisfied: false,
     approvalDecision: null,
     isWindows,
-    // Trusted shell is transport only; allowlist applies to the inner command.
-    // See securityOverrideOnly allowlist branch comment above.
-    cmdInvocation: false,
-    shellWrapperInvocation: false,
+    // Report real Windows cmd.exe /d /s /c transport to preserve allowlist guard.
+    cmdInvocation: isWindows,
+    shellWrapperInvocation: isWindows,
   });
 
   if (!decision.allowed) {
@@ -555,6 +550,12 @@ export async function runCronJobPrecheck(
     spawnImpl?: typeof spawn;
     /** Required for host execution: triggers + exec security policy. */
     authz?: CronJobPrecheckAuthz;
+    /**
+     * Durable run-receipt / currency fence. Invoked immediately after awaited
+     * authorization and before host spawn so a mutation during authz cannot
+     * still reach the shell (ClawSweeper P1).
+     */
+    assertRunCurrent?: () => void;
   },
 ): Promise<CronJobPrecheckResult> {
   const command = normalizeOptionalString(precheck.command) ?? "";
@@ -613,6 +614,10 @@ export async function runCronJobPrecheck(
       stderr: "aborted",
     };
   }
+
+  // Revalidate durable receipt / run currency after authz await, before spawn.
+  // A precheck edit/clear during authorization must not reach host execution.
+  opts?.assertRunCurrent?.();
 
   const timeoutMs = resolveTimeoutMs(precheck);
   const spawnFn = opts?.spawnImpl ?? spawn;

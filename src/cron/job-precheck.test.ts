@@ -473,22 +473,9 @@ describe("runCronJobPrecheck", () => {
 });
 
 describe("Windows allowlist transport (precheck)", () => {
-  it("does not treat trusted cmd.exe transport as a blocked shell wrapper under allowlist", async () => {
+  it("reports real cmd.exe transport facts so allowlist requires approval (fails closed unattended)", async () => {
     const { evaluateSystemRunPolicy } = await import("../node-host/exec-policy.js");
-    // Mirror authorizeCronJobPrecheckCommand flags: transport is not a blocked wrapper.
-    const decision = evaluateSystemRunPolicy({
-      security: "allowlist",
-      ask: "off",
-      analysisOk: true,
-      allowlistSatisfied: true,
-      approvalDecision: null,
-      isWindows: true,
-      cmdInvocation: false,
-      shellWrapperInvocation: false,
-    });
-    expect(decision.allowed).toBe(true);
-    expect(decision.shellWrapperBlocked).toBe(false);
-
+    // Mirror authorizeCronJobPrecheckCommand: pass actual Windows cmd wrapper facts.
     const blocked = evaluateSystemRunPolicy({
       security: "allowlist",
       ask: "off",
@@ -503,7 +490,7 @@ describe("Windows allowlist transport (precheck)", () => {
     expect(blocked.shellWrapperBlocked).toBe(true);
   });
 
-  it("allowlists an allowlisted command on Windows platform with override-only allowlist", async () => {
+  it("denies Windows allowlist precheck without approval (cmd transport fails closed)", async () => {
     const prev = process.platform;
     Object.defineProperty(process, "platform", { value: "win32" });
     try {
@@ -516,9 +503,10 @@ describe("Windows allowlist transport (precheck)", () => {
           toolsAllow: ["*"],
         },
       });
-      // Empty allowlist → miss is OK; must NOT be windows shell-wrapper blocked reason.
+      // Real cmd.exe /c facts + unattended ask=off → policy deny (cannot prompt).
+      expect(result.allowed).toBe(false);
       if (!result.allowed) {
-        expect(result.reason).not.toMatch(/cmd\.exe|shell wrapper|Windows shell/i);
+        expect(result.reason).toMatch(/cmd\.exe|shell wrapper|Windows shell|approval|allowlist/i);
       }
     } finally {
       Object.defineProperty(process, "platform", { value: prev });
@@ -604,5 +592,74 @@ describe("normalizeCronJobPrecheck whitespace prefixes", () => {
         noWorkStdoutPrefix: "\t",
       }),
     ).toThrow(/noWorkStdoutPrefix/);
+  });
+});
+
+
+describe("runCronJobPrecheck receipt fence after authz", () => {
+  it("invokes assertRunCurrent after authorization and before spawn", async () => {
+    const order: string[] = [];
+    const spawnImpl = ((..._args: unknown[]) => {
+      order.push("spawn");
+      const { EventEmitter } = require("node:events") as typeof import("node:events");
+      const child = new EventEmitter() as import("node:events").EventEmitter & {
+        pid: number;
+        stdout: import("node:events").EventEmitter;
+        stderr: import("node:events").EventEmitter;
+        kill: () => boolean;
+      };
+      child.pid = 4242;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => true;
+      queueMicrotask(() => {
+        child.stdout.emit("data", "ok\n");
+        child.emit("close", 0);
+      });
+      return child as unknown as ReturnType<typeof import("node:child_process").spawn>;
+    }) as typeof import("node:child_process").spawn;
+
+    const result = await runCronJobPrecheck(
+      { command: "echo ok" },
+      {
+        spawnImpl,
+        authz: {
+          triggersEnabled: true,
+          security: "full",
+          securityOverrideOnly: true,
+        },
+        assertRunCurrent: () => {
+          order.push("assert");
+        },
+      },
+    );
+    expect(result.decision).toBe("run");
+    expect(order).toEqual(["assert", "spawn"]);
+  });
+
+  it("does not spawn when assertRunCurrent throws after authorization", async () => {
+    let spawned = false;
+    const spawnImpl = ((..._args: unknown[]) => {
+      spawned = true;
+      throw new Error("spawn should not run");
+    }) as typeof import("node:child_process").spawn;
+
+    await expect(
+      runCronJobPrecheck(
+        { command: "echo ok" },
+        {
+          spawnImpl,
+          authz: {
+            triggersEnabled: true,
+            security: "full",
+            securityOverrideOnly: true,
+          },
+          assertRunCurrent: () => {
+            throw new Error("receipt-stale");
+          },
+        },
+      ),
+    ).rejects.toThrow(/receipt-stale/);
+    expect(spawned).toBe(false);
   });
 });
