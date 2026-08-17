@@ -1,13 +1,18 @@
 import type { CronJob } from "./types.js";
 
-type CronToolRuntimeSpec = Pick<CronJob, "payload" | "trigger">;
+type CronToolRuntimeSpec = Pick<CronJob, "payload" | "trigger" | "precheck">;
 
 /** Returns whether a cron job can construct or execute OpenClaw agent tools. */
 export function cronJobUsesToolRuntime(job: CronToolRuntimeSpec): boolean {
+  const hasPrecheckCommand =
+    typeof job.precheck?.command === "string" && job.precheck.command.trim().length > 0;
   return (
     job.payload.kind === "agentTurn" ||
     job.payload.kind === "script" ||
-    Boolean(job.trigger?.script.trim())
+    Boolean(job.trigger?.script.trim()) ||
+    // Host-shell precheck is an executable surface: stamp toolsAllow so capless
+    // systemEvent/heartbeat/command jobs cannot inherit unrestricted undefined.
+    hasPrecheckCommand
   );
 }
 

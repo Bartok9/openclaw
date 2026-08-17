@@ -74,8 +74,11 @@ const PRECHECK_TRIGGERS_DISABLED =
 export function cronToolsAllowPermitsPrecheckExec(
   toolsAllow: readonly string[] | undefined | null,
 ): boolean {
+  // Fail closed: absent toolsAllow must not mean unrestricted host shell.
+  // Create/update paths stamp ["*"] via applyDefaultCronToolsAllow when precheck
+  // is present; runtime still denies if a job somehow reaches exec without a cap.
   if (toolsAllow === undefined || toolsAllow === null) {
-    return true;
+    return false;
   }
   // Core host-shell authority only — not every `*.exec` plugin tool name.
   return isRuntimeToolAllowed("exec", [...toolsAllow]);

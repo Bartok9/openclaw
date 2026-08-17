@@ -128,13 +128,19 @@ const AUTH_FULL = {
   triggersEnabled: true,
   security: "full" as const,
   securityOverrideOnly: true,
+  toolsAllow: ["*"] as const,
 };
 
 describe("authorizeCronJobPrecheckCommand", () => {
   it("denies when triggers are disabled", async () => {
     const result = await authorizeCronJobPrecheckCommand({
       command: "exit 0",
-      authz: { triggersEnabled: false, security: "full", securityOverrideOnly: true },
+      authz: {
+        triggersEnabled: false,
+        security: "full",
+        securityOverrideOnly: true,
+        toolsAllow: ["*"],
+      },
     });
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
@@ -145,7 +151,12 @@ describe("authorizeCronJobPrecheckCommand", () => {
   it("denies when exec security is deny", async () => {
     const result = await authorizeCronJobPrecheckCommand({
       command: "exit 0",
-      authz: { triggersEnabled: true, security: "deny", securityOverrideOnly: true },
+      authz: {
+        triggersEnabled: true,
+        security: "deny",
+        securityOverrideOnly: true,
+        toolsAllow: ["*"],
+      },
     });
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
@@ -170,6 +181,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
       authz: {
         triggersEnabled: true,
         // No securityOverrideOnly — exercise live approvals path with config layer.
+        toolsAllow: ["*"],
         toolsExec: { security: "deny" },
       },
     });
@@ -185,6 +197,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
       command: "exit 0",
       authz: {
         triggersEnabled: true,
+        toolsAllow: ["*"],
         toolsExec: { security: "full" },
         agentToolsExec: { security: "deny" },
       },
@@ -210,6 +223,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
       command: "echo should-not-run-unconfigured",
       authz: {
         triggersEnabled: true,
+        toolsAllow: ["*"],
       },
     });
     expect(result.allowed).toBe(false);
@@ -224,6 +238,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
         triggersEnabled: true,
         security: "full",
         securityOverrideOnly: false,
+        toolsAllow: ["*"],
         toolsExec: { ask: "always", security: "full" },
       },
     });
@@ -239,6 +254,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
       authz: {
         triggersEnabled: true,
         security: "full",
+        toolsAllow: ["*"],
         toolsExec: { ask: "off", security: "full" },
         agentToolsExec: { ask: "always" },
       },
@@ -258,6 +274,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
         triggersEnabled: true,
         security: "full",
         securityOverrideOnly: true,
+        toolsAllow: ["*"],
         toolsExec: { strictInlineEval: true, security: "full" },
       },
     });
@@ -273,7 +290,12 @@ describe("runCronJobPrecheck", () => {
     const result = await runCronJobPrecheck(
       { command: "exit 0" },
       {
-        authz: { triggersEnabled: true, security: "deny", securityOverrideOnly: true },
+        authz: {
+          triggersEnabled: true,
+          security: "deny",
+          securityOverrideOnly: true,
+          toolsAllow: ["*"],
+        },
       },
     );
     expect(result.decision).toBe("error");
@@ -491,6 +513,7 @@ describe("Windows allowlist transport (precheck)", () => {
           triggersEnabled: true,
           security: "allowlist",
           securityOverrideOnly: true,
+          toolsAllow: ["*"],
         },
       });
       // Empty allowlist → miss is OK; must NOT be windows shell-wrapper blocked reason.
@@ -530,7 +553,7 @@ describe("cronToolsAllowPermitsPrecheckExec / job toolsAllow authz", () => {
   });
 
   it("allows precheck when toolsAllow includes exec or wildcard", async () => {
-    for (const toolsAllow of [["exec"], ["*"], ["read", "exec"], undefined] as const) {
+    for (const toolsAllow of [["exec"], ["*"], ["read", "exec"]] as const) {
       const result = await authorizeCronJobPrecheckCommand({
         command: "echo hi",
         authz: {
@@ -542,6 +565,26 @@ describe("cronToolsAllowPermitsPrecheckExec / job toolsAllow authz", () => {
       });
       expect(result.allowed).toBe(true);
     }
+  });
+
+  it("denies precheck when toolsAllow is absent (fail closed)", async () => {
+    for (const toolsAllow of [undefined, null] as const) {
+      const result = await authorizeCronJobPrecheckCommand({
+        command: "echo hi",
+        authz: {
+          triggersEnabled: true,
+          security: "full",
+          securityOverrideOnly: true,
+          toolsAllow,
+        },
+      });
+      expect(result.allowed).toBe(false);
+      if (!result.allowed) {
+        expect(result.reason).toContain("toolsAllow");
+      }
+    }
+    expect(cronToolsAllowPermitsPrecheckExec(undefined)).toBe(false);
+    expect(cronToolsAllowPermitsPrecheckExec(null)).toBe(false);
   });
 });
 
