@@ -129,9 +129,9 @@ export function assertPrecheckSupport(
   if (!normalized) {
     throw new Error("cron precheck requires a non-empty command");
   }
-  if (opts?.requireEnabled && opts.cronConfig?.triggers?.enabled !== true) {
+  if (opts?.requireEnabled && opts.cronConfig?.triggers?.enabled === false) {
     throw new Error(
-      "cron precheck is a host-shell command and is disabled; set cron.triggers.enabled=true to allow unattended precheck scripts",
+      "cron precheck is a host-shell command and is disabled because the operator set cron.triggers.enabled: false; remove it or set it to true to allow unattended precheck scripts",
     );
   }
 }

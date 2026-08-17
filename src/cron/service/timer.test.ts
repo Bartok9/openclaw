@@ -482,7 +482,7 @@ describe("cron service timer seam coverage", () => {
     expect(runScriptJob).not.toHaveBeenCalled();
   });
 
-  it("blocks a host-shell precheck when cron.triggers.enabled is not true", async () => {
+  it("blocks a host-shell precheck when cron.triggers.enabled is explicitly false", async () => {
     const { storePath } = await makeStorePath();
     const now = Date.parse("2026-07-25T12:00:00.000Z");
     const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
@@ -507,10 +507,48 @@ describe("cron service timer seam coverage", () => {
 
     expect(result).toMatchObject({
       status: "error",
-      error: expect.stringContaining("cron.triggers.enabled=true"),
+      error: expect.stringMatching(/cron\.triggers\.enabled/),
     });
     // The gate must short-circuit before any agent payload runs.
     expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+  });
+
+  it("allows host-shell precheck when cron.triggers.enabled is absent (default-on)", async () => {
+    // ClawSweeper P1: match main trigger/script default-on (only explicit false disables).
+    const { storePath } = await makeStorePath();
+    const now = Date.parse("2026-08-17T08:00:00.000Z");
+    const spy = vi.spyOn(jobPrecheck, "runCronJobPrecheck").mockResolvedValue({
+      decision: "skip",
+      reason: "precheck-no-work",
+      exitCode: 2,
+      stdout: "NO_WORK\n",
+      stderr: "",
+    } as Awaited<ReturnType<typeof jobPrecheck.runCronJobPrecheck>>);
+    try {
+      const state = createCronServiceState({
+        storePath,
+        cronEnabled: true,
+        // no cronConfig.triggers — absent means enabled
+        log: logger,
+        nowMs: () => now,
+        enqueueSystemEvent: vi.fn(),
+        requestHeartbeat: vi.fn(),
+        runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+      });
+      const job: CronJob = {
+        ...createDueMainJob({ now, wakeMode: "now" }),
+        payload: { ...createDueIsolatedAgentJob({ now }).payload, toolsAllow: ["*"] as const },
+        precheck: { kind: "exec", command: "exit 2" },
+      };
+      const result = await executeJobCore(state, job);
+      expect(spy).toHaveBeenCalled();
+      const authz = spy.mock.calls[0]?.[1]?.authz as { triggersEnabled?: boolean } | undefined;
+      expect(authz?.triggersEnabled).toBe(true);
+      expect(result).toMatchObject({ status: "skipped", error: "precheck-no-work" });
+      expect(state.deps.runIsolatedAgentJob).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("allows a host-shell precheck to skip the payload when triggers are enabled", async () => {
@@ -762,7 +800,7 @@ describe("cron service timer seam coverage", () => {
     expect(runIsolatedAgentJob).not.toHaveBeenCalled();
     expect(persisted?.state.lastStatus).toBe("error");
     expect(persisted?.state.lastError ?? "").toMatch(
-      /precheck-policy-denied|cron\.triggers\.enabled=true/,
+      /precheck-policy-denied|cron\.triggers\.enabled/,
     );
   });
 
