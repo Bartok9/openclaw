@@ -354,6 +354,7 @@ function rowToCronJob(row: CronJobRow, jobJson: Record<string, unknown>): CronSt
     ...(failureAlert !== undefined ? { failureAlert } : {}),
     ...(() => {
       const cfg = tryParseJsonObject(row.job_json) ?? {};
+      // SAFETY: tryParseJsonObject returns a plain object bag when present.
       const precheck = normalizeCronJobPrecheck((cfg as Record<string, unknown>).precheck);
       return precheck ? { precheck } : {};
     })(),

@@ -91,6 +91,7 @@ async function waitForCronRunCompletion(params: {
     // History reads share the wait deadline, but enqueue keeps its own RPC
     // timeout and a zero-duration wait still gets one immediate ledger poll.
     const pollOpts = { ...params.opts, timeout: String(pollTimeoutMs) };
+    // SAFETY: gateway cron.runs returns a page object with optional entries.
     const page = (await callGatewayFromCli("cron.runs", pollOpts, {
       id: params.jobId,
       runId: params.runId,
@@ -260,6 +261,7 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
+              // SAFETY: gateway cron.list returns a paginated jobs envelope.
               const listed = res as {
                 jobs?: CronJob[];
                 hasMore?: boolean;
@@ -286,6 +288,7 @@ export function registerCronSimpleCommands(cron: Command) {
 
           const perJob: Array<{ jobId: string; rollup: CronRunCostRollup }> = [];
           for (const jobId of jobIds) {
+            // SAFETY: gateway cron.runs returns a page object with optional entries.
             const page = (await callGatewayFromCli("cron.runs", opts, {
               id: jobId,
               limit,
@@ -347,6 +350,7 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
+          // SAFETY: gateway cron.run returns CronRunCommandResult on success.
           const result = res as CronRunCommandResult | undefined;
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
