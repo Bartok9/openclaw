@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { resolveCronDeliveryPlan, resolveFailureDestination } from "../delivery-plan.js";
 import { projectCronJobThroughStorageCodec } from "../store/row-codec.js";
 import type { CronJob, CronJobCreate, CronJobPatch } from "../types.js";
-import { applyJobPatch, createJob } from "./jobs.js";
+import { applyDeclarativeJobSpec, applyJobPatch, createJob } from "./jobs.js";
 
 function makeJob(overrides: Partial<CronJob> = {}): CronJob {
   const now = Date.now();
@@ -458,5 +458,88 @@ describe("applyJobPatch precheck toolsAllow stamping", () => {
     );
 
     expect(job.payload.toolsAllow).toEqual(["read"]);
+  });
+});
+
+describe("applyDeclarativeJobSpec precheck toolsAllow stamping", () => {
+  const cronConfig = { triggers: { enabled: true } };
+
+  function baseCreate(overrides: Partial<CronJobCreate> = {}): CronJobCreate {
+    return {
+      name: "decl-precheck",
+      schedule: { kind: "every", everyMs: 60_000 },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: { kind: "agentTurn", message: "poll queue" },
+      ...overrides,
+    };
+  }
+
+  it("stamps default toolsAllow when declarative upsert adds precheck to legacy capless agentTurn", () => {
+    const job = makeJob({
+      payload: { kind: "agentTurn", message: "poll queue" },
+    });
+    expect(job.payload.toolsAllow).toBeUndefined();
+    expect(job.precheck).toBeUndefined();
+
+    applyDeclarativeJobSpec(
+      job,
+      baseCreate({
+        precheck: { command: "echo NO_WORK; exit 2" },
+      }),
+      {
+        enabledExplicit: true,
+        nowMs: Date.now(),
+        cronConfig,
+      },
+    );
+
+    expect(job.precheck?.command).toBe("echo NO_WORK; exit 2");
+    expect(job.payload.toolsAllow).toEqual(["*"]);
+  });
+
+  it("does not widen an explicit toolsAllow when declarative upsert adds precheck", () => {
+    const job = makeJob({
+      payload: { kind: "agentTurn", message: "poll queue", toolsAllow: ["read"] },
+    });
+
+    applyDeclarativeJobSpec(
+      job,
+      baseCreate({
+        payload: { kind: "agentTurn", message: "poll queue", toolsAllow: ["read"] },
+        precheck: { command: "echo WORK; exit 0" },
+      }),
+      {
+        enabledExplicit: true,
+        nowMs: Date.now(),
+        cronConfig,
+      },
+    );
+
+    expect(job.payload.toolsAllow).toEqual(["read"]);
+  });
+
+  it("preserves prior stored toolsAllow when declaration omits toolsAllow but job already had a cap", () => {
+    const job = makeJob({
+      payload: { kind: "agentTurn", message: "poll queue", toolsAllow: ["exec"] },
+      precheck: { command: "echo OLD; exit 2" },
+    });
+
+    applyDeclarativeJobSpec(
+      job,
+      baseCreate({
+        // omit toolsAllow in declaration
+        payload: { kind: "agentTurn", message: "poll queue" },
+        precheck: { command: "echo NEW; exit 2" },
+      }),
+      {
+        enabledExplicit: true,
+        nowMs: Date.now(),
+        cronConfig,
+      },
+    );
+
+    expect(job.payload.toolsAllow).toEqual(["exec"]);
+    expect(job.precheck?.command).toBe("echo NEW; exit 2");
   });
 });

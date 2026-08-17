@@ -533,11 +533,22 @@ export function applyDeclarativeJobSpec(
   } else {
     delete job.trigger;
   }
+  const hadPrecheckCommand =
+    typeof job.precheck?.command === "string" && job.precheck.command.trim().length > 0;
   if (input.precheck) {
     job.precheck = structuredClone(input.precheck);
   } else {
     delete job.precheck;
   }
+  const introducedPrecheckCommand =
+    !hadPrecheckCommand &&
+    typeof job.precheck?.command === "string" &&
+    job.precheck.command.trim().length > 0;
+  // Introducing host-shell precheck is a new executable surface. Capless legacy
+  // agentTurn jobs already report previouslyUsedToolRuntime=true, so without an
+  // introduced-precheck branch, declaration-key convergence that first adds
+  // precheck leaves toolsAllow absent and fails closed at precheck authz.
+  // applyDefaultCronToolsAllow only fills undefined — it does not widen explicit caps.
   if (cronJobUsesToolRuntime(job) && job.payload.toolsAllow === undefined) {
     if (previousToolsAllow !== undefined) {
       // Omitted declaration fields preserve explicit authority already stored
@@ -546,8 +557,8 @@ export function applyDeclarativeJobSpec(
       if (previousToolsAllowIsDefault === true) {
         job.payload.toolsAllowIsDefault = true;
       }
-    } else if (!previouslyUsedToolRuntime) {
-      // A declaration that newly becomes tool-bearing adopts current explicit semantics.
+    } else if (!previouslyUsedToolRuntime || introducedPrecheckCommand) {
+      // Newly tool-bearing, or first host-shell precheck on a legacy capless job.
       applyDefaultCronToolsAllow(job);
     }
   }
