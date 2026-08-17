@@ -926,7 +926,7 @@ openclaw cron add --name inbox-poll --cron "*/15 * * * *" \
 **Security (durable contract):** the precheck command is a **persisted Gateway-host shell admission step**. It runs unattended with a bounded timeout (default 30s, capped at 5m) in the Gateway environment:
 
 - **POSIX:** fixed trusted `/bin/sh -c` (inherited `$SHELL` is ignored)
-- **Windows:** fixed trusted `cmd.exe` via `resolveTrustedWindowsCmdExe` with `/d /s /c` (inherited `%ComSpec%` is ignored). The trusted `cmd.exe` wrapper is **transport only**; allowlist analysis applies to the inner precheck command string (same model as POSIX `/bin/sh -c`), so default `security=allowlist` remains usable without weakening to `full`.
+- **Windows:** fixed trusted `cmd.exe` via `resolveTrustedWindowsCmdExe` with `/d /s /c` (inherited `%ComSpec%` is ignored). Unattended precheck always reports real `cmd.exe` wrapper transport facts to the shared exec policy. Under default `security=allowlist`, that **fails closed** (requires approval / is denied for unattended runs)—same posture as other unattended `cmd.exe /c` host shells. Use `security=full` only with explicit operator intent if Windows precheck must run without approval; do not expect allowlist mode to admit unattended precheck on Windows.
 
 Host-shell authorization reuses the **same surface as exec / system-run**:
 
