@@ -719,11 +719,12 @@ describe("cron service timer seam coverage", () => {
         payload: { ...base.payload },
         precheck: { kind: "exec", command: "echo should-not-run; exit 0" },
       };
-      delete (job.payload as { toolsAllow?: unknown }).toolsAllow;
+      Reflect.deleteProperty(job.payload, "toolsAllow");
 
       const result = await executeJobCore(state, job);
       expect(result.status).toBe("error");
-      expect(String((result as { error?: string }).error ?? "")).toMatch(
+      expect(result).toMatchObject({ status: "error" });
+      expect(String("error" in result ? result.error : "")).toMatch(
         /toolsAllow|precheck-policy-denied/,
       );
       expect(runIsolatedAgentJob).not.toHaveBeenCalled();

@@ -227,8 +227,10 @@ function normalizeCronJobForSqlite(job: CronStoreFile["jobs"][number]): CronStor
     ...normalized,
     createdAtMs,
     updatedAtMs,
-    state: isRecord(normalized.state) ? (normalized.state as CronJobState) : {},
-  } as CronStoredJob;
+    state: isRecord(normalized.state)
+      ? (normalized.state as CronJobState) // SAFETY: state bag is record-shaped CronJobState.
+      : {},
+  } as CronStoredJob; // SAFETY: reconstructed store fields form CronStoredJob.
 }
 
 function countUnpersistableCronJobs(store: CronStoreFile): number {
@@ -274,7 +276,7 @@ function scheduleFromRow(row: CronJobRow, jobJson: Record<string, unknown>): Cro
     if (!isRecord(schedule) || schedule.kind !== "stream" || !Array.isArray(schedule.command)) {
       return null;
     }
-    return structuredClone(schedule) as CronSchedule;
+    return structuredClone(schedule) as CronSchedule; // SAFETY: schedule already CronSchedule-shaped.
   }
   return null;
 }
@@ -346,16 +348,17 @@ function rowToCronJob(row: CronJobRow, jobJson: Record<string, unknown>): CronSt
     ...(row.session_key ? { sessionKey: row.session_key } : {}),
     schedule,
     ...(pacing !== undefined ? { pacing } : {}),
-    sessionTarget: row.session_target as CronStoredJob["sessionTarget"],
-    wakeMode: row.wake_mode as CronStoredJob["wakeMode"],
+    sessionTarget: row.session_target as CronStoredJob["sessionTarget"], // SAFETY: schema union column.
+    wakeMode: row.wake_mode as CronStoredJob["wakeMode"], // SAFETY: schema union column.
     ...(trigger ? { trigger } : {}),
     payload,
     ...(delivery ? { delivery } : {}),
     ...(failureAlert !== undefined ? { failureAlert } : {}),
     ...(() => {
       const cfg = tryParseJsonObject(row.job_json) ?? {};
-      // SAFETY: tryParseJsonObject returns a plain object bag when present.
-      const precheck = normalizeCronJobPrecheck((cfg as Record<string, unknown>).precheck);
+      const precheck = normalizeCronJobPrecheck(
+        (cfg as Record<string, unknown>).precheck, // SAFETY: JSON object bag from tryParseJsonObject.
+      );
       return precheck ? { precheck } : {};
     })(),
     state: stateFromRow(row),
@@ -368,7 +371,7 @@ export function projectCronJobThroughStorageCodec(job: CronStoredJob): CronStore
   if (!normalized) {
     throw new Error(`cannot project invalid cron job ${job.id}`);
   }
-  const row = bindCronJobRow("config-revision", normalized, 0) as CronJobRow;
+  const row = bindCronJobRow("config-revision", normalized, 0) as CronJobRow; // SAFETY: SQLite row binding.
   const projected = rowToCronJob(row, asOptionalObjectRecord(safeParseJson(row.job_json)) ?? {});
   if (!projected) {
     throw new Error(`cannot project cron job ${job.id} through storage codecs`);
@@ -613,7 +616,7 @@ export function loadedCronStoreFromRows(rows: CronJobRow[]): LoadedCronStore {
     const runtimeEntry = {
       updatedAtMs: normalizeNumber(row.runtime_updated_at_ms) ?? normalizeNumber(row.updated_at),
       scheduleIdentity: row.schedule_identity ?? undefined,
-      state: stateFromRow(row) as Record<string, unknown>,
+      state: stateFromRow(row) as Record<string, unknown>, // SAFETY: plain object bag projection.
     };
 
     if (!job) {

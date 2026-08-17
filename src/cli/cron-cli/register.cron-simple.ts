@@ -95,8 +95,7 @@ async function waitForCronRunCompletion(params: {
       id: params.jobId,
       runId: params.runId,
       limit: 1,
-      // SAFETY: gateway cron.runs returns a page object with optional entries.
-    })) as { entries?: CronRunLogEntryResult[] };
+    })) as { entries?: CronRunLogEntryResult[] }; // SAFETY: cron.runs page with optional entries.
     const entry = page.entries?.[0];
     if (entry?.status === "ok" || entry?.status === "error" || entry?.status === "skipped") {
       return entry;
@@ -261,7 +260,7 @@ export function registerCronSimpleCommands(cron: Command) {
                 limit: CRON_SHOW_PAGE_SIZE,
                 offset,
               });
-              // SAFETY: gateway cron.list returns a paginated jobs envelope.
+              // SAFETY: cron.list paginated jobs envelope.
               const listed = res as {
                 jobs?: CronJob[];
                 hasMore?: boolean;
@@ -291,8 +290,7 @@ export function registerCronSimpleCommands(cron: Command) {
             const page = (await callGatewayFromCli("cron.runs", opts, {
               id: jobId,
               limit,
-              // SAFETY: gateway cron.runs returns a page object with optional entries.
-            })) as { entries?: CronRunLogEntry[] };
+            })) as { entries?: CronRunLogEntry[] }; // SAFETY: cron.runs page with optional entries.
             const rollup = rollupCronRunCost(page.entries ?? []);
             if (rollup.totalRuns > 0) {
               perJob.push({ jobId, rollup });
@@ -350,8 +348,7 @@ export function registerCronSimpleCommands(cron: Command) {
             id,
             mode: opts.due ? "due" : "force",
           });
-          // SAFETY: gateway cron.run returns CronRunCommandResult on success.
-          const result = res as CronRunCommandResult | undefined;
+          const result = res as CronRunCommandResult | undefined; // SAFETY: cron.run success payload.
           if (opts.wait && result?.ok && result.enqueued) {
             if (!result.runId) {
               throw new Error("cron run did not return a runId to wait for");
