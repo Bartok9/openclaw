@@ -133,7 +133,7 @@ export async function executeJobCore(
       abortSignal,
       assertRunCurrent: options?.assertRunCurrent,
       authz: {
-        triggersEnabled: state.deps.cronConfig?.triggers?.enabled === true,
+        triggersEnabled: state.deps.cronConfig?.triggers?.enabled !== false,
         agentId: effectiveAgentId,
         toolsExec,
         agentToolsExec,

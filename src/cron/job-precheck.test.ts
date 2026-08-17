@@ -144,7 +144,7 @@ describe("authorizeCronJobPrecheckCommand", () => {
     });
     expect(result.allowed).toBe(false);
     if (!result.allowed) {
-      expect(result.reason).toContain("cron.triggers.enabled=true");
+      expect(result.reason).toMatch(/cron\.triggers\.enabled/);
     }
   });
 

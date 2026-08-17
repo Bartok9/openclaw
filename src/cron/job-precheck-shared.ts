@@ -37,7 +37,7 @@ export const PRECHECK_ERROR_REASON = "precheck-error";
 export const PRECHECK_TIMEOUT_REASON = "precheck-timeout";
 export const PRECHECK_INVALID_REASON = "precheck-invalid";
 export const PRECHECK_TRIGGERS_DISABLED =
-  "cron precheck is a host-shell command and is disabled; set cron.triggers.enabled=true to allow unattended precheck scripts";
+  "cron precheck is a host-shell command and is disabled because the operator set cron.triggers.enabled: false; remove it or set it to true to allow unattended precheck scripts";
 
 /**
  * Job-scoped toolsAllow must permit core `exec` for precheck.
