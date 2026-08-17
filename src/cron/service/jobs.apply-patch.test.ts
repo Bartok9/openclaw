@@ -467,6 +467,7 @@ describe("applyDeclarativeJobSpec precheck toolsAllow stamping", () => {
   function baseCreate(overrides: Partial<CronJobCreate> = {}): CronJobCreate {
     return {
       name: "decl-precheck",
+      enabled: true,
       schedule: { kind: "every", everyMs: 60_000 },
       sessionTarget: "isolated",
       wakeMode: "now",
