@@ -433,6 +433,7 @@ export async function authorizeCronJobPrecheckCommand(params: {
           : undefined,
       security: normalizeExecSecurity(layer.security),
       ask: normalizeAsk(layer.ask),
+      // SAFETY: literal true narrowed to const boolean flag for ExecToolConfigLayer.
       ...(layer.strictInlineEval === true ? { strictInlineEval: true as const } : {}),
     };
   };
@@ -442,7 +443,9 @@ export async function authorizeCronJobPrecheckCommand(params: {
   // Canonical system.run default is allowlist when exec security is unspecified
   // (node-host/invoke.ts). Do not widen unconfigured prechecks to full.
   const basePolicy = {
+    // SAFETY: default allowlist when unset; requested already normalized upstream.
     security: (requested ?? "allowlist") as ExecSecurity,
+    // SAFETY: precheck is unattended; never prompt (ask always off).
     ask: "off" as ExecAsk,
   };
   const layered = hasConfigLayers
@@ -770,7 +773,9 @@ export function cronRunOutcomeFromPrecheck(
           ? [
               {
                 ts,
+                // SAFETY: diagnostic source/severity are fixed string unions.
                 source: "exec" as const,
+                // SAFETY: diagnostic severity is fixed info for precheck stdout.
                 severity: "info" as const,
                 message: clip(result.stdout, 500),
               },
@@ -804,11 +809,13 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
   if (typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
+  // SAFETY: value narrowed to non-null object above; index as bag for optional fields.
   const rec = value as Record<string, unknown>;
   const command = normalizeOptionalString(rec.command);
   if (!command) {
     return undefined;
   }
+  // SAFETY: only exec kind is supported; literal const for CronJobPrecheck.kind.
   const kind = rec.kind === "exec" || rec.kind === undefined ? ("exec" as const) : undefined;
   if (!kind) {
     return undefined;

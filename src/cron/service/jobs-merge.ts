@@ -29,6 +29,7 @@ export function mergeCronDelivery(
 
   if (typeof patch.mode === "string") {
     const previousMode = next.mode;
+    // SAFETY: patch.mode already typeof-string guarded; compare legacy alias.
     next.mode = (patch.mode as string) === "deliver" ? "announce" : patch.mode;
     if (previousMode !== next.mode && (previousMode === "webhook" || next.mode === "webhook")) {
       // `to` has different meaning for channel targets and webhook URLs; clear

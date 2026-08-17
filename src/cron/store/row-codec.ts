@@ -206,6 +206,7 @@ export function rowToCronJob(
       normalizeNumber(row.runtime_updated_at_ms) ?? normalizeNumber(row.updated_at) ?? createdAtMs,
     ...(() => {
       const cfg = tryParseJsonObject(row.job_json) ?? {};
+      // SAFETY: tryParseJsonObject returns a plain object bag when present.
       const precheck = normalizeCronJobPrecheck((cfg as Record<string, unknown>).precheck);
       return precheck ? { precheck } : {};
     })(),
