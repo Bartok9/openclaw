@@ -366,14 +366,15 @@ export function registerCronEditCommand(cron: Command) {
                 "--precheck-timeout-ms/--precheck-cwd require an existing precheck or --precheck-command",
               );
             }
-            const timeoutMs = precheckTimeoutRaw ? Number(precheckTimeoutRaw) : undefined;
+            const timeoutMs = parseStrictPositiveInteger(opts.precheckTimeoutMs);
+            if (opts.precheckTimeoutMs !== undefined && timeoutMs === undefined) {
+              throw new Error("Invalid --precheck-timeout-ms (must be a positive integer).");
+            }
             patch.precheck = {
               kind: "exec",
               ...prev,
               command: precheckCommand ?? prev?.command ?? "",
-              ...(timeoutMs !== undefined && Number.isFinite(timeoutMs)
-                ? { timeoutMs: Math.floor(timeoutMs) }
-                : {}),
+              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
               ...(precheckCwd ? { cwd: precheckCwd } : {}),
             };
           }

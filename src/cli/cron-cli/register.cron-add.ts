@@ -520,15 +520,15 @@ export function registerCronAddCommand(cron: Command) {
                 if (!precheckCommand) {
                   return {};
                 }
-                const timeoutRaw = normalizeOptionalString(opts.precheckTimeoutMs);
-                const timeoutMs = timeoutRaw ? Number(timeoutRaw) : undefined;
+                const timeoutMs = parseStrictPositiveInteger(opts.precheckTimeoutMs);
+                if (opts.precheckTimeoutMs !== undefined && timeoutMs === undefined) {
+                  throw new Error("Invalid --precheck-timeout-ms (must be a positive integer).");
+                }
                 return {
                   precheck: {
                     kind: "exec" as const,
                     command: precheckCommand,
-                    ...(timeoutMs !== undefined && Number.isFinite(timeoutMs)
-                      ? { timeoutMs: Math.floor(timeoutMs) }
-                      : {}),
+                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                     ...(normalizeOptionalString(opts.precheckCwd)
                       ? { cwd: normalizeOptionalString(opts.precheckCwd) }
                       : {}),

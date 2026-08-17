@@ -319,6 +319,20 @@ function rowToCronJob(row: CronJobRow, jobJson: Record<string, unknown>): CronSt
   if (!schedule || !payload) {
     return null;
   }
+  // Fail closed: a present-but-invalid precheck must quarantine the job rather
+  // than dropping the gate and running the payload ungated.
+  const rawPrecheck = (jobJson as Record<string, unknown>).precheck;
+  let precheck: ReturnType<typeof normalizeCronJobPrecheck>;
+  try {
+    precheck = normalizeCronJobPrecheck(rawPrecheck);
+  } catch {
+    return null;
+  }
+  // null/undefined raw → undefined precheck (ok). Object/string present but not
+  // a valid gate → quarantine so we never erase the intended admission control.
+  if (rawPrecheck !== undefined && rawPrecheck !== null && precheck === undefined) {
+    return null;
+  }
   const createdAtMs = normalizeNumber(row.created_at_ms) ?? Date.now();
   return {
     id: row.job_id,
@@ -354,13 +368,7 @@ function rowToCronJob(row: CronJobRow, jobJson: Record<string, unknown>): CronSt
     payload,
     ...(delivery ? { delivery } : {}),
     ...(failureAlert !== undefined ? { failureAlert } : {}),
-    ...(() => {
-      const cfg = tryParseJsonObject(row.job_json) ?? {};
-      const precheck = normalizeCronJobPrecheck(
-        (cfg as Record<string, unknown>).precheck, // SAFETY: JSON object bag from tryParseJsonObject.
-      );
-      return precheck ? { precheck } : {};
-    })(),
+    ...(precheck ? { precheck } : {}),
     state: stateFromRow(row),
   };
 }
@@ -620,11 +628,25 @@ export function loadedCronStoreFromRows(rows: CronJobRow[]): LoadedCronStore {
     };
 
     if (!job) {
+      const rawPrecheck = jobJson.precheck;
+      const precheckPresent = rawPrecheck !== undefined && rawPrecheck !== null;
+      let invalidPrecheck = false;
+      if (precheckPresent) {
+        try {
+          invalidPrecheck = normalizeCronJobPrecheck(rawPrecheck) === undefined;
+        } catch {
+          invalidPrecheck = true;
+        }
+      }
       invalidConfigRows.push({
         sourceIndex: index,
         reason:
           getInvalidPersistedCronJobReason(configJob) ??
-          (scheduleFromRow(row, jobJson) ? "invalid-payload" : "invalid-schedule"),
+          (invalidPrecheck
+            ? "invalid-precheck"
+            : scheduleFromRow(row, jobJson)
+              ? "invalid-payload"
+              : "invalid-schedule"),
         job: configJob,
         ...(runtimeEntry.state ? { state: runtimeEntry.state } : {}),
         ...(runtimeEntry.updatedAtMs !== undefined
