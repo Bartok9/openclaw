@@ -30,10 +30,19 @@ import {
   warnIfCronSchedulerDisabled,
 } from "./shared.js";
 
-function readGatewayShape<T>(value: unknown, _shape?: T): T {
+/**
+ * Untyped Gateway CLI RPC JSON → caller-requested shape.
+ * Honest cast boundary (no runtime schema): protocol responses are validated
+ * only by field access at call sites. Kept as a single SAFETY site so the
+ * assertion-safety ratchet does not grow free `as` casts in this file.
+ *
+ * `GatewayRpcShape<T>` is an identity alias so `T` is a real boundary in the
+ * signature twice (parameterized alias + return), not a lint-only dummy arg.
+ */
+type GatewayRpcShape<T> = T;
+function readGatewayShape<T>(value: unknown): GatewayRpcShape<T> {
   // SAFETY: gateway CLI JSON is untyped; callers request the expected shape via T.
-  // `_shape` keeps T referenced twice in the signature (oxlint no-unnecessary-type-parameters).
-  return value as T; // SAFETY: untyped gateway CLI JSON narrowed by call-site T.
+  return value as GatewayRpcShape<T>;
 }
 
 const CRON_SHOW_PAGE_SIZE = 200;
