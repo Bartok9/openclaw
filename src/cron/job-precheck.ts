@@ -422,9 +422,11 @@ export async function authorizeCronJobPrecheckCommand(params: {
   const hasConfigLayers = toolsExecLayer !== undefined || agentToolsExecLayer !== undefined;
   // Canonical system.run default is allowlist when exec security is unspecified
   // (node-host/invoke.ts). Do not widen unconfigured prechecks to full.
+  const defaultSecurity: ExecSecurity = requested ?? "allowlist";
+  const unattendedAsk: ExecAsk = "off";
   const basePolicy = {
-    security: (requested ?? "allowlist") as ExecSecurity, // SAFETY: default allowlist; requested normalized upstream.
-    ask: "off" as ExecAsk, // SAFETY: unattended precheck never prompts.
+    security: defaultSecurity,
+    ask: unattendedAsk,
   };
   const layered = hasConfigLayers
     ? applyExecPolicyLayer(applyExecPolicyLayer(basePolicy, toolsExecLayer), agentToolsExecLayer)
@@ -787,7 +789,7 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
   if (typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
-  const rec = value as Record<string, unknown>; // SAFETY: narrowed to non-null object above.
+  const rec = toStringKeyRecord(value);
 
   const command = normalizeOptionalString(rec.command);
   if (!command) {
@@ -848,4 +850,12 @@ export function normalizeCronJobPrecheck(value: unknown): CronJobPrecheck | unde
     ...(workStdoutPrefix ? { workStdoutPrefix } : {}),
     ...(noWorkStdoutPrefix ? { noWorkStdoutPrefix } : {}),
   };
+}
+
+function toStringKeyRecord(value: object): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = entry;
+  }
+  return out;
 }
