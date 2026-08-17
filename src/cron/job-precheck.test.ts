@@ -304,6 +304,70 @@ describe("runCronJobPrecheck", () => {
     }
   });
 
+  it("blocks host spawn when tools.exec.host is sandbox/node (no gateway bypass)", async () => {
+    let spawned = false;
+    const spawnImpl = ((..._args: unknown[]) => {
+      spawned = true;
+      throw new Error("should not spawn");
+    }) as unknown as typeof import("node:child_process").spawn;
+    const toolsAllow = ["exec"] as const;
+
+    for (const host of ["sandbox", "node", "auto"] as const) {
+      spawned = false;
+      const result = await runCronJobPrecheck(
+        { command: "echo WORK_NEEDED" },
+        {
+          spawnImpl,
+          authz: {
+            triggersEnabled: true,
+            toolsAllow,
+            toolsExec: { host, security: "full" },
+          },
+        },
+      );
+      expect(result.decision).toBe("error");
+      if (result.decision === "error") {
+        expect(result.reason).toMatch(/host=/);
+        expect(result.reason).toMatch(/not supported for cron precheck|sandbox\/node bypass/);
+      }
+      expect(spawned).toBe(false);
+    }
+
+    // Agent layer host=node must win over global gateway and still deny.
+    spawned = false;
+    const agentDeny = await runCronJobPrecheck(
+      { command: "echo WORK_NEEDED" },
+      {
+        spawnImpl,
+        authz: {
+          triggersEnabled: true,
+          toolsAllow,
+          toolsExec: { host: "gateway", security: "full" },
+          agentToolsExec: { host: "node", node: "edge-1", security: "full" },
+        },
+      },
+    );
+    expect(agentDeny.decision).toBe("error");
+    if (agentDeny.decision === "error") {
+      expect(agentDeny.reason).toMatch(/host=node/);
+      expect(agentDeny.reason).toMatch(/edge-1/);
+    }
+    expect(spawned).toBe(false);
+
+    // Explicit gateway still allowed through host gate (may still hit other policy).
+    const gatewayOk = await authorizeCronJobPrecheckCommand({
+      command: "echo ok",
+      authz: {
+        triggersEnabled: true,
+        toolsAllow,
+        toolsExec: { host: "gateway", security: "full" },
+        securityOverrideOnly: true,
+        security: "full",
+      },
+    });
+    expect(gatewayOk.allowed).toBe(true);
+  });
+
   it("runs a real shell check for exit 2 skip when policy allows", async () => {
     const result = await runCronJobPrecheck({ command: "exit 2" }, { authz: AUTH_FULL });
     expect(result.decision).toBe("skip");

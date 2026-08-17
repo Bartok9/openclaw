@@ -21,12 +21,18 @@ import {
   resolvePrecheckExecEnv,
 } from "./job-precheck-shared.js";
 
+type ExecHost = "auto" | "sandbox" | "gateway" | "node";
+
 type ExecToolConfigLayer = {
   mode?: ExecMode;
   security?: ExecSecurity;
   ask?: ExecAsk;
   /** Require approval for interpreter inline-eval carriers (python -c, etc.). */
   strictInlineEval?: boolean;
+  /** tools.exec.host — precheck only spawns gateway-local shells. */
+  host?: ExecHost;
+  /** tools.exec.node target (informational for deny reasons). */
+  node?: string;
   /** Global/agent tools.exec.safeBins — same surface as system.run. */
   safeBins?: string[] | null;
   safeBinProfiles?: SafeBinProfileFixtures | null;
@@ -100,6 +106,30 @@ export async function authorizeCronJobPrecheckCommand(params: {
     return {
       allowed: false,
       reason: `${PRECHECK_POLICY_DENIED_REASON}: job toolsAllow does not permit exec (host-shell precheck requires exec in the job tool cap)`,
+    };
+  }
+
+  // Precheck only spawns Gateway-local shells. Honor tools.exec.host (agent > global):
+  // sandbox/node/auto must fail closed — never bypass routing onto the gateway host
+  // (ClawSweeper P1 on #112375).
+  const resolveHost = (layer: ExecToolConfigLayer | undefined): ExecHost | undefined => {
+    const h = layer?.host;
+    return h === "auto" || h === "sandbox" || h === "gateway" || h === "node" ? h : undefined;
+  };
+  const resolveNode = (layer: ExecToolConfigLayer | undefined): string | undefined => {
+    const n = layer?.node;
+    return typeof n === "string" && n.trim().length > 0 ? n.trim() : undefined;
+  };
+  const effectiveHost =
+    resolveHost(params.authz.agentToolsExec) ?? resolveHost(params.authz.toolsExec);
+  if (effectiveHost !== undefined && effectiveHost !== "gateway") {
+    const node = resolveNode(params.authz.agentToolsExec) ?? resolveNode(params.authz.toolsExec);
+    const nodeHint = node ? ` node=${node}` : "";
+    return {
+      allowed: false,
+      reason:
+        `${PRECHECK_POLICY_DENIED_REASON}: exec host=${effectiveHost}${nodeHint} ` +
+        `is not supported for cron precheck (gateway-local spawn only; refuse sandbox/node bypass)`,
     };
   }
 
@@ -203,6 +233,17 @@ export async function authorizeCronJobPrecheckCommand(params: {
     if (!layer) {
       return undefined;
     }
+    const host =
+      layer.host === "auto" ||
+      layer.host === "sandbox" ||
+      layer.host === "gateway" ||
+      layer.host === "node"
+        ? layer.host
+        : undefined;
+    const node =
+      typeof layer.node === "string" && layer.node.trim().length > 0
+        ? layer.node.trim()
+        : undefined;
     return {
       mode:
         layer.mode === "deny" ||
@@ -216,6 +257,8 @@ export async function authorizeCronJobPrecheckCommand(params: {
       ask: normalizeAsk(layer.ask),
       // SAFETY: literal true narrowed to const boolean flag for ExecToolConfigLayer.
       ...(layer.strictInlineEval === true ? { strictInlineEval: true as const } : {}),
+      ...(host ? { host } : {}),
+      ...(node ? { node } : {}),
     };
   };
   const toolsExecLayer = normalizeLayer(params.authz.toolsExec);
