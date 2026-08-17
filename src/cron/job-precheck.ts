@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { killProcessTree } from "../process/kill-tree.js";
-import { authorizeCronJobPrecheckCommand } from "./job-precheck-authz.js";
+import {
+  authorizeCronJobPrecheckCommand,
+  type CronJobPrecheckAuthz,
+} from "./job-precheck-authz.js";
 import {
   PRECHECK_ERROR_REASON,
   PRECHECK_INVALID_REASON,
@@ -9,7 +12,7 @@ import {
   PRECHECK_SKIPPED_ERROR_REASON,
   PRECHECK_TIMEOUT_REASON,
   resolvePrecheckExecEnv,
-  resolveShellCommand,
+  resolveTrustedPrecheckShellCommand,
 } from "./job-precheck-shared.js";
 import { createCronRunDiagnosticsFromError } from "./run-diagnostics.js";
 import type { CronJobPrecheck } from "./types-shared.js";
@@ -234,7 +237,7 @@ export async function runCronJobPrecheck(
 
   const timeoutMs = resolveTimeoutMs(precheck);
   const spawnFn = opts?.spawnImpl ?? spawn;
-  const { shell, args: shellArgs } = resolveShellCommand(command);
+  const { shell, args: shellArgs } = resolveTrustedPrecheckShellCommand(command);
 
   return await new Promise<CronJobPrecheckResult>((resolve) => {
     let settled = false;

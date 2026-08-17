@@ -23,10 +23,6 @@ export function resolveTrustedPrecheckShellCommand(
   return { shell: TRUSTED_POSIX_SHELL, args: ["-c", command] };
 }
 
-export function resolveShellCommand(command: string): { shell: string; args: string[] } {
-  return resolveTrustedPrecheckShellCommand(command);
-}
-
 /** Canonical host-exec env for precheck analysis + spawn (same as system.run). */
 export function resolvePrecheckExecEnv(env?: NodeJS.ProcessEnv): Record<string, string> {
   return sanitizeHostExecEnv({ baseEnv: env ?? process.env });
