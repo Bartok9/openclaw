@@ -9,6 +9,7 @@ import {
   PRECHECK_POLICY_DENIED_REASON,
   authorizeCronJobPrecheckCommand,
   cronRunOutcomeFromPrecheck,
+  cronToolsAllowPermitsPrecheckExec,
   interpretPrecheckOutput,
   normalizeCronJobPrecheck,
   resolveTrustedPrecheckShellCommand,
@@ -518,6 +519,14 @@ describe("cronToolsAllowPermitsPrecheckExec / job toolsAllow authz", () => {
       expect(result.reason).toContain("toolsAllow");
       expect(result.reason).toContain("exec");
     }
+  });
+
+  it("rejects unrelated *.exec plugin tool names (canonical matcher)", () => {
+    expect(cronToolsAllowPermitsPrecheckExec(["vendor.exec"])).toBe(false);
+    expect(cronToolsAllowPermitsPrecheckExec(["unrelated.exec", "read"])).toBe(false);
+    expect(cronToolsAllowPermitsPrecheckExec(["exec"])).toBe(true);
+    expect(cronToolsAllowPermitsPrecheckExec(["*"])).toBe(true);
+    expect(cronToolsAllowPermitsPrecheckExec(["read", "write"])).toBe(false);
   });
 
   it("allows precheck when toolsAllow includes exec or wildcard", async () => {

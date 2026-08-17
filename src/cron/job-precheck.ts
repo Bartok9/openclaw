@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { isRuntimeToolAllowed } from "../agents/tool-policy-match.js";
 import { describeInterpreterInlineEval } from "../infra/command-analysis/inline-eval.js";
 import { detectPolicyInlineEval } from "../infra/command-analysis/policy.js";
 import {
@@ -64,12 +65,11 @@ const PRECHECK_INVALID_REASON = "precheck-invalid";
 const PRECHECK_TRIGGERS_DISABLED =
   "cron precheck is a host-shell command and is disabled; set cron.triggers.enabled=true to allow unattended precheck scripts";
 
-/** Shell tool names that must appear in job.payload.toolsAllow for host-shell precheck. */
-const PRECHECK_SHELL_TOOL_NAMES = new Set(["exec", "bash", "shell", "system.run", "system_run"]);
-
 /**
- * Job-scoped toolsAllow must permit exec/shell for precheck. Undefined allowlist = unrestricted.
- * Empty or non-matching cap denies (same idea as payload tool construction).
+ * Job-scoped toolsAllow must permit core `exec` for precheck.
+ * Undefined allowlist = unrestricted. Empty or non-matching cap denies.
+ * Uses the canonical runtime tool-cap matcher (exact / group / glob) so
+ * unrelated plugin-style names like `vendor.exec` do not authorize host shell.
  */
 export function cronToolsAllowPermitsPrecheckExec(
   toolsAllow: readonly string[] | undefined | null,
@@ -77,31 +77,8 @@ export function cronToolsAllowPermitsPrecheckExec(
   if (toolsAllow === undefined || toolsAllow === null) {
     return true;
   }
-  return toolsAllow.some((tool) => {
-    if (typeof tool !== "string") {
-      return false;
-    }
-    const normalized = tool.trim().toLowerCase();
-    if (!normalized) {
-      return false;
-    }
-    if (normalized === "*" || normalized === "exec" || normalized.endsWith(".exec")) {
-      return true;
-    }
-    // Common shell aliases + simple glob suffix (e.g. "sys*")
-    if (PRECHECK_SHELL_TOOL_NAMES.has(normalized)) {
-      return true;
-    }
-    if (normalized.endsWith("*")) {
-      const prefix = normalized.slice(0, -1);
-      return (
-        !prefix ||
-        "exec".startsWith(prefix) ||
-        [...PRECHECK_SHELL_TOOL_NAMES].some((name) => name.startsWith(prefix))
-      );
-    }
-    return false;
-  });
+  // Core host-shell authority only — not every `*.exec` plugin tool name.
+  return isRuntimeToolAllowed("exec", [...toolsAllow]);
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
