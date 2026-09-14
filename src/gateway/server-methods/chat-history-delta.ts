@@ -6,10 +6,8 @@ import {
   type SessionTranscriptDisplayDeltaResult,
 } from "../../config/sessions/session-accessor.sqlite-history-events.js";
 import { jsonUtf8BytesOrInfinity } from "../../infra/json-utf8-bytes.js";
-import {
-  createCurrentUserProfileMessageProjector,
-  projectChatDisplayMessagesWithState,
-} from "../chat-display-projection.js";
+import { isOpenClawDeliveryMirrorAssistantMessage } from "../../shared/transcript-only-openclaw-assistant.js";
+import { createCurrentUserProfileMessageProjector } from "../chat-display-projection.js";
 import { resolveCurrentUserProfileDisplay } from "../current-user-profile-display.js";
 import {
   projectSessionMessagePayload,
@@ -82,22 +80,18 @@ export function readChatHistoryDelta(params: {
     if (!entryMessage) {
       continue;
     }
-    const messageId = asOptionalRecord(row.event)?.id;
-    const historyProjection = projectChatDisplayMessagesWithState([entryMessage], {
-      ...projectionState,
-      includeCommentaryFallbacks: true,
-    });
     if (
-      historyProjection.messages.some(
-        (message) => asOptionalRecord(message.openclawStreamFallback)?.source === "segment",
-      )
+      isOpenClawDeliveryMirrorAssistantMessage(entryMessage) &&
+      asOptionalRecord(asOptionalRecord(entryMessage)?.openclawDeliveryMirror)?.kind ===
+        "channel-final"
     ) {
-      // One transcript entry can own both commentary and a tool call. The single-message
-      // envelope cannot carry that split; let the full history owner reconcile both rows.
+      // Mirror suppression needs the preceding reply, which can be before this cursor.
       return { kind: "reset" };
     }
+    const messageId = asOptionalRecord(row.event)?.id;
     const projected = projectSessionMessagePayload({
       agentId: params.agentId,
+      historyDelta: true,
       message: entryMessage,
       ...(typeof messageId === "string" && messageId ? { messageId } : {}),
       messageSeq: row.messageSeq,
@@ -107,6 +101,9 @@ export function readChatHistoryDelta(params: {
       sessionKey: params.sessionKey,
       sessionSnapshot: params.sessionSnapshot,
     });
+    if (projected.requiresHistoryReset) {
+      return { kind: "reset" };
+    }
     projectionState = projected.projectionState;
     // Recovery can remove this row from history, which an append-only delta cannot express.
     // Keep the last accepted cursor before the error and let a full tail own reconciliation.

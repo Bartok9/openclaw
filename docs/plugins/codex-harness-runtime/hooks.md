@@ -61,6 +61,27 @@ plugin behavior. For the native tool and permission bridge, OpenClaw injects
 per-thread Codex config for `PreToolUse`, `PostToolUse`, `PermissionRequest`,
 and `Stop`.
 
+Before starting or resuming a thread, OpenClaw prepares the native relay's
+stored MCP approval snapshot and direct publication attempt, then rechecks the
+current run's authority. If the listener or SQLite locator is unavailable, hook
+commands can use the existing Gateway fallback. Policy preparation must still
+succeed; Gateway invocation waits for that snapshot independently of publication.
+Registration returns a synchronous handle whose optional `deferMcpToolApprovals`
+field remains undefined until policy preparation finishes.
+
+The cold hook CLI reads the locator on a dedicated read-only worker, closes its
+database, and joins the worker before using the result. The worker preserves
+schema admission without loading shared-state writer startup. The caller retains
+the existing retry and deadline rules.
+
+A relay without a listening direct bridge can still renew its logical expiry;
+a listening bridge updates its stored locator before extending the visible
+expiry. Unregistering invalidates foreground access
+immediately. Cleanup drains accepted locator writes and, once the relay is
+retired, listener closure. Existing grace windows for late hooks and direct
+children retained after a successful yield are preserved; draining pending
+storage work does not close those children.
+
 When Codex app-server approvals are enabled (`approvalPolicy` is not
 `"never"`), the default injected native hook config omits `PermissionRequest`
 so Codex's app-server reviewer and OpenClaw's approval bridge handle real

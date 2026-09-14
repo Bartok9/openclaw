@@ -5,6 +5,7 @@ import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core
 import { html, nothing, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
 import type {
+  PluginsListResult,
   SessionsCatalogListResult,
   SystemInfoResult,
 } from "../../../../packages/gateway-protocol/src/index.js";
@@ -87,6 +88,7 @@ import {
   buildSessionObserverTogglePatch,
   buildSessionObserverUtilityModelPatch,
 } from "./session-observer-settings.ts";
+import { renderSessionStorage } from "./session-storage.ts";
 import { renderTalkPage } from "./talk-page.ts";
 import { renderUpdates } from "./updates.ts";
 import {
@@ -394,6 +396,27 @@ export class ConfigPage extends OpenClawLightDomElement {
       this.sessionObserverModelsUnavailable = false;
     },
     onError: () => this.resetSessionObserverModels(true),
+  });
+  private readonly sessionSourcePluginsTask = new Task(this, {
+    args: () => {
+      const gateway = this.context?.gateway.snapshot;
+      return [
+        this.gateway.gateway,
+        this.pageId === "appearance" &&
+        canCallGatewayMethod(gateway, "plugins.list", "operator.read")
+          ? gateway?.client
+          : null,
+      ] as const;
+    },
+    task: async ([, client], { signal }) => {
+      if (!client) {
+        return null;
+      }
+      const result = await client.request<PluginsListResult>("plugins.list", {}, { signal });
+      return new Set(
+        result.plugins.filter((plugin) => plugin.installed).map((plugin) => plugin.id),
+      );
+    },
   });
   private readonly hiddenSessionCatalogLabelsTask = new Task(this, {
     args: () => {
@@ -994,9 +1017,7 @@ export class ConfigPage extends OpenClawLightDomElement {
 
   private isUpdateBusy(): boolean {
     const update = this.context.overlays.snapshot;
-    return (
-      update.updateRunning || update.updateStatusRefreshing || update.updateReconciliationPending
-    );
+    return update.updateRunning || update.updateReconciliationPending;
   }
 
   // The update dialog outlives this page and the connection, so it reads live
@@ -1012,6 +1033,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       runtimeState.configSaving ||
       runtimeState.configApplying ||
       this.isUpdateBusy() ||
+      this.context.overlays.snapshot.updateStatusRefreshing ||
       !this.context.runtimeConfig.canSet ||
       !hasOperatorAdminAccess(this.context.gateway.snapshot.hello?.auth ?? null)
     );
@@ -1038,6 +1060,7 @@ export class ConfigPage extends OpenClawLightDomElement {
         heldUpdateCampaignId: overlaySnapshot.heldUpdateCampaignId,
         updateAvailable: overlaySnapshot.updateAvailable,
         statusBanner: overlaySnapshot.updateStatusBanner,
+        statusCheckBanner: overlaySnapshot.updateStatusCheckBanner,
         reportableUpdateFailureId: overlaySnapshot.reportableUpdateFailureId,
         updateFailureReportBusy: overlaySnapshot.updateFailureReportBusy,
         updateFailureReportNotice: overlaySnapshot.updateFailureReportNotice,
@@ -1050,6 +1073,7 @@ export class ConfigPage extends OpenClawLightDomElement {
         canHoldUpdate: canCallGatewayMethod(gatewaySnapshot, "update.hold", "operator.admin"),
         canReport: canReportUpdateFailure(gatewaySnapshot),
         updateBusy: this.isUpdateBusy(),
+        statusChecking: overlaySnapshot.updateStatusRefreshing,
         onChannelChange: (channel) => runtimeConfig.patchForm(["update", "channel"], channel),
         onUpdateChecksChange: (enabled) =>
           runtimeConfig.patchForm(["update", "checkOnStart"], enabled),
@@ -1098,6 +1122,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       configState.configSaving ||
       configState.configApplying ||
       this.isUpdateBusy() ||
+      this.context.overlays.snapshot.updateStatusRefreshing ||
       !hasOperatorAdminAccess(this.context.gateway.snapshot.hello?.auth ?? null);
     const props: ConfigProps = {
       raw: configState.configRaw,
@@ -1107,7 +1132,7 @@ export class ConfigPage extends OpenClawLightDomElement {
       loading: configState.configLoading,
       saving: configState.configSaving,
       applying: configState.configApplying,
-      updating: this.isUpdateBusy(),
+      updating: this.isUpdateBusy() || this.context.overlays.snapshot.updateStatusRefreshing,
       connected: configState.connected,
       mutationAllowed: runtimeConfig.canSet,
       openFileAllowed: runtimeConfig.canOpenFile,
@@ -1267,6 +1292,12 @@ export class ConfigPage extends OpenClawLightDomElement {
       setChatFollowUpMode: (value) => this.setSetting("chatFollowUpMode", value),
       resetChatFollowUpMode: () => this.resetSyncedAppearancePref("chatFollowUpMode"),
       catalogOpenTarget: normalizeCatalogOpenTarget(this.settings.catalogOpenTarget),
+      pluginsHref: pathForRoute("plugin-settings", this.context.basePath),
+      installedSessionSourcePluginIds:
+        this.sessionSourcePluginsTask.status === TaskStatus.COMPLETE
+          ? this.sessionSourcePluginsTask.value
+          : null,
+      sessionSourcePluginsLoading: this.sessionSourcePluginsTask.status === TaskStatus.PENDING,
       setCatalogOpenTarget: (value) => this.setSetting("catalogOpenTarget", value),
       microphone: {
         devices: this.microphoneDevices,
@@ -1303,7 +1334,16 @@ export class ConfigPage extends OpenClawLightDomElement {
                   this.routeData?.targetBlockId === "config-section-transcripts",
                 editor,
               })
-          : undefined,
+          : this.pageId === "ai-agents" && activeSection === "session"
+            ? (editor) =>
+                renderSessionStorage({
+                  mutationDisabled: this.isCuratedConfigMutationDisabled(),
+                  advancedExpanded:
+                    this.routeData?.advanced === true ||
+                    this.routeData?.targetBlockId === "config-section-session",
+                  editor,
+                })
+            : undefined,
       sectionPrelude:
         activeSection === "browser" && browserPanelAvailable && !hasNativeBrowserBridge()
           ? renderBrowserLinkPreferencesRow({

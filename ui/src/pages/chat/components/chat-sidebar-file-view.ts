@@ -1,4 +1,4 @@
-import { html, nothing } from "lit";
+import { html, nothing, type TemplateResult } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import { localEditorFilePath } from "../../../app/native-editor-locality.runtime.ts";
 import { icons } from "../../../components/icons.ts";
@@ -10,30 +10,6 @@ import type { SidebarContent } from "./chat-sidebar-content-types.ts";
 import { renderChatSidebarEditorMenu } from "./chat-sidebar-editor-menu.ts";
 
 type FileSidebarContent = Extract<SidebarContent, { kind: "file" }>;
-
-type RetainedFileDraft = {
-  content: string;
-  expectedHash: string;
-};
-
-const retainedFileDrafts = new Map<string, RetainedFileDraft>();
-
-function retainedFileDraftKey(content: FileSidebarContent): string {
-  return content.draftKey ?? `${content.root ?? ""}\u0000${content.path}`;
-}
-
-export function readFileDraft(content: FileSidebarContent): RetainedFileDraft | undefined {
-  return retainedFileDrafts.get(retainedFileDraftKey(content));
-}
-
-export function setFileDraft(content: FileSidebarContent, draft: RetainedFileDraft | null) {
-  const key = retainedFileDraftKey(content);
-  retainedFileDrafts.delete(key);
-  if (!draft) {
-    return;
-  }
-  retainedFileDrafts.set(key, draft);
-}
 
 export function hasUniformLineEndings(content: string): boolean {
   const crlf = content.split("\r\n").length - 1;
@@ -59,6 +35,12 @@ type FileCopyFeedback = Partial<Record<FileCopyAction, "copied" | "failed">>;
 export const emptyCopyFeedback: FileCopyFeedback = {};
 
 export type FileViewControls = {
+  htmlPreview?: {
+    source: boolean;
+    presentation: TemplateResult | typeof nothing;
+    sourceFallback?: TemplateResult;
+    onToggle: () => void;
+  };
   copyFeedback: FileCopyFeedback;
   currentMatchIndex: number;
   dirty: boolean;
@@ -131,6 +113,18 @@ export function renderSidebarFile(
           controls
             ? html`
                 <div class="sidebar-file-view__actions">
+                  ${
+                    controls.htmlPreview
+                      ? html`<button
+                          class="btn btn--sm"
+                          type="button"
+                          aria-pressed=${String(controls.htmlPreview.source)}
+                          @click=${controls.htmlPreview.onToggle}
+                        >
+                          ${controls.htmlPreview.source ? t("chat.workspaceFiles.preview") : t("chat.detailPanel.viewSource")}
+                        </button>`
+                      : nothing
+                  }
                   ${
                     controls.editing
                       ? html`
@@ -292,7 +286,15 @@ export function renderSidebarFile(
             `
           : nothing
       }
-      <div class="file-view">
+      ${
+        controls?.htmlPreview
+          ? html`<div class="chat-html-preview" ?hidden=${controls.htmlPreview.source}>
+              ${controls.htmlPreview.presentation}
+            </div>`
+          : nothing
+      }
+      <div class="file-view" ?hidden=${controls?.htmlPreview && !controls.htmlPreview.source}>
+        ${controls?.htmlPreview?.sourceFallback ?? nothing}
         ${keyed(controls?.mountKey ?? content, html`<div class="file-view__mount"></div>`)}
         ${
           controls?.loadingEditor
@@ -301,7 +303,7 @@ export function renderSidebarFile(
         }
       </div>
       ${
-        controls?.editing
+        controls?.editing || controls?.htmlPreview
           ? nothing
           : html`
               <div class="sidebar-file-view__footer">

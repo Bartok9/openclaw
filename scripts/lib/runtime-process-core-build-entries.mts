@@ -19,3 +19,21 @@ export function createRuntimeProcessBuildEntries(
 export const runtimeProcessCoreBuildEntries = createRuntimeProcessBuildEntries(
   Object.values(runtimeProcessEntrypoints),
 );
+
+// Short-lived snapshot children own a separate bundle; parents retain shared runtime identity.
+export const standaloneRuntimeProcessBuildEntries = createRuntimeProcessBuildEntries([
+  runtimeProcessEntrypoints.sqliteReadOnly,
+  runtimeProcessEntrypoints.nativeHookRelayClient,
+]);
+
+export function shouldBundleRuntimeSqliteDependency(id: string): boolean {
+  return id === "kysely" || id.startsWith("kysely/");
+}
+
+export function sharedRuntimeProcessBuildEntries(entries: Record<string, string>) {
+  return Object.fromEntries(
+    Object.entries(entries).filter(
+      ([name]) => !Object.hasOwn(standaloneRuntimeProcessBuildEntries, name),
+    ),
+  );
+}

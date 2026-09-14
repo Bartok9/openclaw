@@ -151,6 +151,10 @@ export const runRespawnedChild = (command, args, env) => {
   child.once("exit", (code, signal) => {
     detach();
     if (signal) {
+      if (process.platform !== "win32") {
+        process.kill(process.pid, signal);
+        return;
+      }
       const forwardedSignalExitCode =
         !hardKillBackstopStarted && signal === firstForwardedSignal
           ? signal === "SIGINT"
@@ -653,7 +657,7 @@ export async function recoverNodeRuntime({
     !process.argv[1] ||
     isForegroundGmailRunInvocation(process.argv) ||
     (process.platform !== "win32" && isNativeHookRelayInvocation(process.argv)) ||
-    !nodeRuntimeFailure(process.versions.node, detectCurrentSqliteCapabilities())
+    !nodeRuntimeFailure(process.versions.node, await detectCurrentSqliteCapabilities())
   ) {
     return false;
   }

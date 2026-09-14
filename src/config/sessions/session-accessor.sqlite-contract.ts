@@ -18,7 +18,14 @@ export type SessionEntryStatus = NonNullable<SessionEntry["status"]>;
 
 /** Worker operation facts; no Worker object or plan payload is retained. */
 export type SqliteSessionReclamationDiagnostics = {
-  kind?: "entry" | "lifecycle-artifacts" | "history-eviction" | "historical-generation";
+  kind?:
+    | "entry"
+    | "lifecycle-artifacts"
+    | "history-eviction"
+    | "historical-generation"
+    | "cold-batch"
+    | "cold-maintain"
+    | "cold-restore";
   workerThreadId?: number;
 };
 
@@ -50,8 +57,34 @@ export type SqliteSessionArtifactPreparationDiagnostics =
     completed?: boolean;
   };
 
+/** One pruning attempt retains only aggregate stage observations. */
+export type SqliteSessionArchivePruningDiagnostics = {
+  trigger: "initial" | "after-eviction" | "final";
+  admissionMs?: number;
+  cachedAdmissions?: number;
+  asyncAdmissions?: number;
+  checkpointCalls?: number;
+  checkpointIncomplete?: number;
+  checkpointMs?: number;
+  checkpointMaxMs?: number;
+  vacuumMs?: number;
+  vacuumPasses?: number;
+  vacuumPagesRequested?: number;
+  queryMs?: number;
+  rowDeletionMs?: number;
+  fileRemovalMs?: number;
+  removedFiles?: number;
+  missingFiles?: number;
+  failedRemovals?: number;
+  measurementMs?: number;
+  measurements?: number;
+  legacyInventoryMs?: number;
+  completed?: boolean;
+};
+
 export type SqliteSessionWriteDiagnostics = SqliteSessionReclamationDiagnostics & {
   artifactPreparation?: SqliteSessionArtifactPreparationDiagnostics;
+  archivePruning?: SqliteSessionArchivePruningDiagnostics;
   reclamationAdmission?: SqliteSessionReclamationAdmissionDiagnostics;
 };
 

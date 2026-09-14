@@ -79,6 +79,8 @@ To enter text from your local clipboard, take control and choose **Keyboard** be
 
 A desktop-enabled cloud session uses the same machine for the chat Desktop panel and the agent's `computer` tool. Enable the **Cloud Worker Desktop** lab and provision a Crabbox profile with `settings.desktop: true`. OpenClaw starts the worker's CUA provider inside the provisioned desktop session; the agent does not need to discover or choose a paired computer. Both OpenClaw and Codex sessions use this binding. A paired-device session instead uses that device's enabled Computer Control provider.
 
+OpenClaw worker turns preserve their node host's display and desktop-session environment for local `exec` commands. On a desktop-enabled Linux worker, launch a GUI application with `background: true` to keep using `computer` while it runs.
+
 Use a vision-capable model and a tool profile that permits `computer`. For the `coding` profile, add `computer` to `tools.alsoAllow`. The bound desktop is available under default remote-session sandbox policy; explicit sandbox allowlists and denies still apply. Observe the Desktop panel while the agent works, and pause the agent before taking manual control to avoid competing input.
 
 Worker transcripts retain screenshots. Codex exposes the computer tool directly, outside code mode, so screenshot results reach the model as images. To keep later model requests within the transport limit, OpenClaw can replace older, already processed images with a text marker in the model context while preserving the current computer frame and unprocessed images. Opaque provider replay remains unchanged; if its required context cannot fit, the turn fails with recovery guidance.
@@ -89,7 +91,9 @@ For `remote-exec` turns, computer cleanup finishes before workspace reconciliati
 
 ## Automatic load balancing across devices
 
-You do not have to pick a device. Choosing **Auto** (least-busy device) in the Place picker — or dispatching with `autoDevice: true` — selects a paired session host automatically and retries up to three ranked hosts if provisioning fails before a machine is allocated. OpenClaw `worker-turn` placements rank hosts by most free worker slots, breaking ties by device ID; Codex `remote-exec` placements do not consume worker slots, so eligible hosts are ranked by device ID alone. When no host qualifies, the error says exactly why: no session hosts paired, all disconnected, or all at capacity.
+You do not have to pick a device. Choosing **Auto** (least-busy device) in the Place picker — or dispatching with `autoDevice: true` — selects a paired session host automatically. OpenClaw `worker-turn` placements first prefer hosts with less admitted work relative to their worker capacity. They then compare free worker slots after accounting for dispatches still starting, breaking remaining ties by device ID. A session’s placement alone does not reserve a worker slot. Codex `remote-exec` placements do not consume worker slots, so eligible hosts are ranked by device ID alone. When no host qualifies, the error says exactly why: no session hosts paired, all disconnected, or all at capacity.
+
+If a selected device becomes ineligible before workspace preparation begins, Auto tries up to three ranked hosts after confirming that the failed allocation is fully cleaned up. It does not replay workspace setup or work already started. Once workspace preparation is admitted, another turn filling the device's slots does not cancel it; the node checks physical capacity again when the session launches a turn. Node identity and command authorization remain checked throughout preparation.
 
 See [Nodes](/nodes/session-hosting#host-openclaw-sessions) for the selection rules and [Control UI](/web/control-ui) for the picker.
 

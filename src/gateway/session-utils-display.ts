@@ -1,7 +1,6 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
-  countActiveDescendantRuns,
-  getSessionDisplaySubagentRunByChildSessionKey,
+  buildSubagentSessionListReadIndex,
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
   isSubagentRunLive,
@@ -29,6 +28,7 @@ export function resolveGatewaySessionDisplayName(key: string, entry?: SessionEnt
   const parsedAgent = parseAgentSessionKey(key);
   const channel = sessionDeliveryChannel(entry) ?? parsed?.channel;
   const subject = entry?.subject;
+  const topicName = entry?.topicName;
   const groupChannel = entry?.groupChannel;
   const space = entry?.space;
   const id = parsed?.id;
@@ -37,13 +37,14 @@ export function resolveGatewaySessionDisplayName(key: string, entry?: SessionEnt
   const isDashboardSession = parsedAgent?.rest.startsWith("dashboard:") === true;
   const isGroupSession = isGroupOrChannelDisplaySession(entry, parsed);
   const groupTitle = isGroupSession
-    ? buildGroupDisplayTitle({ subject, groupChannel, space })
+    ? buildGroupDisplayTitle({ subject, topicName, groupChannel, space })
     : undefined;
   const compactGroupFallback =
     isGroupSession && channel
       ? buildGroupDisplayName({
           provider: channel,
           subject,
+          topicName,
           groupChannel,
           space,
           id,
@@ -106,16 +107,14 @@ export function projectGatewaySessionRunState(params: {
   rowContext?: SessionListRowContext;
 }) {
   const { key, entry, now, rowContext } = params;
-  const subagentRun = rowContext
-    ? rowContext.subagentRuns.getDisplaySubagentRun(key)
-    : getSessionDisplaySubagentRunByChildSessionKey(key);
+  const subagentRuns = rowContext?.subagentRuns ?? buildSubagentSessionListReadIndex(now);
+  const subagentRun = subagentRuns.getDisplaySubagentRun(key);
   const subagentOwner =
     normalizeOptionalString(subagentRun?.controllerSessionKey) ||
     normalizeOptionalString(subagentRun?.requesterSessionKey);
   const liveSubagentRunActive = isSubagentRunLive(subagentRun) || isSubagentRunQueued(subagentRun);
   const hasActiveSubagentRun =
-    liveSubagentRunActive ||
-    (rowContext?.subagentRuns.countActiveDescendantRuns(key) ?? countActiveDescendantRuns(key)) > 0;
+    liveSubagentRunActive || subagentRuns.countActiveDescendantRuns(key) > 0;
   const persistedSessionStatus = entry?.status;
   const persistedSessionEndedAt = entry?.endedAt;
   const persistedSessionStartedAt = entry?.startedAt;

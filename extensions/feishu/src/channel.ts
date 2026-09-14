@@ -427,7 +427,7 @@ const collectFeishuSecurityWarnings = createAllowlistProviderGroupPolicyWarningC
 const collectFeishuOpenGroupFindings = createConditionalWarningCollector.findings({
   collectWarnings: collectFeishuSecurityWarnings,
   checkId: "channels.feishu.groups.open",
-  severity: "critical",
+  severity: "warn",
   title: "Feishu security warning",
 });
 
@@ -1174,6 +1174,15 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount, FeishuProbeResul
       },
       actions: {
         providerOwnedReadGates: true,
+        readAuthorityActions: [
+          "read",
+          "reactions",
+          "list-pins",
+          "member-info",
+          "channel-info",
+          "channel-list",
+          "sticker-search",
+        ],
         messageActionTargetAliases,
         describeMessageTool: describeFeishuMessageTool,
         handleAction: async (ctx) => {

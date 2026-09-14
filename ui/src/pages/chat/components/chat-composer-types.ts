@@ -77,6 +77,9 @@ export type ChatComposerProps = ChatAttachmentControlsProps & {
   offline?: boolean;
   queuedOutboxCount?: number;
   canSend: boolean;
+  modelRequiredReason?: string | null;
+  submitDisabledReason?: string | null;
+  submitPending?: boolean;
   disabledReason: string | null;
   disabledReasonTone?: "info" | "danger";
   disabledReasonBusy?: boolean;
@@ -90,6 +93,7 @@ export type ChatComposerProps = ChatAttachmentControlsProps & {
   progressCard?: ProgressCard | null;
   runActive?: boolean;
   collapseTaskProgress?: boolean;
+  readingHistory?: boolean;
   runId?: string | null;
   onDismissProgressCard?: (card: ProgressCard) => void;
   gatewayQuestionPrompts?: readonly QuestionPrompt[];
@@ -159,7 +163,8 @@ export type ChatComposerProps = ChatAttachmentControlsProps & {
   onQueueRemove: (id: string) => void;
   onQueueRetry?: (id: string) => void;
   onQueueSteer?: (id: string) => void;
-  onQueueMove?: (id: string, toIndex: number) => void;
+  onQueueMove?: (id: string, targetId: string) => void;
+  displayQueue?: ChatQueueItem[];
   queuedEdit?: ChatQueuedEditProps;
   onClearReply?: () => void;
   onGoalAction?: (goalId: string, action: ChatGoalAction) => void;
@@ -185,6 +190,7 @@ type ComposingDraft = {
 export type ChatComposerState = SkillMenuState &
   SlashMenuState & {
     composerComposing: boolean;
+    editRevision: number;
     mentionMenu: HumanMentionMenu;
     mentionInput?: HumanMentionInput;
     composingDraft: ComposingDraft | null;

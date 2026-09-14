@@ -15,6 +15,7 @@ import type { Tone } from "../memory-host-sdk/status.js";
 import type { SessionStatus, StatusSummary } from "../status/types.js";
 import { formatDeliveryQueueHealthLine } from "./health-format.js";
 import type { HealthSummary } from "./health.js";
+import { formatSqliteWalHealthWarning } from "./sqlite-wal-health.js";
 import type { AgentLocalStatus } from "./status.agent-local.js";
 import type { MemoryStatusSnapshot, MemoryPluginStatus } from "./status.scan.shared.js";
 
@@ -114,7 +115,7 @@ export function buildStatusHeartbeatValue(params: { summary: Pick<SummaryLike, "
         return `disabled (${agent.agentId})`;
       }
       if (agent.waitingForRoute) {
-        return `${agent.every} (${agent.agentId}; waiting for delivery route — set commands.ownerAllowFrom or channel allowFrom, or heartbeat.target)`;
+        return `${agent.every} (${agent.agentId}; waiting for delivery route — set commands.ownerAllowFrom=["telegram:123456789"] or channel allowFrom; explicit delivery: heartbeat.target="telegram" with heartbeat.to="123456789")`;
       }
       return `${agent.every} (${agent.agentId})`;
     })
@@ -271,6 +272,7 @@ export function buildStatusSecurityAuditLines(params: {
 /** Builds gateway, channel, and delivery queue health table rows. */
 export function buildStatusHealthRows(params: {
   health: HealthSummary;
+  sqliteWal?: StatusSummary["sqliteWal"];
   formatHealthChannelLines: (summary: HealthSummary, opts: { accountMode: "all" }) => string[];
   ok: (value: string) => string;
   warn: (value: string) => string;
@@ -283,6 +285,10 @@ export function buildStatusHealthRows(params: {
       Detail: `${params.health.durationMs}ms`,
     },
   ];
+  const sqliteWalWarning = formatSqliteWalHealthWarning(params.sqliteWal);
+  if (sqliteWalWarning) {
+    rows.push({ Item: "SQLite WAL", Status: params.warn("WARN"), Detail: sqliteWalWarning });
+  }
   if (params.health.eventLoop) {
     rows.push({
       Item: "Event loop",

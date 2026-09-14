@@ -213,6 +213,18 @@ You can override both via the **`OPENCLAW_LOG_LEVEL`** environment variable (e.g
 `--verbose` only affects console output and WS log verbosity; it does not change
 file log levels.
 
+### Provider request failures
+
+Anthropic-compatible HTTP failures preserve the HTTP status separately from a
+bounded, redacted response body. JSON error bodies are parsed before diagnostic
+redaction and preview truncation, so a long proxy error does not lose its status
+or upstream rejection reason merely because the console preview is short.
+Oversized or malformed bodies can still be omitted by the diagnostic redactor.
+
+Chat displays recognized request-limit facts, including the allowed and actual
+number of `cache_control` blocks, in both live failures and saved history. Raw
+proxy metadata stays in redacted diagnostics rather than the chat message.
+
 ### Targeted model transport diagnostics
 
 When debugging provider calls, use targeted environment flags instead of raising
@@ -284,6 +296,60 @@ OpenTelemetry log export is enabled, using the same bounded attributes as file
 logs. Configure `diagnostics.otel.logsExporter` to choose OTLP, stdout JSONL, or
 both sinks.
 
+### Embedded attempt preparation
+
+Embedded `prep stages` summaries separate two tool-preparation intervals:
+
+- `bundle-tools`: awaited MCP/LSP preparation, tool normalization and policy
+  projection, measured after preparation admission.
+- `tool-catalog`: synchronous catalog construction, including Code Mode or tool
+  search when enabled, schema projection and tool diagnostics.
+
+`tool-preparation` is an inclusive checkpoint from the preceding bootstrap
+checkpoint. It includes both intervals, preparation admission waits and the
+remaining bootstrap work. These entries overlap: do not sum them or interpret
+them as CPU time. Later permission refreshes do not append initial-preparation
+entries. The conditional Code Mode and tool-search catalog messages still report
+their original activation/compaction events.
+
+Older summaries charged bundle waiting to `code-mode` or `tool-search` and used
+`bundle-tools` for a later bookkeeping checkpoint. Those names do not provide
+the same timing boundaries as the corrected spans.
+
+The summary keeps its existing identity fields and warning thresholds: ten
+seconds total or five seconds in any recorded stage; faster summaries use trace
+logging. A missing summary does not prove preparation completed without delay.
+
+### Session catalog provider waits
+
+With process diagnostics enabled, the `gateway/session-catalog` logger records
+`slow session catalog provider list` for attempts that settle after at least one second. It separates
+`admissionWaitMs`, `providerElapsedMs`, and `completionDelayMs`: waiting for
+catalog provider admission, elapsed time inside the provider call, and the
+continuation after settlement and queue release. These are elapsed intervals,
+not CPU measurements. The Gateway's earlier operator-start queue is separate.
+
+`admitted` and `providerInvoked` distinguish an attempt that never entered the
+queue's active slot from one that called the provider. Unreached intervals are
+omitted. `outcome` reports the attempt's resolution or rejection;
+`signalAborted` reports the signal independently and does not identify an error's
+cause or prove that native work stopped. Provider slots remain owned until their
+returned promises settle, including after cancellation.
+
+`providerIdHash` hashes provider IDs of at most 256 UTF-16 units; longer IDs omit
+the field. It supports correlation, not anonymization or authorization. Host
+summaries count only returned gateway/node kinds, connection flags and error
+presence, inspecting at most 512 hosts. `returnedHostCount` reports the full
+array length and `hostCountsComplete=false` marks partial counts. No session rows,
+host IDs, provider labels, search text or error messages are included.
+
+Each summary describes an underlying provider attempt. Cached and in-flight
+followers can receive several RPC responses from that one attempt. Later
+`waitUntil` host publications have a separate lifetime and are not included in
+the provider duration or returned-host counts. The log does not prove client
+receipt, identify which native operation was slow, or cover attempts that never
+settle. Missing records do not establish that there were no stalls.
+
 ### Lifecycle queue waits
 
 When process diagnostics are enabled, the `sessions/lifecycle` logger emits
@@ -332,6 +398,65 @@ for the entire wait or which work consumed CPU. These are ordinary performance
 logs. They do not use or change [audit identity](/gateway/audit), decisions,
 retention, principal attribution or admission authority.
 
+### Slow worktree cleanup
+
+With process diagnostics and info-level logging enabled, two subsystems log
+operations lasting at least one second after they return or throw:
+
+- `agents/worktrees`: `slow managed worktree removal` measures removal through
+  allocation-lease settlement. `admissionMs` covers acquisition attempts,
+  backoff, setup, and scheduling before the removal callback starts. `bodyMs`
+  covers that callback; `finalizeMs` covers drainage, final authority checks,
+  lease release, and completion delivery. Create and restore operations do not
+  emit this record.
+- `git/ref-mutation`: `slow Git ref mutation` measures shared Git-ref queue
+  operations. `resolveMs` covers common-directory resolution; `queueWaitMs`
+  covers time from enqueue to callback entry; `queuedOperationMs` covers the
+  callback and delivery of its settlement. It can include multiple Git commands
+  and does not identify a queue holder or every predecessor.
+
+Removal also records the stages reached inside `bodyMs`:
+
+- `preparationMs`: authority and removal-claim checks, repository rebinding, and
+  worktree lock inspection or unlock.
+- `snapshotMs`: snapshot preparation and publication, including provisioned-file
+  capture and snapshot-failure cleanup.
+- `checkoutRemovalMs`: deletion admission checks and physical Git worktree
+  removal through result validation.
+- `bodyFinalizeMs`: branch deletion, prune, empty-parent cleanup, registry
+  finalization, or removal-claim cleanup after failure. This is distinct from
+  `finalizeMs`, which measures the allocation-lease wrapper's final settlement.
+
+Unreached stages are absent; a reached stage can report zero milliseconds.
+Exceptions close the active stage and include claim cleanup in `bodyFinalizeMs`.
+These fields subdivide the admitted body, not individual Git commands or CPU
+work. They use the same completion record and rate budget.
+
+Both records include `durationMs` in integer milliseconds, `callbackEntered`, and
+`outcome` (`returned` or `threw`). Removal that never enters its callback reports
+all elapsed time as `admissionMs` and omits `bodyMs` and `finalizeMs`. Git directory
+resolution failure reports `resolveMs` and omits unreached queue and operation
+durations. Phase durations partition each record's interval before rounding.
+These intervals include asynchronous waits: admission is not pure lock wait,
+and queued operation time is not child-process CPU time. They nest within
+broader operations such as session-patch `worktreeCleanup`; do not add nested
+durations to the enclosing total.
+
+Each subsystem has a separate fixed budget of 60 records per 60-second window
+per JavaScript runtime isolate. Bursts across window boundaries remain possible.
+`omittedObservations` reports suppressed records on the next emitted record,
+then resets. Pending operations emit nothing until they settle; disabled
+diagnostics, log levels, thresholds, and budgets can also leave no record.
+Missing records never prove there was no delay.
+
+The added fields are fixed scalar timings, outcomes, counts, `pid`, `threadId`,
+and `isMainThread`. They omit repository paths, refs, arguments, raw errors, and
+command output. Records preserve an existing valid diagnostic trace when
+available; they create no trace, operation identity, or private-identity hash.
+Use the trace to associate nested records, without treating elapsed time as CPU
+attribution. These diagnostics measure cleanup without changing its ordering or
+completion behavior.
+
 ### Slow agent database opens
 
 The `slow OpenClaw agent database open` warning includes `phaseDurationsMs` when
@@ -360,6 +485,16 @@ integrity check; resumed validation and repair can still run on the opener.
 Correlate the process ID with the log timestamp and current process; PIDs can be
 reused after exit.
 
+`integrityGateMs` covers the initial integrity check through admission
+revalidation and resumption. When the driver measures its synchronous integrity
+and foreign-key callback, `integrityCheckSyncMs` reports that callback's elapsed
+time and `integrityOutsideCheckMs` reports the remaining gate time. The two
+integer fields partition `integrityGateMs`; the remainder includes admission,
+IPC, scheduling, and revalidation, not just a parent queue wait. These are wall
+durations, not CPU time. A reclamation Worker can report this synchronous check
+while its `admissionMode` is `async`. An asynchronous child-process check leaves
+both fields absent because its parent cannot measure the callback itself.
+
 SQLite reclamation Workers also emit `slow SQLite reclamation Worker operation`
 at `warn` when their joined operation takes at least one second. The record is
 emitted after Worker exit and parent admission settlement. It includes the
@@ -371,6 +506,10 @@ time or isolate a validation phase. Short writer sections can therefore remain
 quiet while this whole-operation warning exposes slow preparation between them.
 The record inherits an existing parent trace when available; it contains no
 database path, session identifier, plan content, or raw error.
+Cold-storage operations use the same warning with `reclamationKind` set to
+`cold-batch` (archive or externalize), `cold-maintain` (reclaim free pages), or
+`cold-restore` (restore a transcript). Their writer warnings carry the same Worker
+identity and numbered admission fields.
 
 ### SQLite transaction timing
 
@@ -386,6 +525,22 @@ and before `COMMIT`, including any JavaScript consumer work inside that callback
 It excludes database opening and the separately timed begin and commit steps.
 These elapsed durations do not measure SQL CPU time or establish a causal link
 to a nearby request.
+
+The operation `session.reclamation.commit-settlement` identifies the parent's
+synchronous join after it authorizes a reclamation Worker to commit. Its lock
+wait is separate from the Worker's integrity scan and deletion work. This label
+also applies to cold-storage operations using that commit boundary.
+
+Hot transcript reads identify their purpose in `operation`: `session transcript
+<purpose> read`, where `<purpose>` is `identity`, `header`, `tail`, `incremental`,
+`checkpoint`, `events`, `raw rows`, `storage rows`, or `match`. These fixed labels
+distinguish readers without retaining session IDs or transcript content. Nested
+reads remain part of the outer transaction's timing; older warnings use the
+generic `session transcript hot read` label.
+
+`session branch summaries read` covers the snapshot read and branch-summary
+computation. Stored sessions perform this work in a background Worker; incognito
+sessions use their process-held database. Cache hits do not perform this scan.
 
 Immediate `BEGIN` warnings also include `beginAdmission`: `nativeAttempts` counts
 actual native `BEGIN IMMEDIATE` calls and `nativeMs` measures those calls;
@@ -447,6 +602,51 @@ preparation failed; absent fields were not completed. These fields do not change
 the warning threshold or prove that a nearby request caused the work. Rounding
 and work outside the measured subphases can leave a difference from
 `writerExecutionMs`; do not assign that remainder to a specific phase.
+
+For `session.history.archive-prune`, the same slow or failure warning can include
+one bounded `archivePruning` object. Its `trigger` is recorded at the call site:
+`initial`, `after-eviction`, or `final`. It distinguishes pruning passes within
+the maintenance flow; it does not identify the request that caused maintenance.
+
+The object aggregates observations across the pruning pass:
+
+- `admissionMs`, `cachedAdmissions`, and `asyncAdmissions` measure database
+  acquisition and count its observed modes. Admission time ends at callback entry
+  or acquisition failure and can include shared admission and integrity-check waits.
+  A refusal before mode selection adds admission time without incrementing either mode count.
+- `checkpointMs`, `checkpointMaxMs`, and `checkpointCalls` report total time,
+  longest call, and calls entered. `checkpointIncomplete` counts calls returning
+  false, which can mean a busy checkpoint or an error; it does not identify a lock
+  holder or distinguish those outcomes. A thrown checkpoint contributes to call
+  count and time without incrementing `checkpointIncomplete`.
+- `vacuumMs`, `vacuumPasses`, and `vacuumPagesRequested` measure incremental vacuum
+  calls and their requested page counts. Requested pages are not confirmed
+  reclaimed pages.
+- `queryMs` covers existing archive-presence, candidate, unpublished-name, and
+  freelist reads. `rowDeletionMs` covers the canonical archive row-deletion
+  transaction.
+- `fileRemovalMs`, `removedFiles`, `missingFiles`, and `failedRemovals` report
+  existing file-removal outcomes. `removedFiles` counts successful canonical and
+  legacy removals. `missingFiles` counts canonical removal attempts that return
+  `ENOENT`. Other canonical failures and all unsuccessful legacy removals count
+  under `failedRemovals`; the legacy count includes missing paths, non-files,
+  and stat or removal failures.
+- `measurementMs` and `measurements` cover awaited disk-usage measurement attempts,
+  including failures and time queued for the measurement Worker, scanning, and
+  returning the result. `legacyInventoryMs` covers legacy file inventory,
+  filtering, and sorting.
+
+All durations are wall time, including asynchronous waits, rather than CPU
+measurements. `completed: false` retains partial observations when pruning
+throws; an absent stage timing field means that stage was not entered.
+`completed: true` means the pruning pass returned normally. It does not prove
+that every checkpoint completed, every removal succeeded, or the high-water
+target was reached. Rounding and unmeasured work can leave a remainder relative
+to `writerExecutionMs`; `checkpointMaxMs` is already included in `checkpointMs`.
+
+These fields reuse existing operations without additional store reads, per-file
+records, paths, names, or content. They do not change the warning threshold,
+checkpoint mode or timeout, or archive-retention behavior.
 
 ### Slow reply preparation
 
@@ -518,7 +718,7 @@ event payloads (tool start args, partial/final result payloads, derived
 exec output, and patch summaries):
 
 - Sensitive-value redaction is always enabled.
-- `logging.redactPatterns`: list of regex strings that replaces the default set for log/transcript output. For Control UI tool payloads, custom patterns apply on top of the built-in defaults, so adding a pattern never weakens redaction of values already caught by the defaults.
+- `logging.redactPatterns`: list of regex strings that replaces the default string list for log/transcript output. Built-in structural protections for form bodies, structured authorization headers, and bare AWS secret access keys always apply, including when this list is copied or customized. For Control UI tool payloads, custom patterns apply on top of the built-in defaults, so adding a pattern never weakens redaction of values already caught by the defaults.
 
 File logs use JSONL; active session transcripts live in the
 [per-agent SQLite database](/reference/database-schemas#database-layout). Matching
@@ -532,6 +732,10 @@ so stored history can correlate with live tool events. This exemption applies
 only to protocol metadata; the same values in arguments, results, or nested
 payloads still pass through redaction.
 
+In the OpenClaw harness, finalized tool-result text is masked after middleware,
+before entering live model context. This also covers exec output and tool errors;
+it preserves media bytes and the original arguments used to execute tools.
+Redaction happens when the result is added, keeping later prompt replay stable.
 Model-visible tool-result text uses narrower assignment matching so source code
 remains intact. Registered secrets and explicit credential forms, including
 structured fields, authorization headers, URL credentials, and known token

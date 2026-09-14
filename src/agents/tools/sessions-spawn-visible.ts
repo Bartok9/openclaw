@@ -32,6 +32,7 @@ import { deleteSubagentSessionForCleanup } from "../subagents/registry/subagent-
 import { getSubagentDepthFromSessionStore } from "../subagents/spawn/subagent-depth.js";
 import { resolveSubagentSpawnOwnership } from "../subagents/spawn/subagent-spawn-ownership.js";
 import { resolveConfiguredSubagentRunTimeoutSeconds } from "../subagents/spawn/subagent-spawn-plan.js";
+import { buildSubagentTaskMessage } from "../subagents/spawn/subagent-system-prompt.js";
 import { resolveSubagentTargetPolicy } from "../subagents/spawn/subagent-target-policy.js";
 import { resolveAgentTimeoutMs } from "../timeout.js";
 import { normalizeToolModelOverride, readToolStringParam, ToolInputError } from "./common.js";
@@ -45,13 +46,26 @@ export const VISIBLE_SESSIONS_SPAWN_SCHEMA = {
   visible: Type.Optional(
     Type.Boolean({
       description:
-        "Durable visible session: coding/multi-step/keepable results; works without UI; subagent only. Default run mode and empty attachment fields are accepted; no thread/thinking/lightContext or attachment staging.",
+        "Persistent sidebar session only when the user requests a separate session or needs to revisit and steer it independently. Internal QA/coding/review/test workers: omit or false. Subagent runtime only; default run mode and empty attachments accepted; no thread/thinking/lightContext or attachment staging.",
     }),
   ),
   group: Type.Optional(
     Type.String({
       description:
         "Custom sidebar group for a visible session; a new name creates the group. Omit or pass an empty string to leave it ungrouped.",
+    }),
+  ),
+  projectId: Type.Optional(
+    Type.String({
+      description:
+        "Registered project for a visible session; mutually exclusive with projectGitUrl and cwd.",
+    }),
+  ),
+  projectGitUrl: Type.Optional(
+    Type.String({
+      description:
+        "GitHub HTTPS or git@github.com repository URL for a visible session's managed clone; mutually exclusive with projectId and cwd. Local paths and file URLs are not accepted.",
+      maxLength: 2048,
     }),
   ),
   worktree: Type.Optional(Type.Boolean({ description: "Visible session worktree" })),
@@ -104,9 +118,13 @@ export async function maybeSpawnVisibleSession(params: {
   const worktreeName = readToolStringParam(params.raw, "worktreeName");
   const worktreeBaseRef = readToolStringParam(params.raw, "worktreeBaseRef");
   const group = readToolStringParam(params.raw, "group");
+  const projectId = readToolStringParam(params.raw, "projectId");
+  const projectGitUrl = readToolStringParam(params.raw, "projectGitUrl");
   if (params.raw.visible !== true) {
     const visibleOnlyParams = [
       ["group", group],
+      ["projectId", projectId],
+      ["projectGitUrl", projectGitUrl],
       ["worktree", worktree],
       ["worktreeName", worktreeName],
       ["worktreeBaseRef", worktreeBaseRef],
@@ -332,7 +350,12 @@ export async function maybeSpawnVisibleSession(params: {
         // sessions.create persists the group under the legacy wire field `category`.
         ...(group ? { category: group } : {}),
         model: resolvedModel,
-        task: params.task,
+        task: buildSubagentTaskMessage({
+          task: params.task,
+          spawnMode: "session",
+          childDepth: callerDepth + 1,
+          maxSpawnDepth: maxDepth,
+        }),
         timeoutMs:
           runTimeoutSeconds === 0
             ? 0
@@ -346,6 +369,8 @@ export async function maybeSpawnVisibleSession(params: {
           : {}),
         ...(params.raw.context === "fork" ? { fork: true } : {}),
         ...(spawnedCwd ? { cwd: spawnedCwd } : {}),
+        ...(projectId ? { projectId } : {}),
+        ...(projectGitUrl ? { projectGitUrl } : {}),
         ...(worktree ? { worktree: true } : {}),
         ...(worktreeName ? { worktreeName } : {}),
         ...(worktreeBaseRef ? { worktreeBaseRef } : {}),
@@ -362,7 +387,7 @@ export async function maybeSpawnVisibleSession(params: {
       ) {
         return {
           status: "forbidden",
-          error: `Visible session cwd "${spawnedCwd}" is outside configured agent workspaces and requires operator.admin. Omit cwd to use the target agent workspace, or ask the operator to start the session from a registered project. Do not substitute the synchronous \`openclaw agent\` CLI for a persistent visible session.`,
+          error: `Visible session cwd "${spawnedCwd}" is outside configured agent workspaces and requires operator.admin. Omit cwd to use the target agent workspace, or select a registered project with projectId or a GitHub repository with projectGitUrl. Do not substitute the synchronous \`openclaw agent\` CLI for a persistent visible session.`,
         };
       }
       throw error;

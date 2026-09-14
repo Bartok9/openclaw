@@ -48,21 +48,35 @@ const CODEX_SESSION_CATALOG_LIST_TTL_MS = 32_000;
 const CODEX_SESSION_CATALOG_LIST_CACHE_MAX_ENTRIES = 32;
 
 type CodexCatalogRequestOptions = {
-  agentDir: string;
+  agentDir: string | undefined;
   config: OpenClawConfig | undefined;
   startOptions: CodexAppServerStartOptions;
 };
 
+type CodexCatalogControlSource = Pick<
+  CodexCatalogHome,
+  "appServer" | "localSessionsRoot" | "sourceHomeId"
+> & { agentDir?: string };
+
 type CodexCatalogPageCacheEntry = {
   expiresAt: number;
+  value: CodexSessionCatalogPage;
+};
+
+type CodexCatalogPendingPage = {
   page: Promise<CodexSessionCatalogPage>;
-  value?: CodexSessionCatalogPage;
+  staleValue?: CodexSessionCatalogPage;
+};
+
+type CodexCatalogPageCache = {
+  settled: Map<string, CodexCatalogPageCacheEntry>;
+  pending: Map<string, CodexCatalogPendingPage>;
 };
 
 function codexCatalogPageCacheKey(
   params: CodexSessionCatalogPageParams,
-  agentId: string,
-  source?: CodexCatalogHome,
+  agentId: string | undefined,
+  source?: CodexCatalogControlSource,
 ): string {
   // Mirror listPage's search/cwd normalization; these trimmed values are what reach app-server.
   return JSON.stringify([
@@ -363,17 +377,15 @@ export function createCodexSessionCatalogControl(params: {
     OpenClawConfig,
     Map<string, CodexCatalogRequestOptions>
   >();
-  const catalogPagesByConfig = new WeakMap<
-    OpenClawConfig,
-    Map<string, CodexCatalogPageCacheEntry>
-  >();
+  const catalogPagesByConfig = new WeakMap<OpenClawConfig, CodexCatalogPageCache>();
   const resolveRequestOptions = (
     startOptions: CodexAppServerStartOptions,
-    agentId: string,
-    source?: CodexCatalogHome,
+    agentId: string | undefined,
+    source?: CodexCatalogControlSource,
   ): CodexCatalogRequestOptions => {
     const runtimeConfig = params.getRuntimeConfig();
-    const agentDir = source?.agentDir ?? resolveAgentDir(runtimeConfig ?? {}, agentId);
+    const agentDir =
+      source?.agentDir ?? (agentId ? resolveAgentDir(runtimeConfig ?? {}, agentId) : undefined);
     const resolvedStartOptions = source?.appServer.start ?? startOptions;
     if (!runtimeConfig) {
       return {
@@ -403,8 +415,8 @@ export function createCodexSessionCatalogControl(params: {
     return resolved;
   };
   const createRequestSnapshot = (
-    agentId: string,
-    source?: CodexCatalogHome,
+    agentId: string | undefined,
+    source?: CodexCatalogControlSource,
   ): CodexSessionCatalogRequestSnapshot => {
     const pluginConfig = getPluginConfig();
     const runtime = source?.appServer ?? params.resolveRuntimeOptions({ pluginConfig });
@@ -415,6 +427,7 @@ export function createCodexSessionCatalogControl(params: {
         const { codexControlRequest } = await import("./command-rpc.js");
         return await codexControlRequest(pluginConfig, method, requestParams, {
           ...requestOptions,
+          authProfileId: null,
           assertCurrent,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         });
@@ -422,7 +435,10 @@ export function createCodexSessionCatalogControl(params: {
     );
   };
 
-  const forRequest = (agentId: string, source?: CodexCatalogHome): CodexSessionCatalogControl => {
+  const forRequest = (
+    agentId: string | undefined,
+    source?: CodexCatalogControlSource,
+  ): CodexSessionCatalogControl => {
     const withPinnedConnection: CodexSessionCatalogControl["withPinnedConnection"] = async (
       run,
     ) => {
@@ -446,6 +462,7 @@ export function createCodexSessionCatalogControl(params: {
         agentDir,
         config: runtimeConfig,
         startOptions,
+        authProfileId: null,
         timeoutMs: runtime.requestTimeoutMs,
       });
       try {
@@ -468,13 +485,15 @@ export function createCodexSessionCatalogControl(params: {
         );
         const pinnedControl: CodexSessionCatalogControl =
           createCodexSessionCatalogControlFromRequests({
-            forkContext: {
-              client,
-              appServer: runtime,
-              pluginConfig,
-              agentDir,
-              localSessionsRoot: source?.localSessionsRoot,
-            },
+            forkContext: agentDir
+              ? {
+                  client,
+                  appServer: runtime,
+                  pluginConfig,
+                  agentDir,
+                  localSessionsRoot: source?.localSessionsRoot,
+                }
+              : undefined,
             clientId: resolveCodexAppServerClientInstanceId(client),
             retireConnection: () => {
               retireSharedCodexAppServerClientIfCurrent(client);
@@ -509,63 +528,54 @@ export function createCodexSessionCatalogControl(params: {
         }
         let cache = catalogPagesByConfig.get(runtimeConfig);
         if (!cache) {
-          cache = new Map();
+          cache = { settled: new Map(), pending: new Map() };
           catalogPagesByConfig.set(runtimeConfig, cache);
         }
         const key = codexCatalogPageCacheKey(pageParams, agentId, source);
-        const cached = cache.get(key);
+        const cached = cache.settled.get(key);
         if (cached) {
-          cache.delete(key);
-          cache.set(key, cached);
+          cache.settled.delete(key);
+          cache.settled.set(key, cached);
           if (cached.expiresAt > now()) {
-            return cached.value ?? (await cached.page);
+            return cached.value;
           }
         }
-        if (cached) {
-          cache.delete(key);
+        const pending = cache.pending.get(key);
+        if (pending) {
+          return pending.staleValue ?? (await pending.page);
         }
-        const page = control.listPage(pageParams);
-        const staleValue = cached?.value;
-        const entry: CodexCatalogPageCacheEntry = {
-          expiresAt: Number.POSITIVE_INFINITY,
-          page,
-          ...(staleValue ? { value: staleValue } : {}),
-        };
-        cache.set(key, entry);
-        pruneMapToMaxSize(cache, CODEX_SESSION_CATALOG_LIST_CACHE_MAX_ENTRIES);
-        const settle = (value: CodexSessionCatalogPage) => {
-          if (cache.get(key) === entry) {
-            entry.value = value;
-            entry.expiresAt = now() + CODEX_SESSION_CATALOG_LIST_TTL_MS;
-          }
-          return value;
-        };
-        const restore = () => {
-          if (cache.get(key) !== entry) {
-            return;
-          }
-          if (staleValue) {
-            cache.set(key, {
-              expiresAt: now(),
-              page: Promise.resolve(staleValue),
-              value: staleValue,
-            });
-          } else {
-            cache.delete(key);
-          }
-        };
+        // Result eviction must not retire a live producer or its stale refresh value.
+        // Pending entries belong only to started work and leave on every settlement.
+        const page = control
+          .listPage(pageParams)
+          .then(
+            (value) => {
+              cache.settled.delete(key);
+              cache.settled.set(key, {
+                value,
+                expiresAt: now() + CODEX_SESSION_CATALOG_LIST_TTL_MS,
+              });
+              pruneMapToMaxSize(cache.settled, CODEX_SESSION_CATALOG_LIST_CACHE_MAX_ENTRIES);
+              return value;
+            },
+            (error: unknown) => {
+              if (cached && cache.settled.get(key) === cached) {
+                cached.expiresAt = now();
+              }
+              throw error;
+            },
+          )
+          .finally(() => {
+            cache.pending.delete(key);
+          });
+        cache.pending.set(key, { page, ...(cached ? { staleValue: cached.value } : {}) });
         // Expiry starts one background refresh. Passive callers keep the last settled page while
         // the next poll publishes success or retries failure.
-        if (staleValue) {
-          void page.then(settle, restore);
-          return staleValue;
+        if (cached) {
+          void page.catch(() => undefined);
+          return cached.value;
         }
-        try {
-          return settle(await page);
-        } catch (error) {
-          restore();
-          throw error;
-        }
+        return await page;
       },
     };
   };
@@ -580,5 +590,17 @@ export function createCodexSessionCatalogControl(params: {
     );
     return source ? forRequest(agentId, source) : undefined;
   };
-  return { forRequest, forUpstream, homesForAgent };
+  return {
+    forRequest,
+    forUpstream,
+    homesForAgent,
+    forNode(agentId) {
+      const source = homeResolver.forNode(agentId);
+      return {
+        control: forRequest(source.agentId, source),
+        sourceHomeId: source.sourceHomeId,
+        codexHome: source.codexHome,
+      };
+    },
+  };
 }

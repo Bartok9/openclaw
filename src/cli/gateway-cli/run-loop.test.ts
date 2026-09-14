@@ -3,8 +3,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import {
+  createTempDirTracker,
+  useAutoCleanupTempDirTracker,
+} from "../../../test/helpers/temp-dir.js";
 import type { HostedGatewayStop } from "../../daemon/hosted-stop.js";
+import { LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS } from "../../daemon/launchd-plist.js";
+import { buildSystemdUnit } from "../../daemon/systemd-unit.js";
+import { GatewayConnectionWork } from "../../gateway/server-connection-work.js";
 import type { GatewayServer, GatewayStartupOperation } from "../../gateway/server-public.js";
 import type { GatewayActiveWorkSnapshot } from "../../infra/gateway-active-work.js";
 import type { GatewayBootLifecycleCompletion } from "../../infra/gateway-boot-lifecycle.js";
@@ -14,6 +20,8 @@ import { SUPERVISOR_HINT_ENV_VARS } from "../../infra/supervisor-markers.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { resolveGlobalMap } from "../../shared/global-singleton.js";
 import { captureEnv, deleteTestEnvValue } from "../../test-utils/env.js";
+
+const closeLogTempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const acquireGatewayLock = vi.fn(async (_opts?: { port?: number }) => ({
   release: vi.fn(async () => {}),
@@ -173,6 +181,9 @@ const gatewayLog = {
   error: vi.fn(),
 };
 const flushLogger = vi.fn(async () => {});
+const writeDiagnosticStabilityBundleForFailureSync = vi.fn(() => ({
+  message: "stability bundle recorded",
+}));
 const hasManagedProviderLocalServices = vi.fn(() => false);
 const stopManagedProviderLocalServices = vi.fn(async () => {});
 const cancelShutdownHardExitWatchdog = vi.fn();
@@ -288,6 +299,10 @@ vi.mock("../../logging/subsystem.js", () => ({
 
 vi.mock("../../logging/logger.js", () => ({
   flushLogger: () => flushLogger(),
+}));
+
+vi.mock("../../logging/diagnostic-stability-bundle.js", () => ({
+  writeDiagnosticStabilityBundleForFailureSync,
 }));
 
 vi.mock("../../agents/provider-runtime-lifecycle.js", () => ({
@@ -1289,8 +1304,9 @@ describe("runGatewayLoop", () => {
     vi.clearAllMocks();
 
     await withIsolatedSignals(async ({ captureSignal }) => {
+      const error = new TypeError("close owner failed");
       const close = vi.fn<GatewayCloseFn>(async () => {
-        throw new TypeError("close owner failed");
+        throw error;
       });
       const { start, started } = createSignaledStart(close);
       const { runtime, exited } = createRuntimeWithExitSignal();
@@ -1308,7 +1324,90 @@ describe("runGatewayLoop", () => {
       expect(gatewayLog.error).toHaveBeenCalledWith(
         "shutdown step failed (gateway server close): close owner failed",
       );
+      expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledWith(
+        "gateway.stop_close_failed",
+        error,
+        { shutdownStep: "gateway-server-close" },
+      );
     });
+  });
+
+  it.each(["close", "native stop"])(
+    "records the thrown %s error during a hosted stop",
+    async (step) => {
+      await withIsolatedSignals(async () => {
+        const error = new TypeError("fixture hosted stop failed");
+        const { close, start, exited } = await createSignaledLoopHarness(undefined, true);
+        if (step === "close") {
+          close.mockRejectedValueOnce(error);
+        } else {
+          hostedStopExecute.mockRejectedValueOnce(error);
+        }
+        const host = start.mock.calls[0]?.[0]?.hostLifecycle;
+        expect(host).toBeDefined();
+        await expect(host?.request("stop", () => {})).resolves.toMatchObject({ ok: true });
+        await expect(exited).resolves.toBe(1);
+        expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledWith(
+          step === "close" ? "gateway.stop_close_failed" : "gateway.stop_native_unconfirmed",
+          error,
+          { shutdownStep: step === "close" ? "gateway-server-close" : "hosted-gateway-stop" },
+        );
+      });
+    },
+  );
+
+  it("persists an issued close-error log append before forced exit", async () => {
+    const logger =
+      await vi.importActual<typeof import("../../logging/logger.js")>("../../logging/logger.js");
+    const { fileLogTransport } = await import("../../logging/logger-file-transport.js");
+    const { appendRegularFile } = await import("../../infra/regular-file.js");
+    const logFile = join(closeLogTempDirs.make("openclaw-close-log-"), "gateway.jsonl");
+    const appendAllowed = createDeferredCore();
+    logger.setLoggerOverride({ level: "info", file: logFile });
+    const fileLogger = logger.getChildLogger({ subsystem: "gateway" });
+    fileLogTransport.setAppenderForTests(async (options) => {
+      await appendAllowed.promise;
+      return appendRegularFile(options);
+    });
+    gatewayLog.error.mockImplementation((message: string) => {
+      fileLogger.error(message);
+      void logger.flushLogger();
+    });
+    flushLogger.mockImplementation(() => logger.flushLogger());
+    try {
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const close = vi.fn<GatewayCloseFn>(() => {
+          throw new TypeError("close owner failed");
+        });
+        const { start, started } = createSignaledStart(close);
+        const { runtime, exited } = createRuntimeWithExitSignal();
+        const exit = runtime.exit.getMockImplementation();
+        let persistedAtExit = "";
+        runtime.exit.mockImplementation((code) => {
+          persistedAtExit = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
+          exit?.(code);
+        });
+        await runLoopWithStart({ start, runtime });
+        await waitForStart(started);
+        captureSignal("SIGUSR1")();
+        await waitForLoopCondition(
+          () => runtime.exit.mock.calls.length > 0 || flushLogger.mock.calls.length > 0,
+          "close failure did not reach exit or log flush",
+        );
+        appendAllowed.resolve();
+        await expect(exited).resolves.toBe(1);
+        expect(persistedAtExit).toContain(
+          "shutdown step failed (gateway server close): close owner failed",
+        );
+      });
+    } finally {
+      appendAllowed.resolve();
+      await logger.flushLogger();
+      logger.resetLogger();
+      fileLogTransport.resetForTests();
+      gatewayLog.error.mockReset();
+      flushLogger.mockReset().mockResolvedValue(undefined);
+    }
   });
 
   it.each(["ordinary", "managed restoration"] as const)(
@@ -1533,6 +1632,108 @@ describe("runGatewayLoop", () => {
     });
   });
 
+  it.each<{
+    signal: "SIGTERM" | "SIGUSR1";
+    honorsAbort: boolean;
+    supervisor: "systemd" | "launchd" | "foreground";
+    waitMs?: number;
+  }>([
+    { signal: "SIGTERM", honorsAbort: false, supervisor: "systemd" },
+    { signal: "SIGTERM", honorsAbort: false, supervisor: "foreground" },
+    { signal: "SIGTERM", honorsAbort: true, supervisor: "systemd" },
+    { signal: "SIGUSR1", honorsAbort: false, supervisor: "systemd" },
+    { signal: "SIGTERM", honorsAbort: false, supervisor: "launchd" },
+    { signal: "SIGUSR1", honorsAbort: false, supervisor: "launchd" },
+    { signal: "SIGUSR1", honorsAbort: false, supervisor: "systemd", waitMs: 0 },
+    { signal: "SIGUSR1", honorsAbort: false, supervisor: "systemd", waitMs: 600_000 },
+  ])(
+    "bounds $supervisor $signal cleanup when a long provider call honors abort=$honorsAbort (wait=$waitMs)",
+    async ({ signal, honorsAbort, supervisor, waitMs }) => {
+      vi.clearAllMocks();
+      const unit = buildSystemdUnit({ programArguments: ["openclaw", "gateway", "run"] });
+      const stopTimeoutMs =
+        supervisor === "launchd"
+          ? LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000
+          : Number(unit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]) * 1_000;
+      const successStatuses = unit
+        .match(/^SuccessExitStatus=(.+)$/m)?.[1]
+        ?.split(" ")
+        .map(Number);
+      if (supervisor === "systemd") {
+        process.env.OPENCLAW_SYSTEMD_UNIT = "openclaw-gateway.service";
+        setPlatform("linux");
+      } else if (supervisor === "launchd") {
+        process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+        setPlatform("darwin");
+      }
+      if (waitMs !== undefined) {
+        consumeGatewaySigusr1RestartIntent.mockReturnValueOnce({ waitMs });
+      }
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const provider = createDeferredCore();
+        const connectionWork = new GatewayConnectionWork();
+        void connectionWork.track(() => provider.promise);
+        connectionWork.signal.addEventListener("abort", () => {
+          if (honorsAbort) {
+            provider.resolve();
+          }
+        });
+        const close = vi.fn<GatewayCloseFn>(async () => {
+          await connectionWork.drain();
+        });
+        const { start, started } = createSignaledStart(close);
+        const { runtime } = createRuntimeWithExitSignal();
+        await runLoopWithStart({ start, runtime });
+        await waitForStart(started);
+        const active = createActiveWorkSnapshot({ embeddedRuns: 1 });
+        createGatewayActiveWorkSnapshot.mockReturnValue(active);
+        waitForGatewayActiveWork.mockImplementationOnce(async (timeoutMs, options) => {
+          options?.onSnapshot?.(active);
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, timeoutMs);
+          });
+          return { drained: false, snapshot: active };
+        });
+        vi.useFakeTimers();
+        try {
+          setTimeout(() => provider.resolve(), 600_000);
+          captureSignal(signal)();
+          const deadlineMs =
+            signal === "SIGTERM" || waitMs !== undefined
+              ? stopTimeoutMs - 5_000
+              : Math.min(310_000, stopTimeoutMs - 5_000);
+          expect(deadlineMs).toBeLessThan(stopTimeoutMs);
+          await vi.advanceTimersByTimeAsync(deadlineMs - 1);
+          expect(connectionWork.signal.aborted).toBe(true);
+          if (!honorsAbort) {
+            expect(runtime.exit).not.toHaveBeenCalled();
+          }
+          await vi.advanceTimersByTimeAsync(1);
+          const expectedExit = supervisor === "foreground" && !honorsAbort ? 1 : 0;
+          expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(expectedExit);
+          if (supervisor !== "foreground") {
+            expect(successStatuses).toContain(runtime.exit.mock.calls[0]?.[0]);
+          }
+          expect(start).toHaveBeenCalledOnce();
+          if (!honorsAbort) {
+            expect(gatewayLog.warn).toHaveBeenCalledWith(
+              expect.stringMatching(/abandoning.*embeddedRuns=1/),
+            );
+            expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledWith(
+              signal === "SIGTERM"
+                ? "gateway.stop_shutdown_timeout"
+                : "gateway.restart_shutdown_timeout",
+              undefined,
+            );
+          }
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+        }
+      });
+    },
+  );
+
   it("still closes and exits when the direct-shutdown active-work drain fails", async () => {
     vi.clearAllMocks();
 
@@ -1554,6 +1755,150 @@ describe("runGatewayLoop", () => {
         restartExpectedMs: null,
       });
       expect(runtime.exit).toHaveBeenCalledWith(0);
+    });
+  });
+
+  it("reports failure when foreground provider service cleanup times out after server close", async () => {
+    vi.clearAllMocks();
+    hasManagedProviderLocalServices.mockReturnValue(true);
+    stopManagedProviderLocalServices.mockReturnValue(new Promise<void>(() => {}));
+    await withIsolatedSignals(async ({ captureSignal }) => {
+      const { close, runtime } = await createSignaledLoopHarness();
+      vi.useFakeTimers();
+      try {
+        captureSignal("SIGTERM")();
+        await vi.advanceTimersByTimeAsync(324_999);
+        expect(close).toHaveBeenCalledOnce();
+        expect(stopManagedProviderLocalServices).toHaveBeenCalledOnce();
+        expect(runtime.exit).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+        expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledWith(
+          "gateway.stop_shutdown_timeout",
+          undefined,
+        );
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it.each(["systemd", "launchd"] as const)(
+    "preserves a recorded close failure when %s final cleanup crosses the deadline",
+    async (supervisor) => {
+      vi.clearAllMocks();
+      const deadlineMs =
+        supervisor === "launchd" ? LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS * 1_000 - 5_000 : 325_000;
+      if (supervisor === "systemd") {
+        process.env.OPENCLAW_SYSTEMD_UNIT = "openclaw-gateway.service";
+        setPlatform("linux");
+      } else {
+        process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+        setPlatform("darwin");
+      }
+      hasManagedProviderLocalServices.mockReturnValue(true);
+      stopManagedProviderLocalServices.mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 2_000);
+          }),
+      );
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const { close, runtime } = await createSignaledLoopHarness();
+        close.mockImplementationOnce(async () => {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, deadlineMs - 1_000);
+          });
+          throw new Error("close owner failed");
+        });
+        vi.useFakeTimers();
+        try {
+          captureSignal("SIGTERM")();
+          await vi.advanceTimersByTimeAsync(deadlineMs - 1);
+          expect(gatewayLog.error).toHaveBeenCalledWith(
+            "shutdown step failed (gateway server close): close owner failed",
+          );
+          expect(stopManagedProviderLocalServices).toHaveBeenCalledOnce();
+          expect(runtime.exit).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+          expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+          expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenLastCalledWith(
+            "gateway.stop_shutdown_timeout",
+            expect.objectContaining({ message: "close owner failed" }),
+            { shutdownStep: "gateway-server-close" },
+          );
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+        }
+      });
+    },
+  );
+
+  it.each([true, false])(
+    "bounds abandoned cleanup after managed parking (restore commit=%s)",
+    async (restoreCommitted) => {
+      vi.clearAllMocks();
+      process.env.OPENCLAW_SYSTEMD_UNIT = "openclaw-gateway.service";
+      setPlatform("linux");
+      consumeGatewaySigusr1RestartIntent.mockReturnValueOnce({
+        force: true,
+        reason: "update.run",
+        successorOwner: managedUpdateSuccessorOwner,
+      });
+      cancelManagedServiceUpdateHandoff
+        .mockResolvedValueOnce("restart-after-exit")
+        .mockResolvedValue("restored-in-process");
+      commitManagedServiceUpdateHandoff.mockResolvedValueOnce(restoreCommitted);
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const { close, start, runtime } = await createSignaledLoopHarness();
+        close.mockReturnValue(new Promise<void>(() => {}));
+        vi.useFakeTimers();
+        try {
+          captureSignal("SIGUSR1")();
+          await vi.advanceTimersByTimeAsync(9_999);
+          expect(requestManagedServiceUpdateHandoffPark).toHaveBeenCalledWith(
+            managedUpdateSuccessorOwner,
+          );
+          expect(close).toHaveBeenCalledOnce();
+          expect(runtime.exit).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+          expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(0);
+          expect(start).toHaveBeenCalledOnce();
+          expect(commitManagedServiceUpdateHandoff).toHaveBeenCalledWith(
+            managedUpdateSuccessorOwner,
+            "restore",
+          );
+          expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledWith(
+            "gateway.restart_shutdown_timeout",
+            undefined,
+          );
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+        }
+      });
+    },
+  );
+
+  it("retains external supervisor recovery when timeout prevents a restart handoff", async () => {
+    vi.clearAllMocks();
+    process.env.OPENCLAW_SUPERVISOR_MODE = "external";
+    consumeGatewaySigusr1RestartIntent.mockReturnValueOnce({ force: true });
+    await withIsolatedSignals(async ({ captureSignal }) => {
+      const { close, runtime } = await createSignaledLoopHarness();
+      close.mockReturnValue(new Promise<void>(() => {}));
+      vi.useFakeTimers();
+      try {
+        captureSignal("SIGUSR1")();
+        await vi.advanceTimersByTimeAsync(325_000);
+        expect(writeGatewayRestartHandoffSync).not.toHaveBeenCalled();
+        expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -1595,22 +1940,28 @@ describe("runGatewayLoop", () => {
     });
   });
 
-  it("bounds the file-log flush before a graceful SIGTERM exit", async () => {
+  it.each([
+    { signal: "SIGTERM", timeoutMs: 4_000 },
+    { signal: "SIGUSR1", timeoutMs: 1_000 },
+  ] as const)("bounds the file-log flush before a $signal exit", async ({ signal, timeoutMs }) => {
     vi.clearAllMocks();
 
     await withIsolatedSignals(async ({ captureSignal }) => {
-      const { runtime, exited } = await createSignaledLoopHarness();
-      const sigterm = captureSignal("SIGTERM");
+      const { close, runtime, exited } = await createSignaledLoopHarness();
+      if (signal === "SIGUSR1") {
+        close.mockRejectedValueOnce(new Error("close owner failed"));
+      }
+      const signalExit = captureSignal(signal);
       flushLogger.mockReturnValueOnce(new Promise<void>(() => {}));
       vi.useFakeTimers();
       try {
-        sigterm();
-        await vi.advanceTimersByTimeAsync(4_000);
+        signalExit();
+        await vi.advanceTimersByTimeAsync(timeoutMs);
 
-        await expect(exited).resolves.toBe(0);
-        expect(runtime.exit).toHaveBeenCalledWith(0);
+        await expect(exited).resolves.toBe(signal === "SIGUSR1" ? 1 : 0);
+        expect(runtime.exit).toHaveBeenCalledWith(signal === "SIGUSR1" ? 1 : 0);
         expect(gatewayLog.warn).toHaveBeenCalledWith(
-          "log flush did not settle within 4000ms; continuing shutdown",
+          `log flush did not settle within ${timeoutMs}ms; continuing shutdown`,
         );
       } finally {
         vi.useRealTimers();
@@ -1995,7 +2346,7 @@ describe("runGatewayLoop", () => {
       });
       expectRestartCloseCall(closeSecond, DEFAULT_RESTART_DEFERRAL_TIMEOUT_MS);
       expect(markGatewaySigusr1RestartHandled).toHaveBeenCalledTimes(2);
-      expect(abortActiveCronTaskRuns).toHaveBeenCalledTimes(2);
+      expect(abortActiveCronTaskRuns).toHaveBeenCalledTimes(3);
       expect(waitForActiveCronTaskRuns).toHaveBeenCalledTimes(2);
       expect(waitForActiveCronJobs).toHaveBeenCalledTimes(2);
       expect(advanceCronActiveJobGeneration).toHaveBeenCalledTimes(2);
@@ -2010,7 +2361,10 @@ describe("runGatewayLoop", () => {
         start.mock.invocationCallOrder[1] ?? Infinity,
       );
       expect(advanceCronActiveJobGeneration.mock.invocationCallOrder[0] ?? Infinity).toBeLessThan(
-        abortActiveCronTaskRuns.mock.invocationCallOrder[0] ?? Infinity,
+        abortActiveCronTaskRuns.mock.invocationCallOrder[1] ?? Infinity,
+      );
+      expect(abortActiveCronTaskRuns.mock.invocationCallOrder[0] ?? Infinity).toBeLessThan(
+        closeFirst.mock.invocationCallOrder[0] ?? Infinity,
       );
       expect(waitForActiveCronJobs.mock.invocationCallOrder[0] ?? Infinity).toBeLessThan(
         retireActiveCronTaskRunTracking.mock.invocationCallOrder[0] ?? Infinity,
@@ -3050,14 +3404,53 @@ describe("runGatewayLoop", () => {
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
-      expect(acquireGatewayLock).toHaveBeenNthCalledWith(1, { port: 18789 });
-      expect(acquireGatewayLock).toHaveBeenNthCalledWith(2, { port: 18789 });
-      expect(acquireGatewayLock).toHaveBeenNthCalledWith(3, { port: 18789 });
+      expect(acquireGatewayLock).toHaveBeenNthCalledWith(1, {
+        port: 18789,
+        listenerMode: "foreground",
+        supervisor: null,
+      });
+      expect(acquireGatewayLock).toHaveBeenNthCalledWith(2, {
+        port: 18789,
+        listenerMode: "foreground",
+        supervisor: null,
+      });
+      expect(acquireGatewayLock).toHaveBeenNthCalledWith(3, {
+        port: 18789,
+        listenerMode: "foreground",
+        supervisor: null,
+      });
 
       sigterm();
       await expect(exited).resolves.toBe(0);
     });
   });
+
+  it.each([
+    { env: { OPENCLAW_SUPERVISOR_MODE: "external" }, supervisor: { kind: "external", name: null } },
+    {
+      env: { OPENCLAW_WINDOWS_TASK_NAME: "Fixture Gateway" },
+      supervisor: { kind: "schtasks", name: "Fixture Gateway" },
+    },
+  ])(
+    "publishes the $supervisor.kind supervisor identity at lock acquisition",
+    async ({ env, supervisor }) => {
+      setPlatform("win32");
+      for (const [key, value] of Object.entries(env)) {
+        vi.stubEnv(key, value);
+      }
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const { exited } = await createSignaledLoopHarness();
+        expect(acquireGatewayLock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            listenerMode: "supervised",
+            supervisor,
+          }),
+        );
+        captureSignal("SIGTERM")();
+        await expect(exited).resolves.toBe(0);
+      });
+    },
+  );
 
   it("exits when lock reacquire fails during in-process restart fallback", async () => {
     vi.clearAllMocks();

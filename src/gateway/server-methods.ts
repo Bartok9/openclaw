@@ -13,11 +13,13 @@ import {
   gatewayStartupUnavailableDetails,
   GATEWAY_STARTUP_RETRY_AFTER_MS,
 } from "../../packages/gateway-protocol/src/startup-unavailable.js";
-import { getActivePluginHttpRouteRegistry, getActivePluginRegistry } from "../plugins/runtime.js";
+import type { PluginRegistry } from "../plugins/registry-types.js";
+import { getActivePluginRegistry } from "../plugins/runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
   getPluginRuntimeGatewayNodeAuthorities,
   withPluginRuntimeGatewayRequestScope,
+  withPluginRuntimeRegistryScope,
 } from "../plugins/runtime/gateway-request-scope.js";
 import {
   getGatewaySuspendAdmissionPhase,
@@ -31,6 +33,7 @@ import {
   CONTROL_PLANE_RATE_LIMIT_MAX_REQUESTS,
   CONTROL_PLANE_RATE_LIMIT_WINDOW_MS,
 } from "./control-plane-rate-limit.js";
+import { createExpectedProfileBinding, type ExpectedProfileBinding } from "./expected-profile.js";
 import {
   ADMIN_SCOPE,
   authorizeOperatorScopesForMethod,
@@ -196,12 +199,14 @@ async function authorizeAuthenticatedProfileForMethod(params: {
   requestParams: unknown;
   methodRegistry: GatewayMethodRegistry;
   context: GatewayRequestContext;
+  expectedProfileBinding?: ExpectedProfileBinding;
 }): Promise<ErrorShape | null> {
   const sync = params.client?.authenticatedGitHubIdentitySync;
   if (!sync || params.client?.authenticatedUserProfile?.profileId.trim()) {
     return null;
   }
   const requiresProfile =
+    params.expectedProfileBinding !== undefined ||
     params.methodRegistry.requiresAuthenticatedProfile(params.method) ||
     resolveDirectIncognitoTargets(params.method, params.requestParams).length > 0 ||
     (sessionMutationTargetFields(params.method).length > 0 &&
@@ -224,7 +229,7 @@ export function createRequestGatewayMethodRegistry(
   extraHandlers?: GatewayRequestHandlers,
 ): GatewayMethodRegistry {
   // Attached gateway methods must not be shadowed by agent-scoped registry loads.
-  const gatewayPluginRegistry = getActivePluginHttpRouteRegistry();
+  const gatewayPluginRegistry = getActivePluginRegistry();
   const gatewayPluginHandlers = gatewayPluginRegistry?.gatewayHandlers ?? {};
   const extraHandlerEntries = Object.entries(extraHandlers ?? {});
   const pluginMethodNames = new Set(Object.keys(gatewayPluginHandlers));
@@ -262,15 +267,22 @@ export async function authorizeGatewayRequestPreDispatch(params: {
   client: GatewayRequestOptions["client"];
   context: GatewayRequestContext;
   methodRegistry: GatewayMethodRegistry;
+  expectedProfileBinding?: ExpectedProfileBinding;
 }): Promise<{
   error: ErrorShape | null;
   sessionMutationAuthorization?: SessionMutationAuthorization;
 }> {
-  const authError = authorizeGatewayMethod(
-    params.method,
-    params.client,
-    params.requestParams,
-    params.methodRegistry,
+  // Dynamic scope lookup must use the same registry as the eventual handler.
+  const authError = withPluginRuntimeRegistryScope(
+    // SAFETY: The host-owned method registry carries the PluginRegistry selected for dispatch.
+    params.methodRegistry.pluginRegistry as PluginRegistry | undefined,
+    () =>
+      authorizeGatewayMethod(
+        params.method,
+        params.client,
+        params.requestParams,
+        params.methodRegistry,
+      ),
   );
   if (authError) {
     return { error: authError };
@@ -280,6 +292,14 @@ export async function authorizeGatewayRequestPreDispatch(params: {
   const profileError = await authorizeAuthenticatedProfileForMethod(params);
   if (profileError) {
     return { error: profileError };
+  }
+  try {
+    params.expectedProfileBinding?.assertCurrent();
+  } catch (error) {
+    if (error instanceof SessionMutationAuthorizationChangedError) {
+      return { error: error.error };
+    }
+    throw error;
   }
   // Startup gating precedes session authorization: session stores are not loaded yet,
   // so an authorization read here would deny with a misleading non-retryable error.
@@ -443,9 +463,7 @@ export async function runWithGatewayRequestEnvelope<T>(
     }
     try {
       const pluginRegistry =
-        (options.methodRegistry.pluginRegistry as
-          | NonNullable<ReturnType<typeof getActivePluginRegistry>>
-          | undefined) ??
+        (options.methodRegistry.pluginRegistry as PluginRegistry | undefined) ??
         getPluginRuntimeGatewayRequestScope()?.pluginRegistry ??
         getActivePluginRegistry() ??
         undefined;
@@ -492,8 +510,20 @@ export async function handleGatewayRequest(
   },
   diagnostics?: GatewayRpcDiagnostics,
 ): Promise<void> {
-  const { req, respond, client, isWebchatConnect, context, signal, hasCurrentClientAuthority } =
-    opts;
+  const { req, client, isWebchatConnect, context, signal, hasCurrentClientAuthority } = opts;
+  const profileBinding =
+    opts.expectedProfileBinding ?? createExpectedProfileBinding(req.expectedProfileId, client);
+  // WS publication already owns the shared guard, including policy-close responses.
+  const respond =
+    profileBinding && !opts.expectedProfileBinding
+      ? profileBinding.guardResponse(opts.respond)
+      : opts.respond;
+  const sessionMutationCommitGuard = profileBinding
+    ? () => {
+        profileBinding.assertCurrent();
+        opts.sessionMutationCommitGuard?.();
+      }
+    : opts.sessionMutationCommitGuard;
   const entry = opts.requestEntry ?? context.requestEntryLifetime?.enter(opts);
   try {
     entry?.assertOpen();
@@ -511,6 +541,7 @@ export async function handleGatewayRequest(
       client,
       context,
       methodRegistry,
+      expectedProfileBinding: profileBinding,
     });
     entry?.assertOpen();
     if (authorization.error) {
@@ -528,6 +559,7 @@ export async function handleGatewayRequest(
     const sessionMutationAuthorization = withSessionMutationCommitGuard(
       authorization.sessionMutationAuthorization,
       opts.sessionMutationCommitGuard,
+      profileBinding?.assertCurrent,
     );
     const invokeHandler = async () => {
       const preparedHandler = await prepareGatewayRequestHandler(handler, entry);
@@ -540,10 +572,10 @@ export async function handleGatewayRequest(
         context,
         signal,
         ...(hasCurrentClientAuthority ? { hasCurrentClientAuthority } : {}),
-        sessionMutationCommitGuard: opts.sessionMutationCommitGuard,
+        sessionMutationCommitGuard,
         sessionMutationAuthorization,
       };
-      opts.sessionMutationCommitGuard?.();
+      sessionMutationCommitGuard?.();
       entry?.assertOpen();
       if (signal?.aborted) {
         return;
@@ -551,6 +583,7 @@ export async function handleGatewayRequest(
       // No await between the final fence, ownership handoff, and actual invocation.
       // Long polls and shutdown initiators must never remain preparation leases.
       entry?.release();
+      profileBinding?.markInvoked();
       return diagnostics
         ? diagnostics.runHandler(() => preparedHandler(handlerOptions))
         : preparedHandler(handlerOptions);

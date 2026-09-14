@@ -6,6 +6,7 @@ import {
 } from "../../agents/agent-auth-credentials.js";
 import type { AuthProfileStore } from "../../agents/auth-profiles.js";
 import type { ModelCatalogEntry, ModelCatalogSnapshot } from "../../agents/model-catalog.types.js";
+import type { GetPublishedPreparedModelCatalogOwnerParams } from "../../agents/prepared-model-catalog.js";
 import { setPreparedModelRuntimeAuthStore } from "../../agents/prepared-model-runtime-auth.js";
 import type { PreparedModelRuntimeSnapshot } from "../../agents/prepared-model-runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -88,11 +89,11 @@ export function createDraftChatMetadataScope(
   };
 }
 
-export function createOpenAIChatMetadataConfig(modelIds = ["gpt-5.6-sol"]): OpenClawConfig {
+export function createOpenAIChatMetadataConfig(modelIds = ["gpt-5.6-luna"]): OpenClawConfig {
   return {
     agents: {
       defaults: {
-        model: { primary: "openai/gpt-5.6-sol" },
+        model: { primary: "openai/gpt-5.6-luna" },
         models: Object.fromEntries(modelIds.map((id) => [`openai/${id}`, {}])),
       },
       list: [{ id: "main", default: true }],
@@ -161,12 +162,16 @@ export function createChatMetadataHarness(
   let authStore: AuthProfileStore | undefined = { version: 1, profiles: {} };
   let authStoreRevision = 1;
   const invalidProjections = new WeakSet<object>();
-  const getPreparedOwner = vi.fn((): PreparedModelRuntimeSnapshot | undefined => owner);
+  const getPreparedOwner = vi.fn(
+    (
+      _params?: GetPublishedPreparedModelCatalogOwnerParams,
+    ): PreparedModelRuntimeSnapshot | undefined => owner,
+  );
   const getPreparedAuthStore = vi.fn(() => authStore);
   const getAuthStoreRevision = vi.fn(() => authStoreRevision);
   const getSkillsVersion = vi.fn(() => skillsVersion);
   const getPluginRegistryVersion = vi.fn(() => pluginRegistryVersion);
-  const buildCommands = vi.fn(async () => ({
+  const buildCommands = vi.fn(async (_params: { cfg: OpenClawConfig; agentId: string }) => ({
     commands: [{ name: `command-${skillsVersion}-${pluginRegistryVersion}` }],
   }));
   const buildProjection = vi.fn(

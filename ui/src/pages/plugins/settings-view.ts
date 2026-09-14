@@ -59,6 +59,7 @@ type SharedProps = {
   pageNotice: PluginRowMessage | null;
   iconUrls: Readonly<Record<string, string>>;
   canMutate: boolean;
+  reloadBlockedReason: string | null;
   mutationBlockedReason: string | null;
   configBusy: boolean;
   configSchemaLoading: boolean;
@@ -70,6 +71,7 @@ type SharedProps = {
   onIconError: (pluginId: string) => void;
   onSetEnabled: (pluginId: string, enabled: boolean, rowKey: string) => void;
   onUninstall: (pluginId: string, rowKey: string) => void;
+  onReload: (pluginId: string, rowKey: string) => void;
   onConfigPatch: (path: Array<string | number>, value: unknown) => void;
   onConfigRemove: (path: Array<string | number>) => void;
   onConfigReload: () => void;
@@ -244,6 +246,8 @@ function renderAdvanced(props: InventoryProps): TemplateResult {
   }
   return html`
     ${renderNode({
+      rawAvailable: false,
+      maskSensitive: true,
       schema: props.advancedSchema,
       value: props.configValue.plugins ?? {},
       path: ["plugins"],
@@ -331,6 +335,8 @@ function renderConfiguration(props: DetailProps, plugin: PluginCatalogItem): Tem
   const pluginEntry = pluginEntryValue(props.configValue, plugin.id);
   return html`
     ${renderNode({
+      rawAvailable: false,
+      maskSensitive: true,
       schema: props.configSchema,
       value: pluginEntry.config ?? {},
       path: ["plugins", "entries", plugin.id, "config"],
@@ -402,6 +408,8 @@ function renderInstalledAdvanced(props: DetailProps): TemplateResult {
   return html`${
     props.hostControlsSchema && props.configValue
       ? renderNode({
+          rawAvailable: false,
+          maskSensitive: true,
           schema: props.hostControlsSchema,
           value: pluginEntry,
           path: ["plugins", "entries", props.pluginId],
@@ -666,6 +674,7 @@ export function renderPluginSettingsDetail(props: DetailProps): TemplateResult {
         label: installedTabLabel(tab, plugin.state === "needs-setup"),
       })),
       activeTab,
+      requestedTab: props.tab,
       onTabChange: props.onTabChange,
       panel: html`${props.pageNotice ? renderMessage(props.pageNotice) : nothing}
       ${props.error ? renderRetryError(props.error, props.onRefresh) : nothing}

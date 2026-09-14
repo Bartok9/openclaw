@@ -1,11 +1,14 @@
 /* @vitest-environment jsdom */
 
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { expectDefined } from "@openclaw/normalization-core";
-import { html, render, type LitElement } from "lit";
+import { html, nothing, render, type LitElement } from "lit";
 import "./components/chat-detail-panel.ts";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { SessionWorkspaceGetResult, SessionWorkspaceListResult } from "../../api/types.ts";
+import { loadSettings } from "../../app/settings.ts";
 import type { TaskSummary } from "../../lib/tasks/task-summary.ts";
 import { gatewayHelloForMethods } from "../../test-helpers/gateway-methods.ts";
 import { resolveChatAgentId } from "./chat-agent-id.ts";
@@ -43,7 +46,6 @@ import {
 import type { SidebarContent } from "./components/chat-sidebar-content-types.ts";
 import { resetTaskDetail } from "./components/chat-task-detail-state.ts";
 import { renderChatThread } from "./components/chat-thread.ts";
-import type { ChatTranscriptController } from "./components/chat-transcript-controller.ts";
 import "./components/chat-sidebar-region.runtime.ts";
 import {
   installTranscriptDomMocks,
@@ -105,7 +107,12 @@ async function renderPanelFixture(
     mount,
   );
   await mount.querySelector("openclaw-chat-sidebar-region")?.updateComplete;
-  await mount.querySelector<LitElement>("openclaw-chat-detail-panel")?.updateComplete;
+  await mount.querySelector<LitElement>("openclaw-chat-files-panel")?.updateComplete;
+  await Promise.all(
+    [...mount.querySelectorAll<LitElement>("openclaw-chat-detail-panel")].map(
+      (panel) => panel.updateComplete,
+    ),
+  );
   await mount.querySelector("openclaw-panel-loading-skeleton")?.updateComplete;
 }
 
@@ -182,14 +189,11 @@ function createReviewFixture(taskFields: Partial<TaskSummary> = {}) {
       setObserverVisibility: vi.fn(),
       updateSidebarLayout: state.updateSidebarLayout,
     });
-  const transcript = createTestTranscript();
-  transcript.hostConnected();
   onTestFinished(async () => {
     file.resolve(null);
     list.resolve(null);
     await Promise.allSettled([file.promise, list.promise]);
     resetTaskDetail(state);
-    transcript.hostDisconnected();
   });
   const renderPanels = async () => {
     const definitions = sidebarPanelDefinitions({
@@ -201,24 +205,171 @@ function createReviewFixture(taskFields: Partial<TaskSummary> = {}) {
           content,
           host: state,
           layout: state.sidebarLayout,
-          transcript,
         }),
       workspace: renderSessionWorkspaceRail(createSessionWorkspaceProps(state), {
         embedded: true,
       }),
     } as Parameters<typeof sidebarPanelDefinitions>[0]);
     await renderPanelFixture(mount, state.sidebarLayout, definitions, rails().closePanelSlot);
-    transcript.hostUpdated();
   };
   return { file, history, list, mount, preview, rails, renderPanels, sessions, state, task };
 }
 
 describe("chat pane embedded panels", () => {
+  it("navigates an existing file tab to an explicit line without resetting its editor or draft", async () => {
+    const descriptors = ["getClientRects", "getBoundingClientRect"].map(
+      (key) => [key, Object.getOwnPropertyDescriptor(Range.prototype, key)] as const,
+    );
+    Object.defineProperty(Range.prototype, "getClientRects", {
+      configurable: true,
+      value: () => [],
+    });
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value: () => new DOMRect(),
+    });
+    onTestFinished(() => {
+      for (const [key, descriptor] of descriptors) {
+        if (descriptor) {
+          Object.defineProperty(Range.prototype, key, descriptor);
+        } else {
+          Reflect.deleteProperty(Range.prototype, key);
+        }
+      }
+    });
+    const { file, mount, renderPanels, state, sessions } = createReviewFixture();
+    state.hello = gatewayHelloForMethods(["sessions.files.get", "sessions.files.set"]);
+    const text = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
+    openSessionWorkspaceFile(state, { path: "navigation.txt", line: 2 });
+    file.resolve({
+      sessionKey: state.sessionKey,
+      root: "/synthetic/workspace",
+      file: {
+        kind: "read",
+        path: "navigation.txt",
+        name: "navigation.txt",
+        missing: false,
+        content: text,
+        hash: "original",
+        previewKind: "text",
+        contentEncoding: "utf8",
+      },
+    });
+    await file.promise;
+    await renderPanels();
+    const editorElement = await vi.waitFor(() =>
+      expectDefined(mount.querySelector<HTMLElement>(".cm-editor"), "file editor"),
+    );
+    const editor = expectDefined(EditorView.findFromDOM(editorElement), "CodeMirror view");
+    await vi.waitFor(() =>
+      expect(mount.querySelector(".file-view__line--target")?.getAttribute("data-line")).toBe("2"),
+    );
+    const editButton = expectDefined(
+      mount.querySelector<HTMLButtonElement>('[aria-label="Edit file"]'),
+      "Edit action",
+    );
+    editButton.click();
+    await renderPanels();
+    editor.dispatch({ changes: { from: 0, to: 0, insert: "draft " } });
+    const draft = editor.state.doc.toString();
+    const scroll = vi.spyOn(EditorView, "scrollIntoView");
+    onTestFinished(() => scroll.mockRestore());
+    openSessionWorkspaceFile(state, { path: "navigation.txt", line: 7 });
+    await renderPanels();
+    await vi.waitFor(() =>
+      expect(mount.querySelector(".file-view__line--target")?.getAttribute("data-line")).toBe("7"),
+    );
+    expect(mount.querySelector(".cm-editor")).toBe(editorElement);
+    expect(editor.state.doc.toString()).toBe(draft);
+    expect(scroll).toHaveBeenCalled();
+    scroll.mockClear();
+    openSessionWorkspaceFile(state, { path: "navigation.txt", line: 7 });
+    await renderPanels();
+    expect(scroll).toHaveBeenCalled();
+    expect(editor.contentDOM.getAttribute("contenteditable")).toBe("true");
+    expect(undo(editor)).toBe(true);
+    expect(editor.state.doc.toString()).toBe(text);
+    expect(sessions.getFile).toHaveBeenCalledOnce();
+    expect(state.sessionWorkspaceState?.previews).toHaveLength(1);
+    scroll.mockClear();
+    editor.scrollDOM.scrollTop = 123;
+    openSessionWorkspaceFile(state, { path: "navigation.txt" });
+    await renderPanels();
+    expect(mount.querySelector(".cm-editor")).toBe(editorElement);
+    expect(editor.scrollDOM.scrollTop).toBe(123);
+    expect(scroll).not.toHaveBeenCalled();
+    sessions.setFile = vi.fn().mockResolvedValue({ file: { hash: "saved" } });
+    editor.dispatch({ changes: { from: 0, to: 0, insert: "saved " } });
+    await renderPanels();
+    const save = expectDefined(
+      [...mount.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "Save",
+      ),
+      "Save action",
+    );
+    save.click();
+    await vi.waitFor(() => expect(save.disabled).toBe(true));
+    let savedText = editor.state.doc.toString();
+    const saved = (await file.promise)!;
+    const pendingRead = createDeferred<SessionWorkspaceGetResult | null>();
+    vi.mocked(sessions.getFile).mockReturnValueOnce(pendingRead.promise);
+    openSessionWorkspaceFile(state, { path: "navigation.txt" });
+    await renderPanels();
+    editor.dispatch({ changes: { from: 0, to: 0, insert: "newer " } });
+    await renderPanels();
+    sessions.setFile = vi.fn().mockResolvedValue({ file: { hash: "newer-saved" } });
+    save.click();
+    await vi.waitFor(() => expect(save.disabled).toBe(true));
+    pendingRead.resolve({ ...saved, file: { ...saved.file, content: savedText, hash: "saved" } });
+    await pendingRead.promise;
+    await renderPanels();
+    expect(mount.querySelector(".cm-editor")).toBe(editorElement);
+    expect(editor.state.doc.toString()).toBe(`newer ${savedText}`);
+    savedText = editor.state.doc.toString();
+    vi.mocked(sessions.getFile).mockResolvedValue({
+      ...saved,
+      file: { ...saved.file, content: savedText, hash: "newer-saved" },
+    });
+    const discard = expectDefined(
+      [...mount.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "Discard",
+      ),
+      "Discard action",
+    );
+    discard.click();
+    await renderPanels();
+    const raw = expectDefined(
+      [...mount.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "View Raw Text",
+      ),
+      "Raw action",
+    );
+    raw.click();
+    await renderPanels();
+    const rawReader = mount.querySelector(".sidebar-markdown-reader");
+    expect(rawReader).not.toBeNull();
+    openSessionWorkspaceFile(state, { path: "navigation.txt" });
+    await renderPanels();
+    expect(mount.querySelector(".sidebar-markdown-reader")).toBe(rawReader);
+    expect(mount.querySelector(".cm-editor")).toBeNull();
+    openSessionWorkspaceFile(state, { path: "navigation.txt", line: 3 });
+    await renderPanels();
+    await vi.waitFor(() =>
+      expect(mount.querySelector(".file-view__line--target")?.getAttribute("data-line")).toBe("3"),
+    );
+    const restored = expectDefined(
+      EditorView.findFromDOM(
+        expectDefined(mount.querySelector<HTMLElement>(".cm-editor"), "restored editor"),
+      ),
+      "restored view",
+    );
+    expect(restored.state.doc.toString()).toBe(savedText);
+  });
   describe("Review task selection lifetime", () => {
     beforeEach(installTranscriptDomMocks);
     afterEach(resetTranscriptTestDom);
     it.each(["pending", "unavailable", "checkout retired", "file closed", "task closed"] as const)(
-      "stops the previous task's transcript reads when Review is %s",
+      "keeps task ownership independent of file selection %s",
       async (selection) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(10_000);
@@ -236,7 +387,7 @@ describe("chat pane embedded panels", () => {
         if (selection !== "task closed") {
           openSessionWorkspaceFile(state, { path: preview.file.path });
           await renderPanels();
-          expect(mount.querySelector('[data-panel-skeleton="review"]')).not.toBeNull();
+          expect(mount.querySelector('[data-panel-skeleton="files"]')).not.toBeNull();
         }
         if (selection === "unavailable") {
           file.reject(new Error("Preview unavailable"));
@@ -254,7 +405,7 @@ describe("chat pane embedded panels", () => {
         } else if (selection === "file closed" || selection === "task closed") {
           expect(mount.querySelector('[data-panel-slot="detail"]')).toBeNull();
         } else if (selection === "checkout retired") {
-          expect(mount.querySelector('[data-panel-skeleton="review"]')).toBeNull();
+          expect(mount.querySelector('[data-panel-skeleton="files"]')).toBeNull();
         }
         vi.setSystemTime(12_000);
         handlePageGatewayEvent(state, {
@@ -262,8 +413,14 @@ describe("chat pane embedded panels", () => {
           event: "task",
           payload: { action: "upserted", task: { ...task, updatedAt: 3 } },
         });
-        expect(history).toHaveBeenCalledOnce();
-        expect(mount.querySelector("[data-task-detail-panel]")).toBeNull();
+        expect(history).toHaveBeenCalledTimes(
+          selection === "task closed" || selection === "file closed" ? 1 : 2,
+        );
+        if (selection === "task closed" || selection === "file closed") {
+          expect(mount.querySelector("[data-task-detail-panel]")).toBeNull();
+        } else {
+          expect(mount.querySelector("[data-task-detail-panel]")).not.toBeNull();
+        }
       },
     );
 
@@ -413,6 +570,7 @@ describe("chat pane embedded panels", () => {
   it.each(["history", "stream"] as const)(
     "reuses attachment metadata when Open shows %s content in Files",
     async (surface) => {
+      installTranscriptDomMocks();
       const { mount, state } = createReviewFixture();
       const transcript = document.body.appendChild(document.createElement("div"));
       const fetchMetadata = vi.fn().mockResolvedValue({
@@ -473,8 +631,10 @@ describe("chat pane embedded panels", () => {
         });
         expect(fetchMetadata).toHaveBeenCalledOnce();
         open.click();
-        const content = state.attachmentSidebarContent;
-        expect(content).not.toBeNull();
+        const content = state.sessionWorkspaceState?.previews.at(-1)?.content;
+        if (!content || content.kind !== "attachment") {
+          throw new Error("Expected an attachment preview");
+        }
         render(
           renderChatDetailSlot({
             backgroundTasks: createBackgroundTasksProps(state, { presented: false }),
@@ -482,7 +642,6 @@ describe("chat pane embedded panels", () => {
             content: content!,
             host: state,
             layout: state.sidebarLayout,
-            transcript: {} as ChatTranscriptController,
           }),
           mount,
         );
@@ -493,10 +652,11 @@ describe("chat pane embedded panels", () => {
           expect(mount.querySelector("openclaw-chat-video-player")).not.toBeNull();
         }
       } finally {
+        render(nothing, transcript);
         controller.hostDisconnected();
         mount.remove();
         releaseChatMediaResourceSubscriber(renderAttachment);
-        vi.unstubAllGlobals();
+        resetTranscriptTestDom();
       }
     },
   );
@@ -512,13 +672,13 @@ describe("chat pane embedded panels", () => {
 
     openSessionWorkspaceFile(state, { path: preview.file.path });
     await renderPanels();
-    expect(mount.querySelector('[data-panel-skeleton="review"]')).not.toBeNull();
+    expect(mount.querySelector('[data-panel-skeleton="files"]')).not.toBeNull();
     rails().backgroundTasks.onOpenTaskDetail?.(task);
     await renderPanels();
     expect
       .soft(mount.querySelector("[data-task-detail-panel] .sidebar-title")?.textContent)
       .toBe(task.title);
-    expect.soft(mount.querySelector('[data-panel-skeleton="review"]')).toBeNull();
+    expect(isSidebarSlotVisible(state.sidebarLayout, "detail")).toBe(true);
 
     file.resolve(preview);
     await file.promise;
@@ -526,14 +686,16 @@ describe("chat pane embedded panels", () => {
     expect(mount.querySelector("[data-task-detail-panel] .sidebar-title")?.textContent).toBe(
       task.title,
     );
-    expect(mount.querySelector(".chat-tool-card__preview-image")).toBeNull();
+    expect(isSidebarSlotVisible(state.sidebarLayout, "detail")).toBe(true);
   });
 
-  it("keeps Review closed when a pending file preview completes", async () => {
+  it("keeps Files closed when a pending file preview completes", async () => {
     const { file, mount, preview, renderPanels, state } = createReviewFixture();
     openSessionWorkspaceFile(state, { path: preview.file.path });
     await renderPanels();
-    const close = mount.querySelector<HTMLButtonElement>('button[aria-label="Close Review"]');
+    const close = mount.querySelector<HTMLButtonElement>(
+      'button[aria-label="Close tab: preview.png"]',
+    );
     expect(close).not.toBeNull();
     close!.click();
     await renderPanels();
@@ -550,7 +712,7 @@ describe("chat pane embedded panels", () => {
     createSessionWorkspaceProps(state).onRefresh();
     openSessionWorkspaceFile(state, { path: preview.file.path });
     await renderPanels();
-    expect(mount.querySelector('[data-panel-skeleton="review"]')).not.toBeNull();
+    expect(mount.querySelector('[data-panel-skeleton="files"]')).not.toBeNull();
 
     list.resolve({
       sessionKey: state.sessionKey,
@@ -564,9 +726,11 @@ describe("chat pane embedded panels", () => {
     file.resolve(preview);
     await file.promise;
     await renderPanels();
-    expect(mount.querySelector<HTMLImageElement>(".chat-tool-card__preview-image")?.alt).toBe(
-      "preview.png",
-    );
+    expect(
+      mount.querySelector<HTMLImageElement>(
+        ".chat-files-panel__page:not([hidden]) .chat-tool-card__preview-image",
+      )?.alt,
+    ).toBe("preview.png");
   });
 
   it.each(["Files", "minimized"] as const)(
@@ -598,11 +762,14 @@ describe("chat pane embedded panels", () => {
           mount.querySelector<HTMLImageElement>(".sidebar-attachment-preview__image")?.alt,
         ).toBe("Attachment in Files");
       }
-      state.updateSidebarLayout(openSlot(state.sidebarLayout, "detail"));
+      state.sessionWorkspaceState!.activePreviewId = `file:${preview.file.path}`;
+      state.updateSidebarLayout(openSlot(state.sidebarLayout, "workspace"));
       await renderPanels();
-      expect(mount.querySelector<HTMLImageElement>(".chat-tool-card__preview-image")?.alt).toBe(
-        "preview.png",
-      );
+      expect(
+        mount.querySelector<HTMLImageElement>(
+          ".chat-files-panel__page:not([hidden]) .chat-tool-card__preview-image",
+        )?.alt,
+      ).toBe("preview.png");
     },
   );
 
@@ -617,16 +784,20 @@ describe("chat pane embedded panels", () => {
     openSessionWorkspaceFile(state, { path: replacement.file.path });
     await vi.waitFor(async () => {
       await renderPanels();
-      expect(mount.querySelector<HTMLImageElement>(".chat-tool-card__preview-image")?.alt).toBe(
-        "replacement.png",
-      );
+      expect(
+        mount.querySelector<HTMLImageElement>(
+          ".chat-files-panel__page:not([hidden]) .chat-tool-card__preview-image",
+        )?.alt,
+      ).toBe("replacement.png");
     });
     file.resolve(preview);
     await file.promise;
     await renderPanels();
-    expect(mount.querySelector<HTMLImageElement>(".chat-tool-card__preview-image")?.alt).toBe(
-      "replacement.png",
-    );
+    expect(
+      mount.querySelector<HTMLImageElement>(
+        ".chat-files-panel__page:not([hidden]) .chat-tool-card__preview-image",
+      )?.alt,
+    ).toBe("replacement.png");
   });
 
   it("retires a preview across reconnect without refocusing Review over Files", async () => {
@@ -647,9 +818,8 @@ describe("chat pane embedded panels", () => {
     await file.promise;
     await renderPanels();
     expect(isSidebarSlotVisible(state.sidebarLayout, "workspace")).toBe(true);
-    expect(mount.querySelector<HTMLImageElement>(".sidebar-attachment-preview__image")?.alt).toBe(
-      "Attachment in Files",
-    );
+    expect(state.sessionWorkspaceState?.previews).toEqual([]);
+    expect(mount.querySelector(".sidebar-attachment-preview__image")).toBeNull();
     state.updateSidebarLayout(openSlot(state.sidebarLayout, "detail"));
     await renderPanels();
     expect(mount.querySelector(".chat-tool-card__preview-image")).toBeNull();
@@ -664,7 +834,7 @@ describe("chat pane embedded panels", () => {
     state.updateSidebarLayout(openSlot(state.sidebarLayout, "workspace"));
     await renderPanels();
     expect(mount.textContent).toContain("Preview unavailable");
-    expect(mount.querySelector('[data-panel-skeleton="review"]')).toBeNull();
+    expect(mount.querySelector('[data-panel-skeleton="files"]')).toBeNull();
   });
 
   it("does not offer Discussion when no provider is available", () => {
@@ -692,6 +862,7 @@ describe("chat pane embedded panels", () => {
       sessionKey: "agent:main:review",
       sidebarContent: null,
       sidebarLayout: { columns: [] },
+      settings: loadSettings(),
     } as unknown as ChatPageHost;
     const mount = document.body.appendChild(document.createElement("div"));
     const renderPanels = async (layout: SidebarLayout) => {

@@ -16,9 +16,11 @@ import {
 } from "../providers/openai-response-format.js";
 import {
   projectOpenAITools,
+  prepareOpenAITools,
   reconcileOpenAICompletionsToolChoice,
 } from "../providers/openai-tool-projection.js";
 import { normalizeOpenAIStrictToolParameters } from "../providers/openai-tool-schema.js";
+import { withPreparedToolSchemaNormalization } from "../providers/tool-schema-normalization-cache.js";
 import { resolveOpenAIStrictToolSetting, resolveProviderEndpoint } from "./host-policy.js";
 import { resolveMaxTokensParam } from "./model-max-tokens-params.js";
 import { emitModelTransportDebug } from "./model-transport-debug.js";
@@ -102,6 +104,7 @@ function resolveOpenAICompletionsModelMaxTokens(model: OpenAIModeModel): number 
 
 const OPENAI_COMPLETIONS_INPUT_TOKEN_SAFETY_MARGIN = 1.25;
 const OPENAI_COMPLETIONS_IMAGE_CHAR_ESTIMATE = 8_000;
+const MIN_USEFUL_OUTPUT_TOKENS = 16;
 
 // Used only to bound `max_completion_tokens` below the effective context cap
 // for strict OpenAI-compatible servers (e.g. vLLM, StepFun). The CJK-aware
@@ -258,48 +261,52 @@ function convertTools(
   model: OpenAIModeModel,
   mode: "direct" | "managed",
 ) {
-  const projection = projectOpenAITools(tools);
-  const strict =
-    mode === "direct"
-      ? compat.supportsStrictMode
-        ? false
-        : undefined
-      : resolveOpenAIStrictToolFlagWithDiagnostics(
-          projection,
-          resolveOpenAIStrictToolSetting(model, {
-            transport: "stream",
-            supportsStrictMode: compat?.supportsStrictMode,
-          }),
-          {
-            transport: "completions",
-            model,
-          },
-        );
-  return {
-    projection,
-    tools: sortTransportToolsByName(projection.tools).map((tool) => {
-      const functionTool: {
-        name: string;
-        description: string | undefined;
-        parameters: ReturnType<typeof normalizeOpenAIStrictToolParameters>;
-        strict?: boolean;
-      } = {
-        name: tool.name,
-        description: tool.description,
-        parameters:
-          mode === "direct"
-            ? tool.parameters
-            : normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
-      };
-      if (strict !== undefined) {
-        functionTool.strict = strict;
-      }
-      return {
-        type: "function" as const,
-        function: functionTool,
-      };
-    }),
+  const prepared = mode === "managed" ? prepareOpenAITools(tools) : undefined;
+  const projection = prepared?.projection ?? projectOpenAITools(tools);
+  const convert = () => {
+    const strict =
+      mode === "direct"
+        ? compat.supportsStrictMode
+          ? false
+          : undefined
+        : resolveOpenAIStrictToolFlagWithDiagnostics(
+            projection,
+            resolveOpenAIStrictToolSetting(model, {
+              transport: "stream",
+              supportsStrictMode: compat?.supportsStrictMode,
+            }),
+            {
+              transport: "completions",
+              model,
+            },
+          );
+    return {
+      projection,
+      tools: sortTransportToolsByName(projection.tools).map((tool) => {
+        const functionTool: {
+          name: string;
+          description: string | undefined;
+          parameters: ReturnType<typeof normalizeOpenAIStrictToolParameters>;
+          strict?: boolean;
+        } = {
+          name: tool.name,
+          description: tool.description,
+          parameters:
+            mode === "direct"
+              ? tool.parameters
+              : normalizeOpenAIStrictToolParameters(tool.parameters, strict === true, model.compat),
+        };
+        if (strict !== undefined) {
+          functionTool.strict = strict;
+        }
+        return {
+          type: "function" as const,
+          function: functionTool,
+        };
+      }),
+    };
   };
+  return prepared ? withPreparedToolSchemaNormalization(prepared.schemas, convert) : convert();
 }
 
 export function buildOpenAICompletionsParams(
@@ -518,6 +525,13 @@ export function buildOpenAICompletionsRequest(
             `model=${model.id} requested=${effectiveMaxTokens} output=${clampedMaxTokens} ` +
             `effectiveContext=${effectiveContextTokens} estimatedInput=${estimatedInputTokens}`,
         );
+        if (remainingBudget < MIN_USEFUL_OUTPUT_TOKENS) {
+          log.warn(
+            `[completions] insufficient_output_budget provider=${model.provider} api=${model.api} ` +
+              `model=${model.id} output=${clampedMaxTokens} ` +
+              `effectiveContext=${effectiveContextTokens} estimatedInput=${estimatedInputTokens}`,
+          );
+        }
       }
     }
     if (policy.mode === "direct" ? options?.maxTokens : clampedMaxTokens) {

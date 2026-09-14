@@ -127,7 +127,13 @@ async function createFixture(operation: "summary" | "endpoint", globalAlias = fa
   authStorage.setRuntimeApiKey(model.provider, "test-api-key");
   const modelRegistry = sessions.ModelRegistry.inMemory(authStorage);
   modelRegistry.registerProvider(model.provider, { api: model.api, streamSimple: stream });
-  resolveModelMock.mockReturnValue({ model, error: null, authStorage, modelRegistry });
+  resolveModelMock.mockImplementation((provider = model.provider, modelId = model.id) => ({
+    logicalRef: { provider, model: modelId },
+    model,
+    error: null,
+    authStorage,
+    modelRegistry,
+  }));
   vi.mocked(streamResolution.resolveEmbeddedAgentStream).mockReturnValue({
     streamFn: stream,
     strategy: "session-custom",
@@ -226,6 +232,15 @@ describe("direct compactor through the context-engine delegate", () => {
       if (operation === "summary") {
         expect(result.result?.summary).toContain(summary);
         expect(reopened.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+        expect(accessor.loadSessionEntry(target)?.compactionCheckpoints).toEqual([
+          expect.objectContaining({
+            sessionId: target.sessionId,
+            sessionKey: target.sessionKey,
+            summary: result.result?.summary,
+            preCompaction: expect.objectContaining({ sessionId: target.sessionId }),
+            postCompaction: expect.objectContaining({ sessionId: target.sessionId }),
+          }),
+        ]);
         const firstKeptIndex = fixture.originalEntries.findIndex(
           (entry) => entry.id === result.result?.firstKeptEntryId,
         );
@@ -258,6 +273,7 @@ describe("direct compactor through the context-engine delegate", () => {
       expect(sessions.SessionManager.open(fixture.decoy).buildSessionContext().messages).toEqual([
         { role: "user", content: "Unrelated store history", timestamp: 1 },
       ]);
+      expect(accessor.loadSessionEntry(fixture.decoy)?.compactionCheckpoints).toBeUndefined();
     },
   );
 

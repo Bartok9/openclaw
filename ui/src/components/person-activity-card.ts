@@ -4,12 +4,14 @@ import { ref } from "lit/directives/ref.js";
 import { repeat } from "lit/directives/repeat.js";
 import type { GatewaySessionRow } from "../api/types.ts";
 import { i18n, t } from "../i18n/index.ts";
+import { gatewayClientKind } from "../lib/gateway-client-kind.ts";
 import {
   restartHoverMarqueeIfActive,
   startHoverMarqueeFromEvent,
   stopHoverMarqueeFromEvent,
 } from "../lib/hover-marquee.ts";
 import { shouldHandleNavigationClick } from "../lib/navigation-click.ts";
+import { describePlatform } from "../lib/platform-label.ts";
 import {
   presenceMatchesProfile,
   presenceUserLabel,
@@ -124,17 +126,19 @@ function connections(user: PresenceViewer): string[] {
     ...new Set(
       (user.entries ?? [])
         .map((entry) => {
-          const app =
-            entry.mode === "webchat"
-              ? t("presence.card.controlUi")
-              : entry.mode === "cli"
-                ? t("presence.card.cli")
-                : entry.mode === "ui"
-                  ? t("presence.card.app")
-                  : undefined;
+          const family = entry.deviceFamily?.trim();
+          const platform = describePlatform(entry.platform ?? "", family);
+          const familyPlatform = family === "Mac" ? "macOS" : family === "iPad" ? "iPadOS" : family;
+          const kind = gatewayClientKind({ id: entry.clientId, mode: entry.mode });
+          const app = kind ? t(`presence.card.${kind}`) : undefined;
           return [
             ...new Set(
-              [entry.deviceFamily, entry.platform, app]
+              [
+                family,
+                platform.label === familyPlatform ? undefined : platform.label,
+                platform.architecture,
+                app,
+              ]
                 .map((value) => value?.trim())
                 .filter(Boolean),
             ),

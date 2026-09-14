@@ -4,6 +4,7 @@ import { html, nothing, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
 import { i18n, t } from "../i18n/index.ts";
 import {
+  configValuesEqual,
   isSupportedConfigValueValid,
   normalizeNumericValue,
   numericInputConstraints,
@@ -263,18 +264,16 @@ export function renderTextInput(
   const hint = hintForPath(path, hints);
   const { label, help, tags } = resolveFieldMeta(path, schema, hints);
   const helpId = showLabel && help ? configFieldId(path, "description") : undefined;
-  const sensitiveState = getSensitiveRenderState({
-    path,
-    value,
-    hints,
-    revealSensitive: params.revealSensitive ?? false,
-    isSensitivePathRevealed: params.isSensitivePathRevealed,
-  });
+  const sensitiveState = getSensitiveRenderState(params);
   const isStructuredValue =
     value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value);
   const isStructuredSecretRef = isSecretRefObject(value);
   const rawAvailable = params.rawAvailable ?? true;
-  const effectiveRedacted = sensitiveState.isRedacted || isStructuredSecretRef;
+  const masked = sensitiveState.isMasked;
+  const effectiveRedacted =
+    (sensitiveState.isRedacted && !masked) ||
+    sensitiveState.sentinelRedacted ||
+    isStructuredSecretRef;
   const placeholder = effectiveRedacted
     ? isStructuredSecretRef
       ? rawAvailable
@@ -282,7 +281,7 @@ export function renderTextInput(
         : t("configForm.structuredSecretFile")
       : redactedPlaceholder()
     : (hint?.placeholder ??
-      (schema.default !== undefined
+      (!masked && schema.default !== undefined
         ? t("configForm.defaultValue", { value: formatConfigValueText(schema.default) })
         : ""));
   const displayValue = effectiveRedacted
@@ -292,10 +291,14 @@ export function renderTextInput(
       : (value ?? "");
   const effectiveValue = value !== undefined ? value : schema.default;
   const initialBranch = scalarValueBranch(effectiveValue);
-  const effectiveInputType = sensitiveState.isSensitive && !effectiveRedacted ? "text" : inputType;
+  const effectiveInputType = masked
+    ? "password"
+    : sensitiveState.isSensitive && !effectiveRedacted
+      ? "text"
+      : inputType;
   const isPhonePresentation = hint?.presentation === "phone-number";
   const phonePresentation =
-    isPhonePresentation && !effectiveRedacted && typeof value === "string"
+    isPhonePresentation && !effectiveRedacted && !masked && typeof value === "string"
       ? formatInternationalPhoneNumberForDisplay(value, i18n.getLocale())
       : undefined;
   const controlIdentity = params.controlIdentity ?? params.sourceIdentity ?? value;
@@ -484,7 +487,8 @@ export function renderTextInput(
     label,
     help,
     helpId,
-    defaultDescription: effectiveRedacted ? nothing : renderSchemaDefaultDescription(schema, value),
+    defaultDescription:
+      effectiveRedacted || masked ? nothing : renderSchemaDefaultDescription(schema, value),
     tags,
     showLabel,
     control: presentedInput,
@@ -636,9 +640,7 @@ export function renderSelect(
   const helpId = showLabel && help ? configFieldId(path, "description") : undefined;
   const usingDefault = value === undefined && schema.default !== undefined;
   const resolvedValue = usingDefault ? schema.default : value;
-  const currentIndex = options.findIndex(
-    (option) => option === resolvedValue || String(option) === String(resolvedValue),
-  );
+  const currentIndex = options.findIndex((option) => configValuesEqual(option, resolvedValue));
   const unset = "__unset__";
   const nullValue = "__null__";
   const canSelectNull = schema.nullable && schema.enumIncludesNull;

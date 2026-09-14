@@ -25,7 +25,7 @@ Running `openclaw` with no subcommand routes based on config state:
   without onboarding or OpenClaw. Use `/openclaw` inside the TUI, or run
   `openclaw setup` directly, to reach OpenClaw later.
 
-Running `openclaw setup` first live-tests the configured default model. A passing turn starts OpenClaw. An interactive failure opens guided inference setup and hands off to OpenClaw after a candidate passes. One-shot, JSON, and other noninteractive requests fail with instructions to run `openclaw onboard` when inference is unavailable. `openclaw --help` and `openclaw --version` keep their normal fast paths.
+Running `openclaw setup` first live-tests the configured default model. A passing turn starts OpenClaw. An interactive failure opens guided inference setup and hands off to OpenClaw after a candidate passes. One-shot, JSON, and other noninteractive requests fail with instructions to run [`openclaw onboard`](/cli/onboard) when inference is unavailable. `openclaw --help` and `openclaw --version` keep their normal fast paths.
 
 If inference plugin loading or owner verification fails, the error includes the underlying cause after applying OpenClaw's error redaction. One-shot text and JSON output retain that detail alongside onboarding guidance.
 
@@ -278,6 +278,16 @@ Interactive OpenClaw's free-form conversation runs through the same agent loop a
 A failed or timed-out turn ends that setup conversation with a visible error.
 Retrying starts a fresh conversation and live-checks the inference route again.
 
+System-agent turns use `agents.defaults.timeoutSeconds`, including `0` to disable
+the deadline, just like ordinary agent turns. The default is 48 hours; there is
+no separate two-minute cap for setup and repair.
+
+When a regular agent calls its `openclaw` tool, it delegates to this system agent
+through the running Gateway rather than launching the CLI. That adds a separate
+model turn, so routine session and workspace checks should use the agent's
+available tools directly. The embedded system helper does not load workspace
+skill catalogs because it can act only through its built-in system tool.
+
 The host does not parse natural-language requests into operations. Free-form
 messages — including command-looking text and questions such as "why did my
 gateway stop?" — go to the AI, which can map the request to a typed operation
@@ -364,7 +374,7 @@ OpenClaw: Applied. Audit entry written.
 Agent creation can also be queued locally or via rescue:
 
 ```text
-create agent work workspace ~/path/to/work model openai/gpt-5.6-sol
+create agent work workspace ~/path/to/work model openai/gpt-6-astra
 /openclaw create agent work workspace ~/path/to/work
 ```
 
@@ -427,6 +437,8 @@ pnpm openclaw qa suite --scenario system-agent-ring-zero-setup
 ## Related
 
 - [CLI reference](/cli)
+- [Setup CLI](/cli/setup)
+- [Onboard](/cli/onboard)
 - [Doctor](/cli/doctor)
 - [TUI](/cli/tui)
 - [Sandbox](/cli/sandbox)

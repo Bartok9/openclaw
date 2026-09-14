@@ -42,7 +42,12 @@ function patchContext(
 ) {
   return {
     getRuntimeConfig: () => cfg,
-    loadGatewayModelCatalog,
+    loadGatewayModelCatalogSnapshot: async (
+      params: Parameters<GatewayRequestContext["loadGatewayModelCatalogSnapshot"]>[0],
+    ) => {
+      const entries = await loadGatewayModelCatalog(params);
+      return { entries, routeVariants: entries };
+    },
     getSessionEventSubscriberConnIds: () => new Set(),
     broadcastToConnIds: vi.fn(),
     chatAbortControllers: new Map(),
@@ -406,7 +411,7 @@ test("a multi-target agent group retains ordered label claims around catalog loa
     const loadGatewayModelCatalog = vi.fn(async () => []);
     const respond = vi.fn();
     await sessionMutationHandlers["sessions.patchMany"]!({
-      params: { targets, patch: { label: "Winner", thinkingLevel: "off" } },
+      params: { targets, patch: { label: "Winner", thinkingLevel: "low" } },
       respond,
       context: patchContext(loadGatewayModelCatalog),
       client: null,
@@ -428,7 +433,7 @@ test("a multi-target agent group retains ordered label claims around catalog loa
     expect(loadGatewayModelCatalog).toHaveBeenCalledOnce();
     expect(loadSessionEntry({ agentId: "main", sessionKey: targets[0]!.key })).toMatchObject({
       label: "Winner",
-      thinkingLevel: "off",
+      thinkingLevel: "low",
     });
     expect(
       loadSessionEntry({ agentId: "main", sessionKey: targets[1]!.key })?.label,

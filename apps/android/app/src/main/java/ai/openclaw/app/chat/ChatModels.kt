@@ -44,6 +44,9 @@ data class ChatMessage(
   val cost: ChatMessageCost? = null,
   /** Starts a turn whose input was intentionally omitted from display history. */
   val turnBoundary: Boolean = false,
+  /** Display phase supplied by the Gateway, including signed text blocks. */
+  val phase: String? = null,
+  val isError: Boolean = false,
 ) {
   // Synthetic mirrors and commentary borrow a transcript ID, not its canonical text.
   // Keep the ID for timeline actions, but never use it to recover or retain full text.
@@ -414,13 +417,7 @@ enum class ChatPermissionMode(
 
 internal val defaultChatThinkingLevelSelection =
   ChatThinkingLevelSelection(
-    options =
-      listOf(
-        ChatThinkingLevelOption(id = "off", label = "Off"),
-        ChatThinkingLevelOption(id = "low", label = "Low"),
-        ChatThinkingLevelOption(id = "medium", label = "Medium"),
-        ChatThinkingLevelOption(id = "high", label = "High"),
-      ),
+    options = emptyList(),
     isGatewayProvided = false,
   )
 

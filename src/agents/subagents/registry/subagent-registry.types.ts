@@ -1,4 +1,5 @@
 import type { SubagentEndReason } from "../../../context-engine/types.js";
+import type { GatewayContextResolver } from "../../../gateway/server-methods/types.js";
 /** Persisted execution, completion, delivery, and attachment state for child runs. */
 import type { DeliveryContext } from "../../../utils/delivery-context.types.js";
 import type { AgentRunTerminalReplySnapshot } from "../../agent-run-terminal-reply.js";
@@ -32,7 +33,7 @@ export type ContextEngineSubagentEndedParams = {
   workspaceDir?: string;
 };
 
-export type SubagentProgressOrigin = {
+type SubagentProgressOrigin = {
   channel?: string;
   accountId?: string;
   to?: string;
@@ -53,6 +54,8 @@ export type PendingFinalDeliveryPayload = {
   endedAt?: number;
   outcome?: SubagentRunOutcome;
   expectsCompletionMessage?: boolean;
+  completionTarget?: "parent";
+  completionRequesterSessionId?: string;
   spawnMode?: SpawnSubagentMode;
   wakeOnDescendantSettle?: boolean;
   terminalReply?: AgentRunTerminalReplySnapshot;
@@ -116,7 +119,7 @@ export type SwarmStructuredOutputState = {
   invalidAttempts: number;
 };
 
-export type SwarmQueuedLaunch = {
+type SwarmQueuedLaunch = {
   request: Record<string, unknown>;
   /** Exact trusted launch capability, persisted so restart replay cannot lose it. */
   authorization?: SubagentLaunchAuthorization;
@@ -269,6 +272,8 @@ export type SubagentRunRecord = {
   /** Durable requester-delivery closure until silent completion cleanup finishes. */
   suppressCompletionDelivery?: boolean;
   expectsCompletionMessage?: boolean;
+  completionTarget?: "parent";
+  completionRequesterSessionId?: string;
   endedReason?: SubagentLifecycleEndedReason;
   pauseReason?: "sessions_yield";
   wakeOnDescendantSettle?: boolean;
@@ -316,10 +321,11 @@ export type SubagentRunRecord = {
   collectorCompletion?: SwarmCollectorCompletion;
 };
 
-/** Minimal registry shape needed by session-list topology and display reads. */
+/** Minimal registry shape needed by session-list topology, display and run lookup reads. */
 export type SubagentRunReadRecord = Pick<
   SubagentRunRecord,
   | "runId"
+  | "swarmRunId"
   | "collect"
   | "groupId"
   | "swarmRequesterSessionKey"
@@ -334,9 +340,51 @@ export type SubagentRunReadRecord = Pick<
   | "accumulatedRuntimeMs"
   | "runTimeoutSeconds"
   | "endedReason"
+  | "pauseReason"
   | "cleanupCompletedAt"
   | "delivery"
 > & {
   execution: Pick<SubagentExecutionState, "status" | "startedAt" | "endedAt" | "outcome">;
   collectorCompletion?: Pick<SwarmCollectorCompletion, "status">;
+};
+
+export type RegisterSubagentRunParams = {
+  runId: string;
+  requesterTurnRunId?: string;
+  childSessionKey: string;
+  controllerSessionKey?: string;
+  requesterSessionKey: string;
+  requesterOrigin?: DeliveryContext;
+  progressOrigin?: SubagentProgressOrigin;
+  requesterDisplayKey: string;
+  task: string;
+  taskName?: string;
+  agentId?: string;
+  requesterAgentId?: string;
+  cleanup: "delete" | "keep";
+  label?: string;
+  model?: string;
+  agentDir?: string;
+  workspaceDir?: string;
+  runTimeoutSeconds?: number;
+  expectsCompletionMessage?: boolean;
+  completionTarget?: "parent";
+  completionRequesterSessionId?: string;
+  spawnMode?: "run" | "session";
+  attachmentsDir?: string;
+  attachmentsRootDir?: string;
+  retainAttachmentsOnKeep?: boolean;
+  collect?: boolean;
+  swarmRequesterSessionKey?: string;
+  swarmLaunchIdempotencyKey?: string;
+  swarmLaunchReplayKey?: string;
+  swarmLaunchRequestFingerprint?: string;
+  groupId?: string;
+  outputSchema?: Record<string, unknown>;
+  queuedLaunch?: SwarmQueuedLaunch;
+  queued?: boolean;
+  /** Required when direct dispatch suppresses Gateway tracking. Out-of-process launches keep
+      Gateway's existing best-effort CLI policy; other callers create a best-effort row here. */
+  taskRowOwnership?: "required" | "gateway_best_effort";
+  gatewayContextResolver?: GatewayContextResolver;
 };

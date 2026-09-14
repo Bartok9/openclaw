@@ -7,7 +7,6 @@ import {
   ErrorCodes,
   errorShape,
   type SessionsListParams,
-  validateSessionsCleanupParams,
   validateSessionsListParams,
   validateSessionsPreviewParams,
   validateSessionsResolveParams,
@@ -18,14 +17,13 @@ import {
   listSessionMembershipKeys,
   resolveExistingAgentSessionStoreTargetsSync,
   resolveSessionStorePathCore,
-  runSessionsCleanup,
-  serializeSessionCleanupResult,
   type SessionEntry,
 } from "../../config/sessions.js";
 import {
   listSessionEntriesReadOnly,
   loadExactSessionEntryCandidatesReadOnlyBatch,
 } from "../../config/sessions/session-accessor.js";
+import { SessionTranscriptColdError } from "../../config/sessions/session-cold-storage-state.js";
 import { searchSessionTranscripts } from "../../config/sessions/session-transcript-search.js";
 import {
   measureDiagnosticsTimelineSpan,
@@ -43,6 +41,8 @@ import {
   tryResolveSessionCompatibilityOwnerAgentId,
 } from "../session-request-agent.js";
 import {
+  authorizeIncognitoSessionTarget,
+  authorizeSessionSharingTarget,
   canAccessIncognitoSession,
   createSessionListEntryFilter,
   isGatewayAdmin,
@@ -51,7 +51,7 @@ import {
   resolveSessionVisibility,
 } from "../session-sharing.js";
 import { resolveSessionStoreAgentId } from "../session-store-key.js";
-import { readSessionPreviewItemsFromTranscript } from "../session-transcript-readers.js";
+import { readSessionPreviewItemsFromTranscript } from "../session-transcript-preview.js";
 import type { SessionListActiveRunProjector } from "../session-utils-contracts.js";
 import { projectGatewaySessionActiveRun } from "../session-utils-display.js";
 import {
@@ -66,11 +66,12 @@ import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
 import { gatewayClientSessionCreator } from "./gateway-client-identity.js";
 import { readPreparedServerMethodModelCatalog } from "./optional-model-catalog.js";
 import { createVisibleActiveSessionRunProjector } from "./session-active-runs.js";
-import { emitSessionsChanged } from "./session-change-event.js";
 import { resolveGatewayModelSelectionPolicy } from "./session-model-selection-policy.js";
 import { createSessionPlacementBatchProjector } from "./session-placement-read-projection.js";
-import { listFilter } from "./sessions-board-inventory.js";
+import { listBoardSessionKeys } from "./sessions-board-inventory.js";
 import { respondWithCachedSessionList } from "./sessions-list-cache.js";
+import { withSessionListDiagnostics } from "./sessions-list-diagnostics.js";
+import { sessionMaintenanceHandlers } from "./sessions-maintenance.js";
 import { sessionByKeyReadHandlers } from "./sessions-read-by-key.js";
 import { resolveSessionSearchScope } from "./sessions-search-scope.js";
 import type { GatewayRequestHandlers } from "./types.js";
@@ -143,14 +144,20 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
         const targetSessionKeys =
           scopedSessionKeys ??
           (restrictVisibility
-            ? listSessionEntriesReadOnly({ agentId: target.agentId, storePath: target.storePath })
+            ? listSessionEntriesReadOnly({
+                agentId: target.agentId,
+                storePath: target.storePath,
+                projection: "list",
+                clone: false,
+              })
                 .map((entry) => entry.sessionKey)
                 .filter((sessionKey) => {
-                  if (!canSearchSessionKey(sessionKey)) {
+                  // A shared physical store can include rows owned by another agent.
+                  const parsed = parseAgentSessionKey(sessionKey);
+                  if (parsed && normalizeAgentId(parsed.agentId) !== agentId) {
                     return false;
                   }
-                  const parsed = parseAgentSessionKey(sessionKey);
-                  return !parsed || normalizeAgentId(parsed.agentId) === agentId;
+                  return canSearchSessionKey(sessionKey);
                 })
             : undefined);
         if (targetSessionKeys?.length === 0) {
@@ -187,6 +194,14 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       });
       respond(true, {
         results: hits.slice(0, limit),
+        ...(targetResults.some((result) => result.archivedTranscriptsExcluded)
+          ? {
+              archivedTranscriptsExcluded: targetResults.reduce(
+                (count, result) => count + (result.archivedTranscriptsExcluded ?? 0),
+                0,
+              ),
+            }
+          : {}),
         ...(targetResults.some((result) => result.indexing) ? { indexing: true } : {}),
         ...(targetResults.some((result) => result.truncated) || hits.length > limit
           ? { truncated: true }
@@ -196,7 +211,8 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatErrorMessage(error)));
     }
   },
-  "sessions.list": async ({ params, respond, client, context }) => {
+  "sessions.list": withSessionListDiagnostics(async (args, diagnostics) => {
+    const { params, respond, client, context } = args;
     if (!assertValidParams(params, validateSessionsListParams, "sessions.list", respond)) {
       return;
     }
@@ -208,6 +224,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       callerScopes: client?.connect?.scopes ?? [],
       cfg,
     }).target;
+    diagnostics?.mark("modelCatalog");
     const preparedModelCatalogByAgent = await measureDiagnosticsTimelineSpan(
       "gateway.sessions.list.model_catalog",
       async () => {
@@ -251,6 +268,11 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           } = {},
         ): Promise<Awaited<ReturnType<typeof listSessionsFromStoreAsync>>> {
           const workStartedAt = performance.now();
+          const projectionTiming = diagnostics?.projection;
+          if (projectionTiming) {
+            projectionTiming.projectionPasses++;
+          }
+          diagnostics?.mark("storeLoad");
           let loaded = options.loaded;
           if (!loaded) {
             const loadedStore = measureDiagnosticsTimelineSpanSync(
@@ -274,7 +296,18 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             loaded = { ...loadedStore, modelCatalogByAgent: preparedModelCatalogByAgent };
           }
           const { targetsBySessionKey, durableStorePath, modelCatalogByAgent, storePath } = loaded;
-          const visibleEntryFilter = listFilter({ p, loaded, client, cfg, options });
+          diagnostics?.mark("filterSetup");
+          const boardSessionKeys =
+            p.hasBoard === undefined ? undefined : await listBoardSessionKeys(targetsBySessionKey);
+          const visibilityFilter = prepareSessionSharing({ client, cfg }).entryFilter;
+          const excludedSessionKeys = options.excludedKeys;
+          const visibleEntryFilter =
+            !visibilityFilter && !boardSessionKeys && !excludedSessionKeys?.size
+              ? undefined
+              : (key: string, entry: SessionEntry) =>
+                  !excludedSessionKeys?.has(key) &&
+                  (visibilityFilter?.(key, entry) ?? true) &&
+                  (p.hasBoard === undefined || boardSessionKeys?.has(key) === p.hasBoard);
           const selectionRuns =
             p.activeOnly === true || p.search?.trim()
               ? createVisibleActiveSessionRunProjector(context)
@@ -301,12 +334,14 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
                     expectDefined(targetsBySessionKey.get(key), "active row owner").agentId,
                   ).active
               : visibleEntryFilter;
+          diagnostics?.mark("rows");
           const result = await measureDiagnosticsTimelineSpan(
             "gateway.sessions.list.rows",
             () =>
               listSessionsFromStoreAsync({
                 cfg,
                 workStartedAt,
+                projectionTiming,
                 durableStorePath,
                 ...(entryFilter ? { entryFilter } : {}),
                 storePath,
@@ -324,6 +359,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             },
           );
           result.defaults = { ...result.defaults, modelSelectionTarget };
+          diagnostics?.mark("sharing");
           const { sharingTargets, membershipKeys } = await measureDiagnosticsTimelineSpan(
             "gateway.sessions.list.sharing",
             () => {
@@ -416,6 +452,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
               },
             },
           );
+          diagnostics?.mark("decoration");
           const projectPlacement = createSessionPlacementBatchProjector(context, result.sessions);
           const projectActiveRun = createVisibleActiveSessionRunProjector(context);
           // These rows are unpublished; decorate them with fresh caller facts after the yields.
@@ -425,6 +462,27 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
             () =>
               result.sessions.forEach((session, index) => {
                 const sharingTarget = sharingTargets[index];
+                const isMember = sharingTarget
+                  ? membershipKeys.has(
+                      `${sharingTarget.storeTarget.agentId}\0${sharingTarget.storePath}\0${sharingTarget.storeKey}`,
+                    )
+                  : false;
+                if (session.activitySummary) {
+                  session.activitySummary.canEnsure = Boolean(
+                    sharingTarget &&
+                    !authorizeIncognitoSessionTarget({
+                      client,
+                      sessionKey: session.key,
+                      target: sharingTarget,
+                    }) &&
+                    !authorizeSessionSharingTarget({
+                      cfg,
+                      client,
+                      target: sharingTarget,
+                      isMember,
+                    }),
+                  );
+                }
                 const visibility = sharingTarget
                   ? resolveSessionVisibility(sharingTarget.entry)
                   : "shared";
@@ -440,12 +498,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
                   visibility,
                   ...(sharingTarget
                     ? {
-                        sharingRole: sharing.roleForTarget(
-                          sharingTarget,
-                          membershipKeys.has(
-                            `${sharingTarget.storeTarget.agentId}\0${sharingTarget.storePath}\0${sharingTarget.storeKey}`,
-                          ),
-                        ),
+                        sharingRole: sharing.roleForTarget(sharingTarget, isMember),
                       }
                     : {}),
                   ...projectGatewaySessionActiveRun(activeRunState, session.status),
@@ -465,6 +518,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           );
           // Reapply current visibility and activity after awaits; selected work may
           // settle or change ownership while its row is projected.
+          diagnostics?.mark("visibilityRepair");
           const currentVisibilityFilter = sharing.entryFilter;
           const visibleSessions =
             currentVisibilityFilter || p.activeOnly === true
@@ -493,6 +547,9 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
               }
             }
             if (!options.rowRepairAttempted) {
+              if (projectionTiming) {
+                projectionTiming.rowRepairCount++;
+              }
               // Excluding only freshly rejected rows refills this page from the already-loaded
               // store, preserving cursor continuity without multiplying catalog/store work.
               return await listVisibleSessions({
@@ -503,6 +560,9 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
               });
             }
             if (options.allowFullReload !== false) {
+              if (projectionTiming) {
+                projectionTiming.fullReloadCount++;
+              }
               // A second visibility drift means the loaded snapshot cannot restore a coherent
               // page. One full reload is the last resort; repeated drift below fails closed.
               return await listVisibleSessions({ allowFullReload: false });
@@ -536,6 +596,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           },
         },
       );
+    diagnostics?.mark("cacheSelectionOrWait");
     await respondWithCachedSessionList({
       client,
       config: cfg,
@@ -544,54 +605,9 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
       request: p,
       respond,
       run,
+      diagnostics,
     });
-  },
-  "sessions.cleanup": async ({ params, respond, context }) => {
-    if (!assertValidParams(params, validateSessionsCleanupParams, "sessions.cleanup", respond)) {
-      return;
-    }
-    try {
-      const { mode, appliedSummaries, failure } = await runSessionsCleanup({
-        cfg: context.getRuntimeConfig(),
-        opts: {
-          agent: params.agent,
-          allAgents: params.allAgents,
-          enforce: params.enforce,
-          activeKey: params.activeKey,
-          fixMissing: params.fixMissing,
-          fixDmScope: params.fixDmScope,
-        },
-      });
-      const result = serializeSessionCleanupResult({
-        mode,
-        dryRun: false,
-        summaries: appliedSummaries,
-        failure,
-      });
-      if (failure) {
-        respond(
-          false,
-          undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, failure.message, { details: result }),
-        );
-      } else {
-        respond(true, result, undefined);
-      }
-      for (const summary of appliedSummaries) {
-        emitSessionsChanged(context, { reason: "cleanup", sessionKey: undefined });
-        if (summary.wouldMutate) {
-          context.logGateway.debug(
-            `sessions.cleanup applied ${summary.storePath}: ${summary.beforeCount} -> ${summary.afterCount}`,
-          );
-        }
-      }
-      if (failure?.lifecycleCommitted) {
-        emitSessionsChanged(context, { reason: "cleanup", sessionKey: undefined });
-      }
-    } catch (error) {
-      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error)));
-    }
-  },
+  }),
   "sessions.preview": async ({ params, respond, context, client }) => {
     if (!assertValidParams(params, validateSessionsPreviewParams, "sessions.preview", respond)) {
       return;
@@ -631,6 +647,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           agentId: requestedAgent.agentId,
           exactRead: true,
           readOnly: true,
+          projection: "list",
         });
         const entry = resolveCanonicalSessionEntryFromStoreKeys(target.store, target.storeKeys);
         if (!entry?.sessionId || roleVisibilityFilter?.(target.canonicalKey, entry) === false) {
@@ -649,8 +666,12 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
           maxChars,
         );
         previews.push({ key, status: items.length > 0 ? "ok" : "empty", items });
-      } catch {
-        previews.push({ key, status: "error", items: [] });
+      } catch (error) {
+        previews.push({
+          key,
+          status: error instanceof SessionTranscriptColdError ? "cold" : "error",
+          items: [],
+        });
       }
     }
 
@@ -680,6 +701,7 @@ export const sessionReadHandlers: GatewayRequestHandlers = {
     respond(true, resolved, undefined);
   },
   ...sessionByKeyReadHandlers,
+  ...sessionMaintenanceHandlers,
 };
 
 export const sessionsListHandler = sessionReadHandlers["sessions.list"]!;

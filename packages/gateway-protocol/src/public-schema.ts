@@ -187,6 +187,8 @@ export {
   SessionsSearchParamsSchema,
   SessionsSearchResultSchema,
   SessionsCleanupParamsSchema,
+  SessionsStorageParamsSchema,
+  SessionsStorageStatusResultSchema,
   SessionsPreviewParamsSchema,
   SessionsDescribeParamsSchema,
   SessionsResolveCandidateSchema,
@@ -479,7 +481,10 @@ export {
   CommandsListResultSchema,
   ModelsAuthLogoutParamsSchema,
   ModelsAuthOrderSetParamsSchema,
+  ModelsAuthRefreshParamsSchema,
   ModelsAuthStatusParamsSchema,
+  ModelsAuthSetApiKeyParamsSchema,
+  ModelsAuthSetApiKeyResultSchema,
   ModelsListParamsSchema,
   AuthProbeStatusSchema,
   ModelsProbeParamsSchema,
@@ -679,3 +684,9 @@ export {
   FsListDirParamsSchema,
   FsListDirResultSchema,
 } from "./schema-modules.js";
+
+export {
+  SessionActivitySummarySchema,
+  SessionsActivitySummaryEnsureParamsSchema,
+  SessionsActivitySummaryEnsureResultSchema,
+} from "./schema/sessions-activity-summary.js";

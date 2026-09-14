@@ -6,6 +6,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { AssistantMessage, UserMessage } from "openclaw/plugin-sdk/llm";
 import { beforeEach, expect, vi } from "vitest";
+import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
+import { createZeroUsageFixture } from "../../agents/test-helpers/usage-fixtures.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import type { InternalHookEvent } from "../../hooks/internal-hooks.js";
 import { resetSystemEventsForTest } from "../../infra/system-events.js";
@@ -552,29 +554,18 @@ export async function createCheckpointFixture(
     content: "before compaction",
     timestamp: Date.now(),
   };
-  const assistantMessage: AssistantMessage = {
-    role: "assistant",
+  const assistantMessage: AssistantMessage = makeAgentAssistantMessage({
     content: [{ type: "text", text: "working on it" }],
     api: "responses",
-    provider: "openai",
     model: "gpt-test",
     usage: {
+      ...createZeroUsageFixture(),
       input: 1,
       output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
       totalTokens: 2,
-      cost: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        total: 0,
-      },
     },
-    stopReason: "stop",
     timestamp: Date.now(),
-  };
+  });
   session.appendMessage(userMessage);
   session.appendMessage(assistantMessage);
   const preCompactionLeafId = session.getLeafId();
@@ -665,6 +656,21 @@ export async function directSessionReq<TPayload = unknown>(
   const loadGatewayModelCatalog =
     (opts?.context?.loadGatewayModelCatalog as GatewayRequestContext["loadGatewayModelCatalog"]) ??
     (async () => agentDiscoveryMock.models);
+  const loadGatewayModelCatalogSnapshot: GatewayRequestContext["loadGatewayModelCatalogSnapshot"] =
+    (opts?.context
+      ?.loadGatewayModelCatalogSnapshot as GatewayRequestContext["loadGatewayModelCatalogSnapshot"]) ??
+    (async (request) => {
+      const entries = await loadGatewayModelCatalog(request);
+      return {
+        entries,
+        routeVariants: entries,
+        agentId: request?.agentId ?? "main",
+        agentDir: "/tmp/session-catalog-agent",
+        workspaceDir: "/tmp/session-catalog-workspace",
+        config: getRuntimeConfig(),
+        catalogComplete: true,
+      };
+    });
   let result:
     | {
         ok: boolean;
@@ -699,7 +705,11 @@ export async function directSessionReq<TPayload = unknown>(
       dedupe: new Map(),
       getSessionEventSubscriberConnIds: () => new Set<string>(),
       loadGatewayModelCatalog,
-      readPreparedGatewayModelCatalog: async () => ({ entries: await loadGatewayModelCatalog() }),
+      loadGatewayModelCatalogSnapshot,
+      readPreparedGatewayModelCatalog: async () => {
+        const catalog = await loadGatewayModelCatalogSnapshot();
+        return { entries: catalog.entries, routeVariants: catalog.routeVariants };
+      },
       getRuntimeConfig,
       ...opts?.context,
     } as never,

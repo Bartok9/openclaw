@@ -203,10 +203,16 @@ function scriptSteps(
       : [];
   return [
     {
-      command: process.execPath,
+      command: resolveQaScriptRuntimeExecutable(),
       args: ["--import", "tsx", scenario.execution.path, ...scriptArgs],
     },
   ];
+}
+
+export function resolveQaScriptRuntimeExecutable(): string {
+  // Removal: run source QA producers directly on Bun after oven-sh/bun#35690 lets
+  // tsx's module hooks resolve OpenClaw's private local plugin-SDK aliases.
+  return process.versions.bun ? "node" : process.execPath;
 }
 
 const testFileRunnerDefinitions: Record<QaTestFileExecutionKind, QaTestFileRunnerDefinition> = {
@@ -240,18 +246,22 @@ function buildScenarioEvidenceTarget(scenario: QaTestFileScenario) {
   };
 }
 
-function coverageForScenario(scenario: QaTestFileScenario) {
-  return [
-    ...(scenario.coverage?.primary ?? []).map((id) => ({ id, role: "primary" as const })),
-    ...(scenario.coverage?.secondary ?? []).map((id) => ({ id, role: "secondary" as const })),
-  ];
-}
-
 function withScenarioCoverage(
   entry: QaEvidenceSummaryJson["entries"][number],
   scenario: QaTestFileScenario,
 ) {
-  return { ...entry, coverage: coverageForScenario(scenario) };
+  const primary = new Set(scenario.coverage?.primary ?? []);
+  const secondary = new Set(scenario.coverage?.secondary ?? []);
+  return {
+    ...entry,
+    coverage: entry.coverage
+      .filter(({ id }) => primary.has(id) || secondary.has(id))
+      .map((coverage) =>
+        coverage.role === "primary" && !primary.has(coverage.id)
+          ? { id: coverage.id, role: "secondary" }
+          : coverage,
+      ),
+  };
 }
 
 async function runScenarioCommandSteps(params: {
@@ -508,8 +518,8 @@ function buildTestFileEvidence(params: {
   env?: NodeJS.ProcessEnv;
 }) {
   const producerEntries = params.results.flatMap((result) =>
-    // Producer artifacts own execution facts; the scenario catalog remains the
-    // sole owner of which semantic features those facts cover.
+    // Producers bind assertions to coverage; the catalog caps their ownership.
+    // Filling absent claims would let one passing assertion fulfill failed siblings.
     (result.producerEvidence?.entries ?? []).map((entry) =>
       withScenarioCoverage(entry, result.scenario),
     ),

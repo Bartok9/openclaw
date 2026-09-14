@@ -57,11 +57,14 @@ import {
   createTaskFlowForTask as createTaskFlowForTaskOrNull,
   createManagedTaskFlow as createManagedTaskFlowOrNull,
   getTaskFlowById,
+  reloadTaskFlowRegistryFromStore,
   requestFlowCancel,
+  updateFlowRecordByIdExpectedRevision,
 } from "./task-flow-registry.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import { getTaskActivitySnapshot } from "./task-registry-activity.js";
 import { updateTaskStateByRunId } from "./task-registry-record-api.js";
+import { readTaskRegistryRevision } from "./task-registry-state.js";
 import {
   cancelTaskById,
   deleteTaskRecordById,
@@ -97,7 +100,7 @@ import {
   stopTaskRegistryMaintenance,
   sweepTaskRegistry,
 } from "./task-registry.maintenance.js";
-import { configureTaskRegistryRuntime } from "./task-registry.store.js";
+import { configureTaskRegistryRuntime, getTaskRegistryStore } from "./task-registry.store.js";
 import { summarizeTaskRecords } from "./task-registry.summary.js";
 import { createAcpTaskRecord, createTaskFixture } from "./task-registry.test-support.js";
 import type { TaskDeliveryState, TaskRecord } from "./task-registry.types.js";
@@ -1082,6 +1085,10 @@ describe("task-registry", () => {
       expect(getTaskActivitySnapshot(task.taskId)).toEqual({
         lastActivity: "Editing the native child path",
         diffStat: { files: 2, added: 13, removed: 2 },
+        executionRunId: runId,
+        executionState: "running",
+        lastActivityAt: expect.any(Number),
+        currentTool: { name: "bash", startedAt: expect.any(Number) },
       });
     });
   });
@@ -1820,6 +1827,123 @@ describe("task-registry", () => {
         "Task registry restore failed: SQLITE_IOERR: task startup restore failed",
       );
     });
+  });
+
+  it("replays an equivalent terminal task without writes and repairs a stale mirrored flow", async () => {
+    await withTaskRegistryTempDir(
+      async () => {
+        resetTaskFlowRegistryForTests({ persist: false });
+
+        const task = createTaskFixture("subagent", {
+          runId: "run-equivalent-terminal-replay",
+          childSessionKey: "agent:main:subagent:equivalent-terminal-replay",
+          task: "Replay equivalent terminal projection",
+          deliveryStatus: "pending",
+          startedAt: 100,
+          lastEventAt: 100,
+        });
+        const flow = createTaskFlowForTask({ task });
+        const linked = linkTaskToFlowById({
+          taskId: task.taskId,
+          flowId: flow.flowId,
+        });
+        expect(linked?.parentFlowId).toBe(flow.flowId);
+
+        finalizeSubagentTask(task, {
+          status: "succeeded",
+          endedAt: 200,
+          lastEventAt: 200,
+          progressSummary: "restored result",
+          terminalSummary: null,
+          suppressDelivery: true,
+        });
+        const first = requireTaskById(task.taskId);
+        const firstFlow = getTaskFlowById(flow.flowId);
+        expect(first.status).toBe("succeeded");
+        expect(first.deliveryStatus).toBe("not_applicable");
+        expect(firstFlow?.status).toBe("succeeded");
+        expect(firstFlow?.revision).toBeGreaterThan(flow.revision);
+
+        // Reopen both registries so the replay compares the SQL-decoded shape:
+        // nullable columns omitted by SQLite must remain equivalent to undefined.
+        resetTaskRegistryForTests({ persist: false });
+        resetTaskFlowRegistryForTests({ persist: false });
+        reloadTaskFlowRegistryFromStore();
+        reloadTaskRegistryFromStore();
+        const store = getTaskRegistryStore();
+        const upsertTask = vi.fn(store.upsertTaskWithDeliveryState);
+        configureTaskRegistryRuntime({
+          store: { ...store, upsertTaskWithDeliveryState: upsertTask },
+        });
+        const restoredTaskRevision = readTaskRegistryRevision();
+
+        finalizeSubagentTask(task, {
+          status: "succeeded",
+          endedAt: 200,
+          lastEventAt: 200,
+          progressSummary: "restored result",
+          terminalSummary: null,
+          suppressDelivery: true,
+        });
+        const replayed = requireTaskById(task.taskId);
+        const replayedFlow = getTaskFlowById(flow.flowId);
+        expect(replayed).toMatchObject({
+          status: "succeeded",
+          endedAt: 200,
+          lastEventAt: 200,
+          progressSummary: "restored result",
+          deliveryStatus: "not_applicable",
+        });
+        expect(replayedFlow?.revision).toBe(firstFlow?.revision);
+        expect(replayedFlow?.status).toBe("succeeded");
+        expect(upsertTask).not.toHaveBeenCalled();
+        expect(readTaskRegistryRevision()).toBe(restoredTaskRevision);
+
+        const stale = updateFlowRecordByIdExpectedRevision({
+          flowId: flow.flowId,
+          expectedRevision: replayedFlow!.revision,
+          patch: {
+            status: "failed",
+            updatedAt: 999,
+            endedAt: 999,
+          },
+        });
+        expect(stale.applied).toBe(true);
+        if (!stale.applied) {
+          throw new Error("expected stale mirrored flow patch to apply");
+        }
+        expect(getTaskFlowById(flow.flowId)?.status).toBe("failed");
+
+        finalizeSubagentTask(task, {
+          status: "succeeded",
+          endedAt: 200,
+          lastEventAt: 200,
+          progressSummary: "restored result",
+          terminalSummary: null,
+          suppressDelivery: true,
+        });
+        const repaired = getTaskFlowById(flow.flowId);
+        expect(repaired?.status).toBe("succeeded");
+        expect(repaired?.endedAt).toBe(200);
+        expect(repaired?.revision).toBe(stale.flow.revision + 1);
+        expect(upsertTask).not.toHaveBeenCalled();
+        expect(readTaskRegistryRevision()).toBe(restoredTaskRevision);
+
+        finalizeSubagentTask(task, {
+          status: "succeeded",
+          endedAt: 200,
+          lastEventAt: 200,
+          progressSummary: "corrected result",
+          terminalSummary: null,
+          suppressDelivery: true,
+        });
+        expect(upsertTask).toHaveBeenCalledOnce();
+        expect(readTaskRegistryRevision()).toBeGreaterThan(restoredTaskRevision);
+        reloadTaskRegistryFromStore();
+        expect(requireTaskById(task.taskId).progressSummary).toBe("corrected result");
+      },
+      { durableStore: true },
+    );
   });
 
   it("reports task update success and retries when task-mirrored flow sync persistence fails", async () => {
@@ -4714,6 +4838,49 @@ describe("task-registry", () => {
       );
     });
   });
+
+  it.each(["succeeded", "failed", "timed_out", "lost", "cancelled"] as const)(
+    "preserves ACP %s recorded during cancellation",
+    async (status) => {
+      await withTaskRegistryTempDir(async () => {
+        const runId = "run-acp-cancel-race";
+        const task = createTaskFixture("acp", {
+          childSessionKey: "agent:codex:acp:cancel-race",
+          runId,
+          task: "Finish during cancellation",
+          notifyPolicy: "silent",
+        });
+        hoisted.cancelSessionMock.mockImplementationOnce(async () => {
+          updateTaskStateByRunId({
+            runId,
+            runtime: "acp",
+            status,
+            endedAt: 200,
+            terminalSummary: "Recorded terminal result",
+          });
+        });
+
+        const result = await cancelTask(task.taskId);
+
+        expectRecordFields(result, {
+          found: true,
+          cancelled: status === "cancelled",
+          reason:
+            status === "cancelled"
+              ? undefined
+              : `Task became ${status} while cancellation was in progress.`,
+        });
+        for (const record of [result.task, getTaskById(task.taskId)]) {
+          expectRecordFields(record, {
+            status,
+            endedAt: 200,
+            error: undefined,
+            terminalSummary: "Recorded terminal result",
+          });
+        }
+      });
+    },
+  );
 
   it("cancels subagent-backed tasks through subagent control", async () => {
     await withTaskRegistryTempDir(async () => {

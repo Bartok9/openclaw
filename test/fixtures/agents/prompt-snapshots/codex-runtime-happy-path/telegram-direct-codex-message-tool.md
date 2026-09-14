@@ -102,7 +102,8 @@
   "model": "gpt-5.5",
   "personality": "none",
   "sandbox": "danger-full-access",
-  "serviceName": "OpenClaw"
+  "serviceName": "OpenClaw",
+  "threadSource": "openclaw"
 }
 ```
 
@@ -180,7 +181,8 @@
   "sandboxPolicy": {
     "type": "dangerFullAccess"
   },
-  "threadId": "thread-telegram-direct-codex-message-tool"
+  "threadId": "thread-telegram-direct-codex-message-tool",
+  "turnTrigger": "user"
 }
 ```
 
@@ -252,8 +254,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 0
   },
   "dynamicToolsJson": {
-    "chars": 58312,
-    "roughTokens": 14578
+    "chars": 62511,
+    "roughTokens": 15628
   },
   "openClawDeveloperInstructions": {
     "chars": 2629,
@@ -268,8 +270,8 @@ This is the deterministic model-bound layer stack OpenClaw can snapshot for the 
     "roughTokens": 6616
   },
   "totalWithDynamicToolsJson": {
-    "chars": 84777,
-    "roughTokens": 21195
+    "chars": 88976,
+    "roughTokens": 22244
   },
   "userInputText": {
     "chars": 793,

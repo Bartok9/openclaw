@@ -15,6 +15,7 @@ import {
   restoreRoleRefsForTarget,
 } from "./pw-session.js";
 import {
+  assertInteractionCurrent,
   awaitNavigationGuardedInteraction,
   createAbortPromiseWithListener,
   type ElementInteractionOptions,
@@ -70,6 +71,9 @@ export async function clickViaPlaywright(
         await locator.hover({ timeout, signal });
         throwIfInteractionAborted(opts.signal);
         await sleepWithAbort(delayMs, opts.signal);
+        if (opts.assertCurrent) {
+          await assertInteractionCurrent(opts);
+        }
         throwIfInteractionAborted(opts.signal);
       }
       const clickOptions = { timeout, signal, button: opts.button, modifiers: opts.modifiers };
@@ -114,6 +118,7 @@ async function runGuardedPageInteraction<T>(
         page,
         ...interactionNavigationPolicy(opts),
         targetId: opts.targetId,
+        assertCurrent: opts.assertCurrent,
       },
       abortPromise,
       opts.signal,
@@ -218,6 +223,24 @@ export async function pressKeyViaPlaywright(
   });
 }
 
+export async function insertTextViaPlaywright(
+  opts: GuardedInteractionOptions & { text: string },
+): Promise<void> {
+  const page = await getPageForTargetId(opts);
+  ensurePageState(page);
+  await runGuardedPageInteraction(page, opts, async () => {
+    try {
+      // Native insertion preserves the focused frame and selection without reading the clipboard.
+      await page.keyboard.insertText(opts.text);
+    } catch {
+      // Playwright errors can contain the inserted text, including pasted passwords.
+      throw new Error(
+        "Unable to paste text into the browser. Focus an editable field and try again.",
+      );
+    }
+  });
+}
+
 export async function typeViaPlaywright(
   opts: ElementInteractionOptions & {
     text: string;
@@ -236,12 +259,18 @@ export async function typeViaPlaywright(
     async (signal) => {
       if (opts.slowly) {
         await locator.click({ timeout, signal });
+        if (opts.assertCurrent) {
+          await assertInteractionCurrent(opts);
+        }
         throwIfInteractionAborted(opts.signal);
         await locator.type(text, { timeout, signal, delay: 75 });
       } else {
         await locator.fill(text, { timeout, signal });
       }
       if (opts.submit) {
+        if (opts.assertCurrent) {
+          await assertInteractionCurrent(opts);
+        }
         throwIfInteractionAborted(opts.signal);
         await locator.press("Enter", { timeout, signal });
       }
@@ -378,6 +407,7 @@ export async function evaluateViaPlaywright(
           page,
           ...navigationPolicy,
           targetId: opts.targetId,
+          assertCurrent: opts.assertCurrent,
         },
         abortPromise,
         signal,
@@ -422,6 +452,7 @@ export async function evaluateViaPlaywright(
         page,
         ...navigationPolicy,
         targetId: opts.targetId,
+        assertCurrent: opts.assertCurrent,
       },
       abortPromise,
       signal,

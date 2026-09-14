@@ -31,6 +31,10 @@ cleanup_outer() {
       echo "Upgrade survivor diagnostics missing: no private capture prepared." >&2
     fi
   fi
+  if [ "$exit_status" -eq 0 ] && [ "${OPENCLAW_UPGRADE_SURVIVOR_PUBLISHED_BASELINE:-0}" = "1" ] && [ "$diagnostics_ready" = "1" ]; then
+    publish_diagnostics passed ||
+      echo "Upgrade survivor diagnostics missing: successful receipt was not published." >&2
+  fi
   if [ -n "$PACKAGE_TGZ" ]; then
     docker_e2e_cleanup_package_tgz "$PACKAGE_TGZ"
   fi
@@ -323,7 +327,7 @@ if [ "${OPENCLAW_UPGRADE_SURVIVOR_PUBLISHED_BASELINE:-0}" = "1" ]; then
     CANDIDATE_SPEC="$(normalize_npm_candidate "$CANDIDATE_RAW")"
   fi
 
-  if [ "$CANDIDATE_IS_CURRENT" = "1" ] && [ -z "${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR:-}" ]; then
+  if [ "$CANDIDATE_IS_CURRENT" = "1" ] && [ "$SCENARIO" != "custom-plugin-siblings" ] && [ -z "${OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR:-}" ]; then
     AUTO_PREPUBLISH_PLUGIN_REGISTRY_ROOT="$(
       mktemp -d "${TMPDIR:-/tmp}/openclaw-upgrade-survivor-plugin-registry.XXXXXX"
     )"

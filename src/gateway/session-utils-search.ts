@@ -5,7 +5,6 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import { resolveSessionModelIdentityRef } from "../agents/session-model-ref.js";
-import { getSessionDisplaySubagentRunByChildSessionKey } from "../agents/subagents/registry/subagent-registry-read.js";
 import {
   buildGroupDisplayName,
   type InternalSessionEntry,
@@ -32,12 +31,10 @@ import {
   projectGatewaySessionActiveRun,
   resolveGatewaySessionGoal,
 } from "./session-utils-display.js";
-import {
-  resolveSessionDisplayModelIdentityRefCached,
-  resolveGatewaySessionRuntimeProjection,
-} from "./session-utils-model.js";
+import { resolveSessionDisplayModelIdentityRefCached } from "./session-utils-model.js";
 import {
   buildSessionListRowMetadataContext,
+  resolveGatewaySessionRuntimeProjection,
   populateSessionListAcpMetadata,
   resolveSessionSelectedModelRef,
 } from "./session-utils-projection.js";
@@ -95,25 +92,16 @@ function shouldResolveDerivedSessionModelSearchFields(search: string): boolean {
   return !search.startsWith("agent:");
 }
 
-export function resolveSessionListRowContext(params: {
-  rowContext?: SessionListRowContext;
-  getRowContext?: SessionListRowContextProvider;
-}): SessionListRowContext | undefined {
-  return params.rowContext ?? params.getRowContext?.();
-}
-
 function resolveSessionListSearchModelFields(params: {
   agentId: string;
   cfg: OpenClawConfig;
   key: string;
   entry?: SessionEntry;
-  rowContext?: SessionListRowContext;
+  rowContext: SessionListRowContext;
   selectedModel: ReturnType<typeof resolveSessionSelectedModelRef>;
 }): Array<string | undefined> {
   const { agentId, selectedModel } = params;
-  const subagentRun = params.rowContext
-    ? params.rowContext.subagentRuns.getDisplaySubagentRun(params.key)
-    : getSessionDisplaySubagentRunByChildSessionKey(params.key);
+  const subagentRun = params.rowContext.subagentRuns.getDisplaySubagentRun(params.key);
   const resolvedModel = resolveSessionModelIdentityRef(
     params.cfg,
     params.entry,
@@ -269,6 +257,7 @@ function loadGatewaySessionSnapshot(
     loadGatewaySessionEntryReadOnly(sessionKey, {
       clone: false,
       includeStoreChildEntries: true,
+      projection: lightweight ? "list" : "full",
       agentId: options?.agentId,
     });
   if (!entry) {

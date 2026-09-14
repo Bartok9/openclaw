@@ -17,7 +17,7 @@ import {
 } from "../store/run-receipt-store.js";
 import type { CronJob } from "../types.js";
 import { findJobOrThrow } from "./jobs-scheduling.js";
-import { cronRunReceiptOwnerMutationHooks } from "./run-receipts.js";
+import { cronRunReceiptMutationHooks } from "./run-receipts.js";
 import { createCronServiceState } from "./state.js";
 import { ensureLoaded, persist, persistOrRestore, snapshotStoreForRollback } from "./store.js";
 
@@ -73,6 +73,33 @@ function createReloadCronJob(params?: Partial<CronJob>): CronJob {
 describe("cron service store seam coverage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("keeps a loaded snapshot stale when a writer advances its revision during loading", async () => {
+    const { storePath } = await makeStorePath();
+    const state = createStoreTestState(storePath);
+    const first = createReloadCronJob({ id: "before-write" });
+    const second = createReloadCronJob({ id: "after-write" });
+    const loaded = (job: CronJob) => ({
+      store: { version: 1 as const, jobs: [job] },
+      configJobs: [{ ...job }],
+      configJobIndexes: [0],
+      configJobRuntimeEntries: [{ state: job.state }],
+      invalidConfigRows: [],
+    });
+    const read = vi
+      .spyOn(cronStoreModule, "loadCronJobsStoreWithConfigJobs")
+      .mockImplementationOnce(async () => {
+        cronStoreModule.noteCronJobsStoreCommit(storePath);
+        return loaded(first);
+      })
+      .mockResolvedValue(loaded(second));
+
+    await ensureLoaded(state, { skipRecompute: true });
+    expect(state.store?.jobs[0]?.id).toBe("before-write");
+    await ensureLoaded(state, { skipRecompute: true });
+    expect(state.store?.jobs[0]?.id).toBe("after-write");
+    expect(read).toHaveBeenCalledTimes(2);
   });
 
   it("does not drain post-persist notifications when there is no store to write", async () => {
@@ -697,7 +724,12 @@ describe("cron service store seam coverage", () => {
     try {
       await expect(
         persistOrRestore(state, snapshot, {
-          transactionHooks: cronRunReceiptOwnerMutationHooks({ state, jobId: job.id }),
+          transactionHooks: cronRunReceiptMutationHooks({
+            state,
+            jobId: job.id,
+            ownerChanged: true,
+            triggerStateChanged: false,
+          }),
         }),
       ).rejects.toBeInstanceOf(CronRunReceiptConflictError);
       expect((await loadCronStore(storePath)).jobs[0]?.agentId).toBe("alpha");

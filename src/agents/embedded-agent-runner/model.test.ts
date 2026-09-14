@@ -2,9 +2,9 @@
 import fs from "node:fs";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadBundledPluginPublicSurface } from "../../plugin-sdk/test-helpers/public-surface-loader.js";
 import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
 import type { ProviderPlugin } from "../../plugins/types.js";
+import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
@@ -1927,6 +1927,20 @@ describe("resolveModel", () => {
     expect(model.provider).toBe("custom");
     expect(model.id).toBe("missing-model");
     expect(model.api).toBe("openai-completions");
+  });
+
+  it("does not inherit an unrelated configured row's maxTokens for an unlisted fallback model", async () => {
+    const cfg = makeProviderConfig("custom", {
+      baseUrl: "http://localhost:9000",
+      models: [{ id: "listed-model", name: "listed-model", contextWindow: 32_768, maxTokens: 128 }],
+    });
+
+    const result = await resolveModelForTest("custom", "missing-model", state.agentDir(), cfg);
+    const model = expectResolvedModel(result);
+
+    expect(model.id).toBe("missing-model");
+    expect(model.maxTokens).toBeUndefined();
+    expect(model).not.toHaveProperty("maxTokensSource");
   });
 
   it("defaults baseUrl-only Google fallback models to native Gemini transport", async () => {
@@ -4767,7 +4781,7 @@ describe("resolveModel", () => {
   it.each(["provider", "model"])(
     "preserves authored %s transport and model overrides",
     async (scope) => {
-      const { buildOpenAIProvider } = await loadBundledPluginPublicSurface<{
+      const { buildOpenAIProvider } = await loadBundledPluginFacade<{
         buildOpenAIProvider: () => ProviderPlugin;
       }>({ pluginId: "openai", artifactBasename: "api.js" });
       const provider = buildOpenAIProvider();

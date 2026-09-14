@@ -33,7 +33,7 @@ import { resolveOperatorSessionCreation } from "./session-creation-provenance.js
 import * as sessionUnreadAck from "./session-unread-ack.js";
 import {
   prepareSessionPatchArchive,
-  prepareSessionPatchWorktreeTransition,
+  prepareSessionPatchArchiveTransition,
   releaseSessionPatchArchive,
   type SessionPatchArchivePreparation,
   type SessionPatchArchiveTarget,
@@ -51,6 +51,10 @@ import {
   unexpectedPatchError,
 } from "./sessions-patch-errors.js";
 import * as sessionPatchExpectations from "./sessions-patch-expectations.js";
+import {
+  prepareSessionPatchRuntimeSelection,
+  refreshSessionPatchQueuedSelection,
+} from "./sessions-patch-model-selection.js";
 import type { ActiveSessionPermissionChange } from "./sessions-patch-permissions.runtime.js";
 import { resolveSessionWorkerPlacementPatchError } from "./sessions-shared.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
@@ -76,11 +80,10 @@ type MutationOutcome =
       applied: boolean;
       accessChanged: boolean;
       entry: SessionEntry;
-      cleanupError?: ErrorShape;
     }
   | { ok: false; error: ErrorShape };
 
-type WorktreeTransition = Awaited<ReturnType<typeof prepareSessionPatchWorktreeTransition>>;
+type ArchiveTransition = Awaited<ReturnType<typeof prepareSessionPatchArchiveTransition>>;
 type GroupMutationOperation = {
   replacements?: SessionEntryCanonicalReplacement[];
   result: GroupMutationResult;
@@ -263,7 +266,7 @@ export async function executeSessionPatchMutations(params: {
   }
 
   const catalogs = createSessionPatchCatalogPreparation(
-    (agentId) => params.context.loadGatewayModelCatalog({ agentId }),
+    (agentId) => params.context.loadGatewayModelCatalogSnapshot({ agentId }),
     params.diagnostics,
   );
 
@@ -282,7 +285,7 @@ export async function executeSessionPatchMutations(params: {
                 cfg,
                 commitGuard: params.targets[target.index]!.commitGuard,
                 context: params.context,
-                loadGatewayModelCatalog: () => catalogs.load(target.targetAgentId),
+                loadGatewayModelCatalogSnapshot: () => catalogs.load(target.targetAgentId),
                 personalModelSelection,
                 ...(pluginOwnerId ? { pluginOwnerId } : {}),
                 target,
@@ -338,7 +341,7 @@ export async function executeSessionPatchMutations(params: {
                     ...target.initialStoreKeys,
                   ]);
                   const requestedLabel = parseSessionLabel(first.fullPatch.label);
-                  const worktreeTransitions = new Map<number, WorktreeTransition>();
+                  const archiveTransitions = new Map<number, ArchiveTransition>();
                   const commitGuards = new Set<() => ErrorShape | undefined>();
                   const projectGroup = async (
                     entries: SqliteLifecycleTargetSnapshot,
@@ -488,18 +491,15 @@ export async function executeSessionPatchMutations(params: {
                           projectedOutcomes.push(projected);
                           continue;
                         }
-                        const placementPatchError = resolveSessionWorkerPlacementPatchError({
-                          agentId: target.targetAgentId,
+                        const runtimeSelection = await prepareSessionPatchRuntimeSelection({
                           cfg,
-                          context: params.context,
-                          entry: projected.entry,
-                          key: target.key,
+                          agentId: target.targetAgentId,
                           patch: target.fullPatch,
-                          sessionKey: primaryKey,
-                          validateModelRuntime: true,
+                          entry: projected.entry,
+                          placement: { context: params.context, sessionKey: primaryKey },
                         });
-                        if (placementPatchError) {
-                          projectedOutcomes.push(invalidSessionPatchOutcome(placementPatchError));
+                        if (!runtimeSelection.ok) {
+                          projectedOutcomes.push(runtimeSelection);
                           continue;
                         }
                         const authorizationFailure = params.targets[target.index]!.commitGuard();
@@ -508,13 +508,16 @@ export async function executeSessionPatchMutations(params: {
                           continue;
                         }
                         if (
-                          existingEntry?.worktree &&
-                          typeof target.fullPatch.archived === "boolean"
+                          existingEntry &&
+                          typeof target.fullPatch.archived === "boolean" &&
+                          (existingEntry.worktree ||
+                            existingEntry.archivedAt !== undefined ||
+                            target.fullPatch.archived)
                         ) {
                           const worktreeTiming = params.diagnostics?.scope("worktree");
-                          let transition: WorktreeTransition;
+                          let transition: ArchiveTransition;
                           try {
-                            transition = await prepareSessionPatchWorktreeTransition({
+                            transition = await prepareSessionPatchArchiveTransition({
                               archived: target.fullPatch.archived,
                               entry: existingEntry,
                               context: params.context,
@@ -529,7 +532,7 @@ export async function executeSessionPatchMutations(params: {
                           } finally {
                             worktreeTiming?.finish();
                           }
-                          worktreeTransitions.set(target.index, transition);
+                          archiveTransitions.set(target.index, transition);
                         }
                         if (permissionRuntime && existingEntry?.sessionId) {
                           const permission = permissionRuntime.prepareSessionPatchPermissionChange({
@@ -549,6 +552,9 @@ export async function executeSessionPatchMutations(params: {
                           (sessionKey) => sessionKey !== primaryKey && workingStore[sessionKey],
                         );
                         commitGuards.add(params.targets[target.index]!.commitGuard);
+                        if (runtimeSelection.validate) {
+                          commitGuards.add(runtimeSelection.validate);
+                        }
                         replacements.push({
                           entry: projected.entry,
                           previousSessionKeys,
@@ -593,7 +599,7 @@ export async function executeSessionPatchMutations(params: {
                           throw new SessionMutationAuthorizationChangedError(error);
                         }
                       }
-                      for (const transition of worktreeTransitions.values()) {
+                      for (const transition of archiveTransitions.values()) {
                         transition.assertCommitAllowed();
                       }
                     },
@@ -644,10 +650,20 @@ export async function executeSessionPatchMutations(params: {
                   for (const [groupIndex, target] of group.entries()) {
                     const outcome = groupOutcomes[groupIndex]!;
                     outcomes[target.index] = outcome;
-                    const afterCommit = worktreeTransitions.get(target.index)?.afterCommit;
+                    if (outcome.ok && outcome.applied && "agentRuntime" in target.fullPatch) {
+                      refreshSessionPatchQueuedSelection({
+                        cfg,
+                        entry: outcome.entry,
+                        patch: target.fullPatch,
+                        sessionKey: target.canonicalKey,
+                        agentId: target.targetAgentId,
+                        catalog: (await catalogs.available(target.targetAgentId))?.entries,
+                      });
+                    }
+                    const afterCommit = archiveTransitions.get(target.index)?.afterCommit;
                     if (outcome.ok && outcome.applied && afterCommit) {
                       groupTiming?.mark("worktreeCleanup");
-                      outcome.cleanupError = await afterCommit(outcome.entry);
+                      await afterCommit(outcome.entry);
                     }
                   }
                 } catch (error) {
@@ -715,10 +731,7 @@ export async function executeSessionPatchMutations(params: {
   return {
     ok: true,
     cfg,
-    // Publish committed hooks/events/cron changes even when only checkout cleanup failed.
-    outcomes: outcomes.map((outcome) =>
-      outcome?.ok && outcome.cleanupError ? { ok: false, error: outcome.cleanupError } : outcome,
-    ) as MutationOutcome[],
+    outcomes: outcomes as MutationOutcome[],
     preparedByIndex,
     catalogs,
   };

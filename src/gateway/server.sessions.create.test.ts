@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { expectDefined } from "@openclaw/normalization-core";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -366,7 +367,10 @@ async function createPersonalAccountSessionFixture() {
   const cfg = gatewayConfig.getRuntimeConfig();
   const context = {
     getRuntimeConfig: () => cfg,
-    loadGatewayModelCatalog: vi.fn(async () => catalog),
+    loadGatewayModelCatalogSnapshot: vi.fn(async () => ({
+      entries: catalog,
+      routeVariants: catalog,
+    })),
     getClientConnIds: (filter?: (current: GatewayClient) => boolean) =>
       new Set(
         [...clients].filter((current) => !filter || filter(current)).map(({ connId }) => connId),
@@ -423,12 +427,12 @@ test("session creation provenance cannot authorize a fresh personal account", as
       creation: { via: "operator", actor: { type: "human", source: "profile", id: owner.id } },
       commandSource: "webchat",
       prepareLifecycle,
-      loadGatewayModelCatalog: context.loadGatewayModelCatalog,
+      loadGatewayModelCatalogSnapshot: context.loadGatewayModelCatalogSnapshot,
     });
 
     expect(created).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
     expect(prepareLifecycle).not.toHaveBeenCalled();
-    expect(context.loadGatewayModelCatalog).not.toHaveBeenCalled();
+    expect(context.loadGatewayModelCatalogSnapshot).not.toHaveBeenCalled();
     expect(loadSessionEntry({ sessionKey: key, storePath })).toBeUndefined();
   });
 });
@@ -669,14 +673,17 @@ test.each([
             const context = {
               getRuntimeConfig: () => cfg,
               modelAccountConnectService: service,
-              loadGatewayModelCatalog: async () => [
-                { id: "trinity-large-thinking", name: "Direct Arcee model", provider: "arcee" },
-                {
-                  id: "trinity-large-preview",
-                  name: "Arcee model through OpenRouter",
-                  provider: "arcee",
-                },
-              ],
+              loadGatewayModelCatalogSnapshot: async () => {
+                const entries = [
+                  { id: "trinity-large-thinking", name: "Direct Arcee model", provider: "arcee" },
+                  {
+                    id: "trinity-large-preview",
+                    name: "Arcee model through OpenRouter",
+                    provider: "arcee",
+                  },
+                ];
+                return { entries, routeVariants: entries };
+              },
               getClientConnIds: (filter?: (current: GatewayClient) => boolean) =>
                 new Set(
                   [...clients]
@@ -865,7 +872,7 @@ test.each(["foreign admin", "unidentified admin", "synthetic owner"] as const)(
         );
 
         expect(created).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
-        expect(context.loadGatewayModelCatalog).not.toHaveBeenCalled();
+        expect(context.loadGatewayModelCatalogSnapshot).not.toHaveBeenCalled();
         expect(dashboardTitleGenerationMocks.generate).not.toHaveBeenCalled();
         expect(loadSessionEntry({ sessionKey: key, storePath })).toEqual(before);
         expect(managedWorktrees.findLiveByOwner("session", key)).toBeUndefined();
@@ -905,9 +912,9 @@ test.each([
         gateway: { roles: { default: "writer", definitions: { writer } } },
       };
       const catalogGate = createDeferredCore();
-      context.loadGatewayModelCatalog.mockImplementationOnce(async () => {
+      context.loadGatewayModelCatalogSnapshot.mockImplementationOnce(async () => {
         await catalogGate.promise;
-        return catalog;
+        return { entries: catalog, routeVariants: catalog };
       });
       const key = "agent:main:dashboard:personal-revoked";
       const creating = directSessionReq(
@@ -919,7 +926,9 @@ test.each([
         { client, context: { ...context, getRuntimeConfig: () => cfg } },
       );
       try {
-        await waitForFast(() => expect(context.loadGatewayModelCatalog).toHaveBeenCalledOnce());
+        await waitForFast(() =>
+          expect(context.loadGatewayModelCatalogSnapshot).toHaveBeenCalledOnce(),
+        );
         if (loss === "disconnected") {
           clients.delete(client);
         } else {
@@ -4296,12 +4305,24 @@ test("sessions.create stores dashboard model, thinking, fast mode, and parent li
 test.each([undefined, "main"])(
   "sessions.create parents dashboard sessions to agent main when dmScope is %s",
   async (dmScope) => {
-    await createSessionStoreDir();
+    const { storePath } = await createSessionStoreDir();
     testState.sessionConfig = dmScope ? { dmScope } : undefined;
+    testState.agentConfig = { model: { primary: "openai/current-model" } };
+    await writeSessionStore({
+      entries: {
+        "agent:main:main": {
+          ...sessionStoreEntry("sess-grouping-parent"),
+          providerOverride: "anthropic",
+          modelOverride: "parent-model",
+          modelOverrideSource: "user",
+        },
+      },
+    });
 
     const created = await directSessionReq<{
       key?: string;
       entry?: { parentSessionKey?: string; spawnDepth?: number };
+      resolved?: { modelProvider?: string; model?: string };
     }>("sessions.create", { agentId: "main" });
 
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
@@ -4311,6 +4332,39 @@ test.each([undefined, "main"])(
     // their operator identity and makes explicit finite spawn-depth caps apply
     // from the correct origin.
     expect(created.payload?.entry?.spawnDepth).toBe(0);
+    const key = requireNonEmptyString(created.payload?.key, "created session key");
+    const child = expectDefined(
+      loadSessionEntry({ sessionKey: key, storePath }),
+      "created session",
+    );
+    const parent = expectDefined(
+      loadSessionEntry({ sessionKey: "agent:main:main", storePath }),
+      "grouping parent session",
+    );
+    const { createModelSelectionState } = await import("../auto-reply/reply/model-selection.js");
+    const cfg = getRuntimeConfig();
+    const reply = await createModelSelectionState({
+      cfg,
+      agentId: "main",
+      agentCfg: cfg.agents?.defaults,
+      sessionEntry: child,
+      sessionStore: { "agent:main:main": parent },
+      sessionKey: key,
+      parentSessionKey: child.parentSessionKey,
+      defaultProvider: "openai",
+      defaultModel: "current-model",
+      provider: "openai",
+      model: "current-model",
+      hasModelDirective: false,
+    });
+    expect(created.payload?.resolved).toMatchObject({
+      modelProvider: "openai",
+      model: "current-model",
+    });
+    expect({ provider: reply.provider, model: reply.model }).toEqual({
+      provider: "openai",
+      model: "current-model",
+    });
   },
 );
 
@@ -6636,10 +6690,15 @@ test("sessions.create forks the parent transcript into the new session", async (
   const { dir, storePath } = await createSessionStoreDir();
   testState.sessionConfig = { scope: "per-sender" };
   const parent = await createCheckpointFixture(dir);
+  const projectRoot = path.join(dir, "qa-writer");
+  await fs.mkdir(projectRoot);
   await writeSessionStore({
     entries: {
       main: sessionStoreEntry(parent.sessionId, {
         sessionFile: parent.sessionFile,
+        projectId: "qa-writer",
+        spawnedCwd: projectRoot,
+        sessionRoot: projectRoot,
         totalTokens: 123,
         totalTokensFresh: true,
         totalTokensVersion: 1,
@@ -6718,6 +6777,9 @@ test("sessions.create forks the parent transcript into the new session", async (
 
   const key = requireNonEmptyString(created.payload?.key, "forked session key");
   expect(loadSessionEntry({ sessionKey: key, storePath })).toMatchObject({
+    projectId: "qa-writer",
+    spawnedCwd: projectRoot,
+    sessionRoot: projectRoot,
     sessionId: created.payload?.sessionId,
     forkSource: {
       sessionKey: "agent:main:main",

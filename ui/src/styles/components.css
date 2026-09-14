@@ -167,6 +167,11 @@ openclaw-session-owner-chip {
   font-size: inherit;
 }
 
+.sidebar-recent-session .session-owner-chip--row {
+  border: 0;
+  box-shadow: none;
+}
+
 .session-owner-stack {
   position: relative;
   display: inline-flex;
@@ -206,6 +211,42 @@ openclaw-session-owner-chip {
   z-index: 1;
   width: 18px;
   height: 18px;
+}
+
+.sidebar-recent-session .session-owner-stack__front,
+.sidebar-recent-session .session-owner-stack__back .viewer-avatar,
+.sidebar-recent-session .session-owner-stack__overflow {
+  border: 1px solid transparent;
+  background-clip: padding-box;
+}
+
+/* Compose the row's translucent fill over its surface, outside the front face's
+   away filter/opacity. The mask leaves only the 1px cutout. */
+.sidebar-recent-session .session-owner-stack::before,
+.sidebar-recent-session .session-owner-stack::after {
+  content: "";
+  position: absolute;
+  inset-block: 1px;
+  z-index: 1;
+  box-sizing: border-box;
+  width: 18px;
+  border: 1px solid var(--session-row-bg);
+  border-radius: var(--radius-full);
+  background: var(--sidebar-bg, var(--bg));
+  mask:
+    linear-gradient(white 0 0) padding-box,
+    linear-gradient(white 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  transition: border-color var(--duration-fast) ease;
+}
+
+.sidebar-recent-session .session-owner-stack::before {
+  left: 0;
+}
+
+.sidebar-recent-session .session-owner-stack::after {
+  right: 0;
 }
 
 /* Leading slot shared by every sidebar row: the row's own artwork plus a run
@@ -248,9 +289,14 @@ openclaw-session-owner-chip {
 }
 
 .session-glyph__icon,
-.session-glyph__icon svg {
+.session-glyph__icon svg,
+.session-glyph__icon img {
   width: 16px;
   height: 16px;
+}
+
+.session-glyph__icon img {
+  object-fit: contain;
 }
 
 .session-glyph__icon {
@@ -283,6 +329,37 @@ openclaw-session-owner-chip {
    slot used to draw; a full-size empty circle reads as a missing icon. */
 .session-glyph--bare .session-glyph__ring {
   inset: 4px;
+}
+
+/* Two identities share one run: the arc traces the union outline of the owner
+   stack's pair instead of a circle. Sized to .session-owner-stack (18px faces
+   at ±5px around the glyph center) plus the ring's 2px gap. */
+.session-glyph__trace {
+  position: absolute;
+  top: -1px;
+  left: -6px;
+  width: 32px;
+  height: 22px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.session-glyph__trace path {
+  fill: none;
+  stroke-width: 1.5;
+}
+
+.session-glyph__trace-track {
+  stroke: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* The arc covers the same share of its outline as the ring's quarter turn and
+   moves at the ring's linear speed (~45px/s). */
+.session-glyph__trace-run {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-dasharray: 25 75;
+  animation: session-run-trace 2s linear infinite;
 }
 
 .session-glyph__badge {
@@ -2183,13 +2260,48 @@ select.input {
 
 /* Pending routes reserve the content layout without exposing transient panel text. */
 .lazy-view-state--loading {
-  display: grid;
+  display: flex;
   flex: 1 1 auto;
-  place-items: center;
   min-width: 0;
   min-height: min(50dvh, 360px);
   width: 100%;
-  margin: auto;
+  margin: 0;
+}
+
+.lazy-element-loading-modal {
+  --openclaw-modal-width: 360px;
+  --openclaw-modal-backdrop-filter: none;
+  --wa-color-overlay-modal: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.lazy-element-loading {
+  padding: 16px 20px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+}
+
+.lazy-element-loading__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.lazy-element-loading__header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.lazy-element-loading__status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 /* Lazy route load failure — a centered panel state, not a stretched callout. */
@@ -2268,439 +2380,6 @@ select.input {
 @keyframes compaction-spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-openclaw-chat-session-rail {
-  display: contents;
-}
-
-.chat-session-rail {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 30;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--card) 96%, transparent);
-  box-shadow: var(--shadow-lg);
-  animation: fade-in 0.2s var(--ease-out);
-  backdrop-filter: blur(14px);
-}
-
-.chat-session-rail--pill {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  width: min(390px, calc(100% - 24px));
-  min-height: 40px;
-  padding: 4px 6px 4px 10px;
-  border-radius: 999px;
-  color: var(--text);
-}
-
-.chat-session-rail--pill:hover {
-  border-color: var(--border-strong);
-  background: var(--card);
-}
-
-/* Narrow panes cannot hold two columns, so the companion becomes a full-height
-   sheet on the pane's trailing edge. It still covers the thread, but it reads as
-   a surface that took the pane over rather than a card floating above it — the
-   docked column below is the shape this degrades from. The shadow and blur the
-   base rule gives the pill are card cues, so the sheet drops them too. */
-.chat-session-rail--expanded {
-  display: flex;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  flex-direction: column;
-  width: min(400px, 100%);
-  overflow: hidden;
-  border-width: 0 0 0 1px;
-  border-radius: 0;
-  box-shadow: none;
-  backdrop-filter: none;
-  animation: none;
-}
-
-.chat-session-rail--embedded {
-  position: relative;
-  inset: auto;
-  z-index: auto;
-  width: 100%;
-  height: 100%;
-  border: 0;
-  background: transparent;
-}
-
-.chat-session-rail__header {
-  display: flex;
-  flex: 0 0 auto;
-}
-
-.chat-session-rail__header-copy {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.chat-session-rail__status-row,
-.chat-session-rail__status,
-.chat-session-rail__actions,
-.chat-session-rail__prs,
-.chat-session-rail__pr {
-  display: flex;
-  align-items: center;
-}
-
-.chat-session-rail__status-row {
-  gap: 8px;
-  min-width: 0;
-  min-height: 18px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.chat-session-rail__status {
-  --rail-health-color: var(--muted);
-  gap: 5px;
-  /* Never shrink: the chip has no overflow clipping, so a squeezed box paints
-     its label over the pill headline next to it. */
-  flex: 0 0 auto;
-  color: var(--rail-health-color);
-  font-size: 11px;
-  font-weight: 650;
-  line-height: 1;
-}
-
-.chat-session-rail__status--critical {
-  padding: 4px 7px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--rail-health-color) 14%, transparent);
-  font-size: 10px;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.chat-session-rail__status-dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--rail-health-color);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rail-health-color) 13%, transparent);
-}
-
-.chat-session-rail__status-icon {
-  display: inline-flex;
-  width: 13px;
-  height: 13px;
-  flex: 0 0 auto;
-}
-
-.chat-session-rail__status-icon svg {
-  width: 100%;
-  height: 100%;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2;
-}
-
-.chat-session-rail__status[data-health="on-track"],
-.chat-session-rail__status[data-health="done"],
-.chat-session-rail__status[data-health="wrapping-up"] {
-  --rail-health-color: var(--ok);
-}
-
-.chat-session-rail__status[data-health="grinding"] {
-  --rail-health-color: var(--accent);
-}
-
-.chat-session-rail__status[data-health="stuck"],
-.chat-session-rail__status[data-health="waiting-on-user"] {
-  --rail-health-color: var(--warn);
-}
-
-.chat-session-rail__status[data-health="failed"] {
-  --rail-health-color: var(--danger);
-}
-
-.chat-session-rail__timing {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-session-rail__headline {
-  /* Block, not inline: ellipsis needs a block box inside the pill's expand
-     button, or the text hard-clips at the button edge. */
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text);
-  font-size: 12.5px;
-  font-weight: 650;
-  line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-session-rail__subtitle {
-  color: var(--muted);
-  font-size: 11.5px;
-}
-
-.chat-session-rail__expand {
-  min-width: 0;
-  flex: 1 1 auto;
-  padding: 4px;
-  overflow: hidden;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: var(--cursor-action);
-}
-
-.chat-session-rail__hide,
-.chat-session-rail__toggle {
-  color: var(--muted);
-}
-
-.chat-session-rail__actions {
-  gap: 2px;
-  flex: 0 0 auto;
-}
-
-.chat-session-rail__digest {
-  flex: 0 0 auto;
-  padding: 0 14px;
-}
-
-.chat-session-rail__assessment {
-  margin: 11px 0 0;
-  color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.45;
-}
-
-.chat-session-rail__prs {
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 11px;
-}
-
-.chat-session-rail__pr {
-  gap: 5px;
-  padding: 4px 7px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--text);
-  font-size: 10.5px;
-  line-height: 1;
-}
-
-.chat-session-rail__pr:hover {
-  border-color: var(--border-strong);
-  color: var(--text);
-}
-
-.chat-session-rail__pr-checks,
-.chat-session-rail__timestamp,
-.chat-session-rail__hint {
-  color: var(--muted);
-}
-
-.chat-session-rail__thread {
-  display: flex;
-  flex: 1 1 auto;
-  min-height: 96px;
-  flex-direction: column;
-  gap: 14px;
-  margin-top: 12px;
-  padding: 12px 14px 16px;
-  overflow-y: auto;
-  border-top: 1px solid var(--border);
-  user-select: text;
-  overscroll-behavior-y: contain;
-}
-
-/* No digest or embedded header means the thread would otherwise open with a
-   hanging divider and 12px gap. */
-.chat-session-rail__header + .chat-session-rail__thread,
-.chat-session-rail--embedded > .chat-session-rail__thread {
-  margin-top: 0;
-  border-top: 0;
-}
-
-/* Openers stack against the composer they feed, so the eye travels chips ->
-   input without crossing the thread. Left-aligned: they are actions, not
-   content, and centring them would read as a second empty state. */
-.chat-session-rail__starters {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 0 14px 10px;
-}
-
-.chat-session-rail__starter {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
-  color: var(--text);
-}
-
-/* strokeIcon already inlines fill/stroke/stroke-width on the svg. */
-.chat-session-rail__starter svg {
-  width: 12px;
-  height: 12px;
-  flex: 0 0 auto;
-  color: var(--muted);
-}
-
-.chat-session-rail__starter:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-.chat-session-rail__starter:disabled:hover {
-  border-color: var(--border);
-  transform: none;
-}
-
-.chat-session-rail__exchange {
-  display: grid;
-  gap: 6px;
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-
-.chat-session-rail__exchange + .chat-session-rail__exchange {
-  padding-top: 13px;
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-}
-
-.chat-session-rail__question {
-  justify-self: end;
-  max-width: 90%;
-  padding: 6px 9px;
-  border-radius: var(--radius-md) var(--radius-md) 3px var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--text);
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-
-.chat-session-rail__answer {
-  color: var(--text);
-}
-
-.chat-session-rail__answer > :first-child {
-  margin-top: 0;
-}
-
-.chat-session-rail__answer > :last-child {
-  margin-bottom: 0;
-}
-
-.chat-session-rail__timestamp {
-  font-size: 10.5px;
-}
-
-.chat-session-rail__hint {
-  font-size: 12px;
-}
-
-.chat-session-rail__exchange--error .chat-session-rail__hint {
-  color: var(--danger);
-}
-
-.chat-session-rail__retry {
-  justify-self: start;
-}
-
-.chat-session-rail__exchange--pending .chat-session-rail__hint {
-  animation: chat-session-rail-pending-pulse 1.4s ease-in-out infinite;
-}
-
-@keyframes chat-session-rail-pending-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-
-  50% {
-    opacity: 0.45;
-  }
-}
-
-.chat-session-rail__prompt {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.chat-session-rail__input {
-  width: 100%;
-  min-height: 34px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--card);
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
-}
-
-.chat-session-rail__input:focus {
-  border-color: var(--border-strong);
-  outline: none;
-}
-
-.chat-session-rail__input::placeholder {
-  color: var(--muted);
-}
-
-/* The docked form: a real column in the pane's flex row. It claims layout space
-   instead of painting over the thread, so nothing here may float, shadow, or
-   blur — those cues would read as an overlay again. */
-.chat-main--rail-docked .chat-session-rail--expanded {
-  position: static;
-  width: 100%;
-  height: 100%;
-  border-left-width: 0;
-}
-
-@media (max-width: 768px) {
-  /* The ambient pill stays a small chip above the composer. */
-  .chat-session-rail--pill {
-    position: fixed;
-    top: auto;
-    left: max(8px, var(--safe-area-left));
-    right: max(8px, var(--safe-area-right));
-    bottom: calc(108px + var(--safe-area-bottom));
-    z-index: 35;
-    width: auto;
-  }
-
-  /* No pane can hold a column at this width, so the companion takes the whole
-     surface rather than hovering over part of it. */
-  .chat-session-rail--expanded:not(.chat-session-rail--embedded) {
-    position: fixed;
-    z-index: 35;
-    inset: 0;
-    width: 100%;
-    padding-bottom: var(--safe-area-bottom);
-    border-width: 0;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .chat-session-rail,
-  .chat-session-rail__exchange--pending .chat-session-rail__hint {
-    animation: none;
   }
 }
 
@@ -3848,7 +3527,7 @@ td.data-table-key-col {
 }
 
 .agent-select__label {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3858,6 +3537,7 @@ td.data-table-key-col {
 .agent-select__chevron {
   display: inline-flex;
   flex: 0 0 auto;
+  margin-inline-start: auto;
   color: var(--muted);
 }
 
@@ -3871,6 +3551,44 @@ td.data-table-key-col {
   stroke-linejoin: round;
 }
 
+.agent-select--compact .agent-select__trigger,
+:root[data-theme-mode="light"] .agent-select--compact .agent-select__trigger {
+  width: auto;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.agent-select--compact .agent-select__trigger:hover:not(:disabled),
+.agent-select--compact .agent-select__trigger[aria-expanded="true"] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-hover) 84%, transparent);
+}
+
+.agent-select--compact .agent-select__avatar {
+  width: 16px;
+  height: 16px;
+}
+
+.agent-select--compact .agent-select__label {
+  max-width: min(32vw, 220px);
+}
+
+.agent-select--compact .agent-select__chevron {
+  margin-inline-start: 0;
+}
+
+@media (pointer: coarse) {
+  .agent-select--compact .agent-select__trigger {
+    min-height: 44px;
+  }
+}
+
 .agent-select__avatar {
   display: inline-flex;
   align-items: center;
@@ -3882,16 +3600,11 @@ td.data-table-key-col {
   object-fit: cover;
 }
 
-.agent-select__avatar--text,
 .agent-select__avatar--icon {
   background: var(--secondary);
   color: var(--muted);
   font-size: 11px;
   font-weight: 600;
-}
-
-.agent-select__avatar--text::before {
-  content: attr(data-avatar);
 }
 
 .agent-select__avatar--icon svg,
@@ -3929,6 +3642,23 @@ td.data-table-key-col {
   background: var(--menu-selected);
 }
 
+.agent-select__option-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-select__option-check {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.agent-select__option-check svg {
+  width: 14px;
+  height: 14px;
+}
+
 .agent-select__separator {
   height: 1px;
   margin: 6px 4px;
@@ -3940,6 +3670,13 @@ td.data-table-key-col {
   flex: 1;
   min-width: 0;
   gap: 1px;
+}
+
+.agent-select__option-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
 }
 
 .agent-select__option-label {
@@ -5417,6 +5154,7 @@ td.data-table-key-col {
 
 .device-pair-setup__body {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   justify-items: center;
   gap: 15px;
   padding: 0 28px 24px;
@@ -5564,7 +5302,19 @@ td.data-table-key-col {
 .device-pair-setup__command {
   display: grid;
   width: min(540px, 100%);
+  min-width: 0;
+  max-width: 100%;
   gap: 10px;
+}
+
+.device-pair-setup .login-gate__command {
+  min-width: 0;
+}
+
+.device-pair-setup .login-gate__command code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .device-pair-setup__meta {
@@ -5783,8 +5533,9 @@ td.data-table-key-col {
 }
 
 .session-row-host--draft-other {
+  --session-row-bg: color-mix(in srgb, var(--bg-muted) 44%, transparent);
   --draft-row-opacity: 0.58;
-  background: color-mix(in srgb, var(--bg-muted) 44%, transparent);
+  background: var(--session-row-bg);
 }
 
 .session-row-host--draft-other:hover,
@@ -6021,7 +5772,8 @@ td.data-table-key-col {
   animation: session-run-spin 1.6s linear infinite;
 }
 
-.session-glyph__ring--queued {
+.session-glyph__ring--queued,
+.session-glyph__trace--queued .session-glyph__trace-run {
   animation-play-state: paused;
 }
 
@@ -6031,11 +5783,25 @@ td.data-table-key-col {
   }
 }
 
+@keyframes session-run-trace {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .session-run-spinner,
   .session-glyph__ring {
     animation: none;
     border-color: var(--accent);
+  }
+
+  .session-glyph__trace-run {
+    display: none;
+  }
+
+  .session-glyph__trace-track {
+    stroke: var(--accent);
   }
 }
 
@@ -6209,12 +5975,4 @@ td.data-table-key-col {
 .person-activity-avatar-link {
   display: block;
   line-height: 0;
-}
-
-.plugin-ui-recovery {
-  position: fixed;
-  right: max(12px, env(safe-area-inset-right));
-  bottom: max(12px, env(safe-area-inset-bottom));
-  z-index: 110;
-  box-shadow: var(--shadow-md);
 }

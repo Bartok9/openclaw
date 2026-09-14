@@ -1,10 +1,10 @@
-/**
- * Gateway session store RPC tests.
- */
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, test, vi } from "vitest";
+/**
+ * Gateway session store RPC tests.
+ */
 import * as sessionDirs from "../agents/session-dirs.js";
 import {
   loadSessionEntry,
@@ -55,12 +55,7 @@ async function loadTranscriptRows(params: {
   sessionKey: string;
   storePath: string;
 }): Promise<unknown[]> {
-  return await loadTranscriptEvents({
-    agentId: "main",
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    storePath: params.storePath,
-  });
+  return await loadTranscriptEvents({ agentId: "main", ...params });
 }
 
 test("sessions.patch validates persistent session icons", async () => {
@@ -70,7 +65,8 @@ test("sessions.patch validates persistent session icons", async () => {
   });
   expect(invalid.error).toEqual({
     code: "INVALID_REQUEST",
-    message: "icon must be a single emoji or one of: braces, book, monitor, bot, kanban, coins",
+    message:
+      "icon must be a single emoji, a named icon (braces, book, monitor, bot, kanban, coins), or self-contained SVG markup/data URL up to 16 KiB",
   });
 });
 
@@ -157,6 +153,10 @@ test("lists and patches session store via sessions.* RPC", async () => {
     getSessionEventSubscriberConnIds: () => new Set<string>(),
     logGateway: { debug: vi.fn() },
     loadGatewayModelCatalog: async () => agentDiscoveryMock.models,
+    loadGatewayModelCatalogSnapshot: async () => ({
+      entries: agentDiscoveryMock.models,
+      routeVariants: agentDiscoveryMock.models,
+    }),
     getRuntimeConfig,
   };
   async function directSessionReq<TPayload = unknown>(
@@ -951,7 +951,7 @@ test("write-scoped operators manage chat organization but not admin session sett
       key: "agent:main:topic-a",
       label: "Sneaky",
       model: null,
-      thinkingLevel: "high",
+      verboseLevel: "full",
     });
     expect(mixedFieldsDenied.ok).toBe(false);
     expect(mixedFieldsDenied.error?.message).toContain("missing scope: operator.admin");

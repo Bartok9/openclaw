@@ -1,6 +1,14 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { readAcpSessionMetaBatch } from "../acp/runtime/session-meta.js";
+import {
+  readAcpSessionMeta,
+  readAcpSessionMetaForEntry,
+  readAcpSessionMetaBatch,
+} from "../acp/runtime/session-meta.js";
+import { resolveCurrentSessionAgentRuntimeMetadata } from "../agents/agent-runtime-metadata.js";
 import { readSessionRuntimeOwnership } from "../agents/harness/session-runtime-ownership.js";
+import { findModelCatalogEntry } from "../agents/model-catalog-lookup.js";
+import { selectModelCatalogRuntimeEntry } from "../agents/model-catalog-view.js";
+import type { ModelCatalogEntry } from "../agents/model-catalog.types.js";
 import {
   resolveSessionModelIdentityRef,
   resolveSessionModelRef,
@@ -8,7 +16,7 @@ import {
 import { buildSubagentSessionListReadIndex } from "../agents/subagents/registry/subagent-registry-read.js";
 import { resolveSessionStorePathCore, type SessionEntry } from "../config/sessions.js";
 import type { GatewayStoredSessionTargets } from "../config/sessions/combined-store-gateway.js";
-import { resolveConcreteSessionStorePath } from "../config/sessions/session-accessor.js";
+import { resolveConcreteSessionStorePath } from "../config/sessions/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import {
@@ -17,11 +25,12 @@ import {
 } from "../sessions/stored-model-overrides.js";
 import type { SessionEntryPair } from "./session-list-order.js";
 import { resolveStoredSessionKeyForAgentStore } from "./session-store-key.js";
-import { readRecentSessionUsageFromTranscript as readScopedRecentSessionUsageFromTranscript } from "./session-transcript-readers.js";
-import type {
-  GatewaySessionModelSource,
-  SessionActorProfileIdentity,
-  SessionListRowContext,
+import { readRecentSessionUsageFromTranscript as readScopedRecentSessionUsageFromTranscript } from "./session-transcript-usage.js";
+import {
+  createSessionRowModelCacheKey,
+  type GatewaySessionModelSource,
+  type SessionActorProfileIdentity,
+  type SessionListRowContext,
 } from "./session-utils-contracts.js";
 import { resolveEstimatedSessionCostUsd, resolvePositiveNumber } from "./session-utils-core.js";
 
@@ -29,10 +38,44 @@ export function buildSessionListRowMetadataContext(params: {
   now: number;
   userProfileIdentityById?: Map<string, SessionActorProfileIdentity | undefined>;
 }): SessionListRowContext {
+  const catalogEntries = new WeakMap<
+    ModelCatalogEntry[],
+    Map<string, ModelCatalogEntry | undefined>
+  >();
+  const runtimeEntries = new WeakMap<
+    readonly ModelCatalogEntry[],
+    Map<string, ReturnType<typeof selectModelCatalogRuntimeEntry>>
+  >();
   return {
     subagentRuns: buildSubagentSessionListReadIndex(params.now),
     selectedModelByOverrideRef: new Map(),
     thinkingMetadataByModelRef: new Map(),
+    findModelCatalogEntry: (catalog, query) => {
+      let entries = catalogEntries.get(catalog);
+      if (!entries) {
+        entries = new Map();
+        catalogEntries.set(catalog, entries);
+      }
+      const key = createSessionRowModelCacheKey(query.provider, query.modelId);
+      if (!entries.has(key)) {
+        entries.set(key, findModelCatalogEntry(catalog, query));
+      }
+      return entries.get(key);
+    },
+    selectModelCatalogRuntimeEntry: (selection) => {
+      let entries = runtimeEntries.get(selection.routeVariants);
+      if (!entries) {
+        entries = new Map();
+        runtimeEntries.set(selection.routeVariants, entries);
+      }
+      const key = `${selection.runtimeId}\0${createSessionRowModelCacheKey(selection.entry.provider, selection.entry.id)}`;
+      let selected = entries.get(key);
+      if (!selected) {
+        selected = selectModelCatalogRuntimeEntry(selection);
+        entries.set(key, selected);
+      }
+      return selected;
+    },
     displayModelIdentityByKey: new Map(),
     modelCostConfigByModelRef: new Map(),
     userProfileIdentityById: params.userProfileIdentityById ?? new Map(),
@@ -60,9 +103,15 @@ export function resolveSessionSelectedModelRef(params: {
   if (ownership?.modelRef) {
     return { ...ownership.modelRef, storedOverrideSource: null };
   }
-  const configuredDefault = resolveSessionModelRef(params.cfg, undefined, params.agentId, {
-    allowPluginNormalization: params.allowPluginNormalization,
-  });
+  const cachePrefix = `${normalizeAgentId(params.agentId)}\0${params.allowPluginNormalization !== false}\0`;
+  const defaultKey = `${cachePrefix}\0\0`;
+  let configuredDefault = params.rowContext?.selectedModelByOverrideRef.get(defaultKey);
+  if (!configuredDefault) {
+    configuredDefault = resolveSessionModelRef(params.cfg, undefined, params.agentId, {
+      allowPluginNormalization: params.allowPluginNormalization,
+    });
+    params.rowContext?.selectedModelByOverrideRef.set(defaultKey, configuredDefault);
+  }
   const storedOverride = resolveStoredModelOverride({
     // A prepared miss is authoritative; the presentation store can contain another owner's alias.
     loadSessionEntry: params.source.loadSessionEntry,
@@ -72,38 +121,38 @@ export function resolveSessionSelectedModelRef(params: {
     defaultProvider: configuredDefault.provider,
     allowPluginNormalization: params.allowPluginNormalization,
   });
-  const selectedEntry = storedOverride
-    ? {
-        providerOverride: storedOverride.provider,
-        modelOverride: storedOverride.model,
-        ...(storedOverride.routeResolution === "resolved"
-          ? { modelOverrideRouteResolution: "resolved" as const }
-          : {}),
-      }
-    : undefined;
+  if (!storedOverride) {
+    return { ...configuredDefault, storedOverrideSource: null };
+  }
+  const selectedEntry = {
+    providerOverride: storedOverride.provider,
+    modelOverride: storedOverride.model,
+    ...(storedOverride.routeResolution === "resolved"
+      ? { modelOverrideRouteResolution: "resolved" as const }
+      : {}),
+  };
   if (!params.rowContext) {
     return {
       ...resolveSessionModelRef(params.cfg, selectedEntry, params.agentId, {
         allowPluginNormalization: params.allowPluginNormalization,
       }),
-      storedOverrideSource: storedOverride?.source ?? null,
+      storedOverrideSource: storedOverride.source,
     };
   }
-  const key = [
-    normalizeAgentId(params.agentId),
-    selectedEntry?.providerOverride ?? "",
-    selectedEntry?.modelOverride ?? "",
-    storedOverride?.routeResolution ?? "",
-  ].join("\0");
+  const key = `${cachePrefix}${[
+    selectedEntry.providerOverride ?? "",
+    selectedEntry.modelOverride,
+    storedOverride.routeResolution,
+  ].join("\0")}`;
   const cached = params.rowContext.selectedModelByOverrideRef.get(key);
   if (cached) {
-    return { ...cached, storedOverrideSource: storedOverride?.source ?? null };
+    return { ...cached, storedOverrideSource: storedOverride.source };
   }
   const selected = resolveSessionModelRef(params.cfg, selectedEntry, params.agentId, {
     allowPluginNormalization: params.allowPluginNormalization,
   });
   params.rowContext.selectedModelByOverrideRef.set(key, selected);
-  return { ...selected, storedOverrideSource: storedOverride?.source ?? null };
+  return { ...selected, storedOverrideSource: storedOverride.source };
 }
 
 export function resolveTranscriptUsageFallback(params: {
@@ -222,4 +271,49 @@ export function populateSessionListAcpMetadata(params: {
   for (const { entry } of entries) {
     metadataByEntry.set(entry, metadata.get(entry));
   }
+}
+
+/** Runtime ownership is independent of whether the model itself can change. */
+export function resolveGatewaySessionRuntimeSelectionLocked(
+  entry: Pick<SessionEntry, "modelSelectionLocked"> | undefined,
+  acpMeta: SessionEntry["acp"],
+): boolean {
+  return entry?.modelSelectionLocked === true || acpMeta != null;
+}
+
+export function resolveGatewaySessionRuntimeProjection(params: {
+  cfg: OpenClawConfig;
+  provider: string;
+  model: string;
+  agentId: string;
+  sessionKey: string;
+  entry?: SessionEntry;
+  rowContext?: SessionListRowContext;
+}) {
+  const { cfg, agentId, sessionKey, entry } = params;
+  const cachedAcpMeta = params.rowContext?.acpSessionMetaByEntry;
+  // Keep metadata bound to the projected row; rereading its key can adopt a
+  // replacement lifecycle while projecting the original entry.
+  const acpMeta =
+    entry?.acp ??
+    (entry && cachedAcpMeta?.has(entry)
+      ? cachedAcpMeta.get(entry)
+      : entry
+        ? readAcpSessionMetaForEntry({ cfg, sessionKey, agentId, entry })
+        : readAcpSessionMeta({ sessionKey, agentId }));
+  const agentRuntime = resolveCurrentSessionAgentRuntimeMetadata({
+    cfg: params.cfg,
+    agentScope: { kind: "prepared", agentId: params.agentId },
+    provider: params.provider,
+    model: params.model,
+    sessionKey: params.sessionKey,
+    sessionEntry: params.entry,
+    acpRuntime: acpMeta != null,
+    acpBackend: acpMeta?.backend,
+  });
+  return {
+    acpMeta,
+    agentRuntime,
+    runtimeSelectionLocked: resolveGatewaySessionRuntimeSelectionLocked(entry, acpMeta),
+  };
 }

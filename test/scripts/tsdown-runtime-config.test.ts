@@ -1,6 +1,7 @@
 // Covers bundling rules encoded in the root tsdown config.
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { bundledPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "../../src/state/openclaw-agent-schema.js";
@@ -18,6 +19,10 @@ type TsdownConfigEntry = {
   entry?: Record<string, string> | string[];
   inputOptions?: TsdownInputOptions;
   minify?: unknown;
+  dts?: boolean | { emitDtsOnly?: boolean };
+  define?: Record<string, unknown>;
+  outputOptions?: { codeSplitting?: boolean; chunkFileNames?: string };
+  outExtensions?: () => { js: string };
   outDir?: string;
   plugins?: Array<{ name?: string }>;
 };
@@ -66,6 +71,24 @@ function entrySources(config: TsdownConfigEntry): Record<string, string> {
     return {};
   }
   return config.entry;
+}
+
+function requireStandaloneRuntimeGraph(entry: string): TsdownConfigEntry {
+  const graphs = asConfigArray(tsdownConfig).filter(
+    (config) =>
+      !(typeof config.dts === "object" && config.dts.emitDtsOnly) &&
+      entryKeys(config).includes(entry),
+  );
+  expect(graphs).toHaveLength(1);
+  return expectDefined(graphs[0], `${entry} standalone graph`);
+}
+
+function requireNativeHookRelayGraph(): TsdownConfigEntry {
+  const graphs = asConfigArray(tsdownConfig).filter((config) =>
+    entryKeys(config).includes("native-hook-relay/entry"),
+  );
+  expect(graphs).toHaveLength(1);
+  return expectDefined(graphs[0], "native hook relay graph");
 }
 
 function bundledEntry(pluginId: string): string {
@@ -162,36 +185,41 @@ describe("tsdown config", () => {
   it("installs schema inlining only on executable runtime graphs", () => {
     const configs = asConfigArray(tsdownConfig);
     const unifiedGraph = requireUnifiedDistGraph();
-    const workerGraph = configs.find((config) => {
-      const entry = config.entry;
-      return (
-        typeof entry === "object" &&
-        entry !== null &&
-        !Array.isArray(entry) &&
-        (entry as Record<string, unknown>)["worker/worker"] === "src/worker/worker-deploy-entry.ts"
-      );
-    });
+    const workerGraph = configs.find(
+      (config) => entrySources(config)["worker/worker"] === "src/worker/worker-deploy-entry.ts",
+    );
     const handoffGraph = configs.find((config) =>
       entryKeys(config).includes("managed-handoff-runtime"),
     );
-    const inlinePlugins = configs.flatMap(
-      (config) =>
-        config.plugins?.filter((plugin) => plugin.name === STATE_SCHEMA_INLINE_PLUGIN_NAME) ?? [],
-    );
+    const executableGraphs = new Set([
+      unifiedGraph,
+      expectDefined(workerGraph, "deploy worker graph"),
+      expectDefined(handoffGraph, "managed handoff graph"),
+      requireNativeHookRelayGraph(),
+      requireStandaloneRuntimeGraph("infra/sqlite-readonly-location.worker"),
+      requireStandaloneRuntimeGraph("agents/harness/native-hook-relay-client.worker"),
+    ]);
 
-    expect(unifiedGraph.plugins).toContainEqual(
-      expect.objectContaining({ name: STATE_SCHEMA_INLINE_PLUGIN_NAME }),
+    for (const config of configs) {
+      const inlinePlugins =
+        config.plugins?.filter((plugin) => plugin.name === STATE_SCHEMA_INLINE_PLUGIN_NAME) ?? [];
+      expect(inlinePlugins).toHaveLength(executableGraphs.has(config) ? 1 : 0);
+    }
+  });
+
+  it("isolates relay startup from shared runtime chunks while retaining lazy fallback", () => {
+    const relay = requireNativeHookRelayGraph();
+    expect(entrySources(relay)).toEqual({
+      "native-hook-relay/entry": "src/cli/native-hook-relay-entry.ts",
+    });
+    expect(relay).not.toBe(requireUnifiedDistGraph());
+    expect(relay.dts).toBe(false);
+    expect(relay.outputOptions?.codeSplitting).not.toBe(false);
+    expect(relay.outputOptions?.chunkFileNames).toBe("native-hook-relay/[name]-[hash].mjs");
+    // Only the shared graph may publish the global plugin ownership manifest.
+    expect(relay.plugins).not.toContainEqual(
+      expect.objectContaining({ name: "openclaw:runtime-dependency-ownership" }),
     );
-    expect(workerGraph?.plugins).toContainEqual(
-      expect.objectContaining({ name: STATE_SCHEMA_INLINE_PLUGIN_NAME }),
-    );
-    expect(handoffGraph?.plugins).toContainEqual(
-      expect.objectContaining({ name: STATE_SCHEMA_INLINE_PLUGIN_NAME }),
-    );
-    expect(entrySources(unifiedGraph)["native-hook-relay/entry"]).toBe(
-      "src/cli/native-hook-relay-entry.ts",
-    );
-    expect(inlinePlugins).toHaveLength(3);
   });
 
   it("keeps core, plugin runtime, plugin-sdk, bundled root plugins, and bundled hooks in one dist graph", () => {
@@ -205,11 +233,9 @@ describe("tsdown config", () => {
       "agents/models-config.runtime",
       "cli/gateway-lifecycle.runtime",
       "agents/compaction-planning.worker",
-      "agents/model-provider-auth.worker",
       "config/sessions/session-accessor.sqlite-archive.worker",
-      "infra/sqlite-readonly-location.worker",
+      "plugin-sdk/sqlite-runtime",
       "state/openclaw-database-verify.worker",
-      "system-agent/setup-inference-detection.worker",
       "plugins/memory-state",
       "subagent-registry.runtime",
       "task-registry-control.runtime",
@@ -232,6 +258,25 @@ describe("tsdown config", () => {
     ]) {
       expect(keys).toContain(entry);
     }
+  });
+
+  it.each([
+    {
+      label: "read-only snapshot child",
+      entry: "infra/sqlite-readonly-location.worker",
+      source: "src/infra/sqlite-readonly-location.worker.ts",
+    },
+    {
+      label: "native hook locator worker",
+      entry: "agents/harness/native-hook-relay-client.worker",
+      source: "src/agents/harness/native-hook-relay-client.worker.ts",
+    },
+  ])("emits the $label once without sealing its package loaders", ({ entry, source }) => {
+    const child = requireStandaloneRuntimeGraph(entry);
+    expect(entrySources(child)).toEqual({ [entry]: path.resolve(source) });
+    expect(child.outputOptions).toEqual({ codeSplitting: false });
+    expect(child.outExtensions?.().js).toBe(".js");
+    expect(child.define?.SEALED_RUNTIME_BUILD).toBeUndefined();
   });
 
   it("builds the Docker healthcheck as a stable dist entry", () => {
@@ -341,20 +386,25 @@ describe("tsdown config", () => {
   });
 
   it("bundles SDK-owned helpers while retaining fs-safe package ownership", () => {
-    const unifiedGraph = requireUnifiedDistGraph();
-    const alwaysBundle = unifiedGraph.deps?.alwaysBundle;
+    for (const graph of [
+      requireUnifiedDistGraph(),
+      requireStandaloneRuntimeGraph("infra/sqlite-readonly-location.worker"),
+    ]) {
+      const alwaysBundle = graph.deps?.alwaysBundle;
+      const external = graph.inputOptions?.({})?.external;
+      if (typeof alwaysBundle !== "function" || typeof external !== "function") {
+        throw new Error("expected runtime graph dependency predicates");
+      }
 
-    if (typeof alwaysBundle !== "function") {
-      throw new Error("expected unified graph alwaysBundle predicate");
+      expect(alwaysBundle("@openclaw/fs-safe")).toBe(false);
+      expect(alwaysBundle("@openclaw/fs-safe/path")).toBe(false);
+      expect(external("@openclaw/fs-safe/path", undefined, false)).toBe(true);
+      expect(alwaysBundle("openclaw/plugin-sdk/ssrf-runtime-internal")).toBe(true);
+      expect(alwaysBundle("openclaw/plugin-sdk/ssrf-runtime")).toBe(false);
+      expect(alwaysBundle("zod")).toBe(true);
+      expect(alwaysBundle("zod/v4/core")).toBe(true);
+      expect(alwaysBundle("not-a-runtime-dependency")).toBe(false);
     }
-
-    expect(alwaysBundle("@openclaw/fs-safe")).toBe(false);
-    expect(alwaysBundle("@openclaw/fs-safe/path")).toBe(false);
-    expect(alwaysBundle("openclaw/plugin-sdk/ssrf-runtime-internal")).toBe(true);
-    expect(alwaysBundle("openclaw/plugin-sdk/ssrf-runtime")).toBe(false);
-    expect(alwaysBundle("zod")).toBe(true);
-    expect(alwaysBundle("zod/v4/core")).toBe(true);
-    expect(alwaysBundle("not-a-runtime-dependency")).toBe(false);
   });
 
   it("suppresses unresolved imports from extension source", () => {

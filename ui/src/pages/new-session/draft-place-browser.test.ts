@@ -122,6 +122,32 @@ function createBrowser(
 }
 
 describe("DraftPlaceBrowser", () => {
+  it("keeps environment search transient and separate from project search", () => {
+    const { browser } = createBrowser(async () => ({}));
+    const writeStorage = vi.spyOn(Storage.prototype, "setItem");
+    onTestFinished(() => writeStorage.mockRestore());
+    browser.changeProjectQuery("openclaw");
+    browser.onPopoverShow("where");
+    browser.changeEnvironmentQuery("runner");
+
+    expect(browser.environmentQuery).toBe("runner");
+    expect(browser.projectQuery).toBe("openclaw");
+    expect(writeStorage).not.toHaveBeenCalled();
+
+    browser.onPopoverHide("where");
+    browser.onPopoverAfterHide("where");
+    browser.onPopoverShow("where");
+    expect(browser.environmentQuery).toBe("");
+    expect(browser.projectQuery).toBe("openclaw");
+
+    browser.changeEnvironmentQuery("cloud");
+    browser.onPopoverShow("project");
+    expect(browser.environmentQuery).toBe("cloud");
+    browser.disconnect();
+    expect(browser.environmentQuery).toBe("");
+    expect(writeStorage).not.toHaveBeenCalled();
+  });
+
   it("keeps the current listing's repository probe while filtering its entries", async () => {
     const branches = createDeferred<{ repositoryStatus: "git" }>();
     const request = vi.fn(async (method: string) => {
@@ -585,6 +611,7 @@ describe("DraftGatewayState", () => {
     expect(loadNewSessionPreference("ws://gateway.example", "main")).toEqual({
       folder: "/workspace/ordinary",
       worktree: true,
+      freshWorkspace: false,
     });
   });
 });

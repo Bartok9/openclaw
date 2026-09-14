@@ -12,10 +12,8 @@ import {
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { publishSessionStateArchives } from "./session-accessor.sqlite-archive-store.js";
-import {
-  materializeSessionStateDeletePlans,
-  type SessionStateDeletePlan,
-} from "./session-accessor.sqlite-archive.js";
+import type { SessionStateDeletePlan } from "./session-accessor.sqlite-archive-types.js";
+import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
 import type { SessionLifecycleArchivedTranscript } from "./session-accessor.sqlite-contract.js";
 import {
   runSqliteSessionDeletionTransaction as runOpenClawAgentWriteTransaction,
@@ -369,13 +367,6 @@ export function applySessionEntryMaintenance(
     params.activeSessionKey ?? "",
     ...(params.activeSessionKeys ?? []),
   ]);
-  const keyProjection = readSessionMaintenanceKeyProjection(database);
-  const preserveKeys =
-    collectSessionMaintenancePreserveKeysForStore({
-      storePath: params.storePath,
-      store: keyProjection,
-      baseKeys: collectSqliteSessionMaintenanceBaseKeys(keyProjection, activeSessionKeys),
-    }) ?? new Set<string>();
   const removalReasons = new Map<
     string,
     NonNullable<SessionEntryMaintenancePlan["entryRemovals"][number]["maintenanceReason"]>
@@ -387,7 +378,14 @@ export function applySessionEntryMaintenance(
       maintenance,
       initialUnarchivedCount: entryCount,
       forceMaintenance: params.forceMaintenance,
-      preserveKeys,
+      readPreserveKeys: () => {
+        const keyProjection = readSessionMaintenanceKeyProjection(database);
+        return collectSessionMaintenancePreserveKeysForStore({
+          storePath: params.storePath,
+          store: keyProjection,
+          baseKeys: collectSqliteSessionMaintenanceBaseKeys(keyProjection, activeSessionKeys),
+        });
+      },
       log: false,
       readAgeCandidates: (minimumAgeMs) =>
         readSessionMaintenanceAgeCandidates({ database, minimumAgeMs }),
@@ -409,15 +407,18 @@ export function applySessionEntryMaintenance(
   const selectedEntries = readSessionEntryStore(database, { sessionKeys: selectedKeys });
   const archivedWorktrees: NonNullable<SessionEntryMaintenancePlan["archivedWorktrees"]> = [];
   for (const key of archivedKeys) {
-    const entry = selectedEntries[key];
+    const previousEntry = selectedEntries[key];
     const planned = store[key];
-    if (!entry || !planned?.archivedAt) {
+    if (!previousEntry || !planned?.archivedAt) {
       continue;
     }
-    entry.archivedAt = planned.archivedAt;
+    const entry = {
+      ...previousEntry,
+      archivedAt: planned.archivedAt,
+      archiveReason: planned.archiveReason,
+    };
     delete entry.archivedBy;
-    entry.archiveReason = planned.archiveReason;
-    writeSessionEntry(database, key, entry);
+    writeSessionEntry(database, key, entry, { canonicalPreviousEntry: previousEntry });
     if (entry.worktree) {
       archivedWorktrees.push({
         entry: cloneSessionEntry(entry),

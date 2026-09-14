@@ -117,6 +117,28 @@ const PACKED_PLUGIN_SDK_TYPESCRIPT_SMOKE_FIXTURE = new URL(
   "./fixtures/packed-plugin-sdk-type-smoke.ts",
   import.meta.url,
 );
+const PACKED_PLUGIN_SDK_SETUP_CONSUMER_FIXTURE = new URL(
+  "./fixtures/packed-plugin-sdk-setup-consumer.ts",
+  import.meta.url,
+);
+const PACKED_PLUGIN_SDK_SETUP_DECLARATIONS = [
+  "dist/plugin-sdk/setup.d.ts",
+  "dist/plugin-sdk/setup-runtime.d.ts",
+] as const;
+const PACKED_PLUGIN_SDK_SETUP_SURFACE_OMISSION_VERSIONS = new Set(["2026.7.33"]);
+
+export function packedPluginSdkSupportsSetupSurface(installedOpenClawRoot: string): boolean {
+  return PACKED_PLUGIN_SDK_SETUP_DECLARATIONS.every((relativePath) => {
+    const declarationPath = join(installedOpenClawRoot, relativePath);
+    return (
+      existsSync(declarationPath) && readFileSync(declarationPath, "utf8").includes("setupSurface")
+    );
+  });
+}
+
+export function packedPluginSdkMayOmitSetupSurface(packageVersion: string): boolean {
+  return PACKED_PLUGIN_SDK_SETUP_SURFACE_OMISSION_VERSIONS.has(packageVersion);
+}
 const PACKED_BUNDLED_CHANNEL_ENTRY_SMOKE_ENTRYPOINTS = [
   "scripts/test-built-bundled-channel-entry-smoke.mts",
   "scripts/test-built-bundled-channel-entry-smoke.mjs",
@@ -730,6 +752,7 @@ export function createPackedPluginSdkTypescriptSmokeProject(params: {
           noEmit: true,
           strict: true,
           skipLibCheck: false,
+          types: ["node"],
           target: "ES2022",
         },
         include: ["src/index.ts"],
@@ -743,6 +766,10 @@ export function createPackedPluginSdkTypescriptSmokeProject(params: {
     PACKED_PLUGIN_SDK_TYPESCRIPT_SMOKE_FIXTURE,
     join(params.consumerDir, "src", "index.ts"),
   );
+  copyFileSync(
+    PACKED_PLUGIN_SDK_SETUP_CONSUMER_FIXTURE,
+    join(params.consumerDir, "src", "packed-plugin-sdk-setup-consumer.ts"),
+  );
 }
 
 function runPackedPluginSdkTypescriptSmoke(
@@ -750,36 +777,75 @@ function runPackedPluginSdkTypescriptSmoke(
   tmpRoot: string,
   localPackageTarballs: string[],
 ): void {
-  const consumerDir = join(tmpRoot, "plugin-sdk-type-consumer");
   const aiTarball = localPackageTarballs.find(
     (localPackageTarball) => localPackageNameForTarball(localPackageTarball) === "@openclaw/ai",
   );
-  createPackedPluginSdkTypescriptSmokeProject({
-    consumerDir,
-    packageSpec: `file:${tarballPath}`,
-    aiPackageSpec: aiTarball ? `file:${aiTarball}` : undefined,
-  });
-  execNpm(["install", "--ignore-scripts", "--no-audit", "--no-fund"], {
-    cwd: consumerDir,
-    encoding: "utf8",
-    stdio: "inherit",
-  });
-
-  const installedOpenClawRoot = join(consumerDir, "node_modules", "openclaw");
-  const tscPath = [
-    join(consumerDir, "node_modules", "typescript", "bin", "tsc"),
-    join(installedOpenClawRoot, "node_modules", "typescript", "bin", "tsc"),
-  ].find((candidate) => existsSync(candidate));
-  if (!tscPath) {
-    throw new Error("release-check: packed plugin SDK TypeScript smoke could not find tsc.");
-  }
-  runReleaseCheckCommand(
-    { command: process.execPath, args: [tscPath, "-p", "tsconfig.json", "--pretty", "false"] },
+  for (const target of [
     {
-      cwd: consumerDir,
-      stdio: "inherit",
+      name: "plugin-sdk-released-setup-consumer",
+      packageSpec: "2026.9.4",
+      aiPackageSpec: undefined,
+      setupConsumerOnly: true,
     },
-  );
+    {
+      name: "plugin-sdk-type-consumer",
+      packageSpec: `file:${tarballPath}`,
+      aiPackageSpec: aiTarball ? `file:${aiTarball}` : undefined,
+      setupConsumerOnly: false,
+    },
+  ]) {
+    const consumerDir = join(tmpRoot, target.name);
+    createPackedPluginSdkTypescriptSmokeProject({ consumerDir, ...target });
+    if (target.setupConsumerOnly) {
+      copyFileSync(PACKED_PLUGIN_SDK_SETUP_CONSUMER_FIXTURE, join(consumerDir, "src", "index.ts"));
+    }
+    console.log(`release-check: compiling ${target.name} against ${target.packageSpec}`);
+    execNpm(["install", "--ignore-scripts", "--no-audit", "--no-fund"], {
+      cwd: consumerDir,
+      encoding: "utf8",
+      stdio: "inherit",
+    });
+
+    const installedOpenClawRoot = join(consumerDir, "node_modules", "openclaw");
+    if (!target.setupConsumerOnly && !packedPluginSdkSupportsSetupSurface(installedOpenClawRoot)) {
+      const installedPackageVersion = (
+        JSON.parse(readFileSync(join(installedOpenClawRoot, "package.json"), "utf8")) as {
+          version?: unknown;
+        }
+      ).version;
+      if (
+        typeof installedPackageVersion !== "string" ||
+        !packedPluginSdkMayOmitSetupSurface(installedPackageVersion)
+      ) {
+        throw new Error(
+          `release-check: packed plugin SDK ${String(installedPackageVersion)} is missing setupSurface declarations`,
+        );
+      }
+      const indexPath = join(consumerDir, "src", "index.ts");
+      writeFileSync(
+        indexPath,
+        readFileSync(indexPath, "utf8").replace(
+          'import "./packed-plugin-sdk-setup-consumer.js";\n',
+          "",
+        ),
+      );
+    }
+    const tscPath = [
+      join(consumerDir, "node_modules", "typescript", "bin", "tsc"),
+      join(installedOpenClawRoot, "node_modules", "typescript", "bin", "tsc"),
+    ].find((candidate) => existsSync(candidate));
+    if (!tscPath) {
+      throw new Error("release-check: packed plugin SDK TypeScript smoke could not find tsc.");
+    }
+    runReleaseCheckCommand(
+      { command: process.execPath, args: [tscPath, "-p", "tsconfig.json", "--pretty", "false"] },
+      {
+        cwd: consumerDir,
+        stdio: "inherit",
+      },
+    );
+    console.log(`release-check: ${target.name} compiled successfully`);
+  }
 }
 
 export function writePackedBundledPluginActivationConfig(homeDir: string): void {

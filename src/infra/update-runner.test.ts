@@ -8,6 +8,7 @@ import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 import { pathExists } from "../utils.js";
+import * as container from "./container-environment.js";
 import { resolveStableNodePath } from "./stable-node-path.js";
 import type { UpdateChannel } from "./update-channels.js";
 import type { DevUpdateTarget } from "./update-dev-target.js";
@@ -451,6 +452,7 @@ describe("runGatewayUpdate", () => {
   type TestCommandOptions = {
     env?: NodeJS.ProcessEnv;
     cwd?: string;
+    input?: string | Uint8Array;
     timeoutMs?: number;
   };
 
@@ -660,6 +662,7 @@ describe("runGatewayUpdate", () => {
         }
         return await runCommandWithTimeout(argv, {
           cwd: options.cwd,
+          input: options.input,
           env: options.env,
           timeoutMs: options.timeoutMs ?? 5000,
         });
@@ -860,7 +863,7 @@ describe("runGatewayUpdate", () => {
       code: 0,
       stdout: " M README.md",
       stderr: "",
-      status: "skipped",
+      status: "error",
       reason: "dirty",
     },
     {
@@ -889,7 +892,11 @@ describe("runGatewayUpdate", () => {
         [`git -C ${tempDir} status --porcelain -- :!dist/control-ui/`]: { code, stdout, stderr },
       });
 
-      const result = await runWithRunner(runner, { beforeGitMutation });
+      const onStepComplete = vi.fn();
+      const result = await runWithCommand(runner, {
+        beforeGitMutation,
+        progress: { onStepComplete },
+      });
 
       expect(result.status).toBe(status);
       expect(result.reason).toBe(reason);
@@ -901,11 +908,16 @@ describe("runGatewayUpdate", () => {
       expect(result.steps).toMatchObject([
         {
           name: "clean check",
-          exitCode: code,
+          exitCode: reason === "dirty" ? 1 : code,
           stdoutTail: stdout || null,
-          stderrTail: stderr || null,
+          stderrTail:
+            reason === "dirty" ? expect.stringContaining("local changes") : stderr || null,
         },
       ]);
+      expect(onStepComplete).toHaveBeenCalledOnce();
+      expect(onStepComplete).toHaveBeenCalledWith(
+        expect.objectContaining({ exitCode: reason === "dirty" ? 1 : code }),
+      );
       expect(beforeGitMutation).not.toHaveBeenCalled();
       expect(calls.some((call) => call.includes(" fetch "))).toBe(false);
       expect(calls.filter((call) => call.includes("rebase"))).toEqual([]);
@@ -3056,6 +3068,7 @@ describe("runGatewayUpdate", () => {
   });
 
   it("skips update when no git root", async () => {
+    vi.spyOn(container, "isContainerEnvironment").mockReturnValueOnce(false);
     await fs.writeFile(
       path.join(tempDir, "package.json"),
       JSON.stringify({ name: "openclaw", packageManager: PNPM_PACKAGE_MANAGER }),
@@ -3071,7 +3084,8 @@ describe("runGatewayUpdate", () => {
     const result = await runWithRunner(runner);
 
     expect(result.status).toBe("skipped");
-    expect(result.reason).toBe("not-git-install");
+    expect(result.reason).toBe("unmanaged-package-install");
+    expect(result.recovery).toBeUndefined();
     const pnpmGlobalInstallCalls = calls.filter((call) => call.startsWith("pnpm add -g"));
     const npmGlobalInstallCalls = calls.filter((call) => call.startsWith("npm i -g"));
     expect(pnpmGlobalInstallCalls).toStrictEqual([]);
@@ -3098,7 +3112,7 @@ describe("runGatewayUpdate", () => {
       status: "skipped",
       mode: "unknown",
       root: pkgRoot,
-      reason: "not-git-install",
+      reason: "package-update-requires-cli",
       before: { version: "1.0.0" },
       steps: [],
     });

@@ -14,6 +14,11 @@ without applying lint defaults to declaration preparation. Explicit Go settings
 remain inherited. Frozen revisions retain the workflow limits because their
 wrappers can predate this policy.
 
+On serial hosts with less than 24 GiB of memory, full lint runs core targets in
+five disjoint batches and plugins in smaller chunks. These runs retain the same
+type-aware rules and TypeScript configuration while bounding checker caches.
+Explicit split-core and parallel execution selections remain unchanged.
+
 Oxlint keeps `eslint/no-redeclare` enabled for JavaScript. For `.ts`, `.tsx`,
 `.mts`, and `.cts`, `tsgo` owns declaration validity, including intentional
 type/value pairs with the same public name. `eslint/no-var` remains enabled
@@ -132,7 +137,7 @@ is not generic compute offload. `.crabbox.yaml` defaults remote proof to
 credentials, so untrusted contributor or fork code must use secretless fork CI
 or sanitized direct AWS Crabbox instead.
 The wrapper uses the bundled Crabbox plugin's binary manager. OpenClaw supports
-the current Crabbox CLI contract, starting at 0.55.0. If the selected binary is
+the current Crabbox CLI contract, starting at 0.56.0. If the selected binary is
 missing or older, the plugin installs a verified current release in its own
 managed directory before provider discovery or lease work. It leaves the original
 binary untouched. Provider readiness and broker authentication still determine
@@ -385,6 +390,24 @@ pnpm crabbox:stop -- --provider aws <cbx_id-or-slug>
 Under AWS pressure, avoid `class=beast` unless the task really needs 48xlarge-class CPU. A `beast` request starts at 192 vCPUs and is the easiest way to trip regional EC2 Spot or On-Demand Standard quota. The repo-owned `.crabbox.yaml` defaults to `class: standard`, on-demand market, and `capacity.hints: true` so brokered AWS leases print selected region/market, quota pressure, Spot fallback, and high-pressure class warnings. Use `fast` for heavier broad checks, `large` only after standard/fast are not enough, and `beast` only for exceptional CPU-bound lanes such as full-suite or all-plugin Docker matrices, explicit release/blocker validation, or high-core performance profiling. Do not use `beast` for `pnpm check:changed`, focused tests, docs-only work, ordinary lint/typecheck, small E2E repros, or Blacksmith outage triage. Use `--market on-demand` for capacity diagnosis so Spot market churn is not mixed into the signal.
 
 `.crabbox.yaml` owns provider, sync, and GitHub Actions hydration defaults. Crabbox sync never transfers `.git`, so the hydrated Actions checkout keeps its own remote Git metadata instead of syncing maintainer-local remotes and object stores, and the repo config additionally excludes local runtime/build artifacts (such as `.artifacts` and test reports) that should never be transferred. `.github/workflows/crabbox-hydrate.yml` owns checkout, Node/pnpm setup, `origin/main` fetch, and the non-secret environment handoff for owned-cloud `crabbox run --id <cbx_id>` commands.
+
+Linux hydration keeps physical workspace `node_modules` directories and pnpm's
+default `.pnpm` virtual store. Only the package-content store uses the persistent
+`/var/cache/crabbox/pnpm/store` volume; its fallback lives at
+`.cache/openclaw-pnpm-store` beside the workspace dependencies. Ordinary POSIX
+sync preserves these ignored directories, so frozen reinstalls and later build
+commands use the same owned install. Hydration checks the tooling loader before
+marking the lease ready. When rehydrating an older lease, the workflow retires
+only its former root links to `/var/tmp/openclaw-pnpm/node_modules` or
+`${XDG_CACHE_HOME:-$RUNNER_TEMP/cache}/openclaw/pnpm/install/node_modules` before
+installing physical workspace dependencies, including links whose runner cache
+was already cleared. It preserves external package caches and unrelated
+dependency links.
+
+Native Windows daemon hydration retains its external dependency junction because
+released Crabbox native Windows delete-sync replaces workspace contents. Move
+that route to physical workspace dependencies only with a Crabbox sync version
+that preserves generated dependency directories.
 
 ## Related
 

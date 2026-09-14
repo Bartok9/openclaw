@@ -12,6 +12,7 @@ import {
   getLoadedRuntimePluginRegistry,
   registryContainsRuntimePluginIds,
 } from "./active-runtime-registry.js";
+import { normalizePluginsConfig } from "./config-state.js";
 import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "./installed-plugin-index-install-records.js";
 import { resolvePluginRegistrationConfigKey } from "./loader-registration-config.js";
@@ -19,7 +20,7 @@ import type { PluginLoadOptions } from "./loader-types.js";
 import { resolvePluginControlPlaneFingerprint } from "./plugin-control-plane-context.js";
 import { resolvePluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 import type { PluginMetadataRegistryView } from "./plugin-metadata-snapshot.types.js";
-import { hasCompletedPluginRuntimeRegistration } from "./plugin-runtime-artifact-selection.js";
+import { hasCompletedPluginRuntimeRegistration } from "./plugin-runtime-artifact-binding.js";
 import { hasExplicitPluginIdScope } from "./plugin-scope.js";
 import { resolveProviderConfigApiOwnerHint } from "./provider-config-owner.js";
 import {
@@ -416,15 +417,18 @@ export function createProviderRegistryResolver(dependencies: {
     const { inputs, snapshot } = prepared;
     let { loadOptions } = prepared;
     const { env, workspaceDir } = inputs;
-    const registrationConfigKey =
-      !generationRegistry && params.config !== undefined
-        ? resolvePluginRegistrationConfigKey(
-            loadOptions ?? {
-              config: params.config,
-              activationSourceConfig: resolvePluginActivationSourceConfig(params),
-            },
-          )
-        : undefined;
+    let registrationConfigKey: string | undefined;
+    if (!generationRegistry && params.config !== undefined) {
+      const registrationConfig = loadOptions ?? {
+        config: params.config,
+        activationSourceConfig: resolvePluginActivationSourceConfig(params),
+      };
+      registrationConfigKey = resolvePluginRegistrationConfigKey({
+        runtimeEntries: normalizePluginsConfig(registrationConfig.config?.plugins).entries,
+        sourceEntries: normalizePluginsConfig(registrationConfig.activationSourceConfig?.plugins)
+          .entries,
+      });
+    }
     if (params.skipIfLoadInFlight && loadOptions && isPluginRegistryLoadInFlight(loadOptions)) {
       return undefined;
     }
@@ -572,17 +576,21 @@ export function createProviderRegistryResolver(dependencies: {
 
   function resolvePluginProvidersCore(
     params: Parameters<typeof resolvePluginProviderRegistryCore>[0],
-    onSelectedRegistry?: (registry: PluginRegistry) => void,
+    onSelectedRegistry?: (
+      registry: PluginRegistry,
+    ) => ((provider: ProviderPlugin, pluginId: string) => ProviderPlugin) | undefined,
   ): ProviderPlugin[] {
     const resolved = resolvePluginProviderRegistryCore(params);
     if (!resolved) {
       return [];
     }
     const { registry, onlyPluginIds } = resolved;
-    onSelectedRegistry?.(registry);
+    const project =
+      onSelectedRegistry?.(registry) ??
+      ((provider: ProviderPlugin, pluginId: string) => Object.assign({}, provider, { pluginId }));
     return registry.providers
       .filter((entry) => !onlyPluginIds || onlyPluginIds.includes(entry.pluginId))
-      .map((entry) => Object.assign({}, entry.provider, { pluginId: entry.pluginId }));
+      .map((entry) => project(entry.provider, entry.pluginId));
   }
 
   return {

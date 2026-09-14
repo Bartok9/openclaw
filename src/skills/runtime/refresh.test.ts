@@ -25,7 +25,6 @@ const pluginSkillsMocks = vi.hoisted(() => ({
 }));
 
 let refreshModule: typeof import("./refresh.js");
-let refreshTestSupport: typeof import("./refresh.test-support.js");
 let fixtureRoot: string;
 let fixtureWorkspaceDir: string;
 
@@ -47,7 +46,6 @@ vi.mock("../loading/plugin-skills.js", () => ({
 describe("ensureSkillsWatcher", () => {
   beforeAll(async () => {
     refreshModule = await import("./refresh.js");
-    refreshTestSupport = await import("./refresh.test-support.js");
   });
 
   beforeEach(async () => {
@@ -55,7 +53,9 @@ describe("ensureSkillsWatcher", () => {
     createdWatchers.length = 0;
     pluginSkillsMocks.resolvePluginSkillRoots.mockClear();
     pluginSkillsMocks.resolvePluginSkillRootsFromMetadata.mockClear();
-    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-watch-fixture-"));
+    fixtureRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-watch-fixture-")),
+    );
     fixtureWorkspaceDir = await createFixtureDirectory("workspace");
     await createFixtureDirectory("workspace/skills");
   });
@@ -63,7 +63,7 @@ describe("ensureSkillsWatcher", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     vi.useRealTimers();
-    await refreshTestSupport.resetSkillsRefreshForTest();
+    await refreshModule.closeSkillsWatchers(true);
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   });
 
@@ -822,6 +822,7 @@ describe("ensureSkillsWatcher", () => {
   );
 
   it("refreshes skills snapshots when watched skill roots change", async () => {
+    vi.useFakeTimers();
     const sharedA = await createFixtureDirectory("shared-a");
     const sharedB = await createFixtureDirectory("shared-b");
     const seen: SkillsChangeEvent[] = [];
@@ -848,6 +849,20 @@ describe("ensureSkillsWatcher", () => {
         reason: "watch-targets",
         changedPath: expect.stringContaining(sharedB.replaceAll("\\", "/")),
       },
+    ]);
+    seen.length = 0;
+    const replacement = watchForSkillRoot(sharedB).watcher;
+    for (const watcher of createdWatchers) {
+      if (watcher !== replacement) {
+        watcher.emit("ready");
+      }
+    }
+    await vi.advanceTimersByTimeAsync(250);
+    expect(seen).toEqual([]);
+    replacement.emit("ready");
+    await vi.advanceTimersByTimeAsync(250);
+    expect(seen).toEqual([
+      { workspaceDir: fixtureWorkspaceDir, reason: "watch", changedPath: undefined },
     ]);
   });
 
@@ -958,6 +973,13 @@ describe("ensureSkillsWatcher", () => {
         event === "change" ? path.join(sharedRoot, "demo", "SKILL.md") : undefined;
       const watcher = watchForSkillRoot(sharedRoot).watcher;
       if (event === "ready") {
+        for (const other of createdWatchers) {
+          if (other !== watcher) {
+            other.emit("ready");
+          }
+        }
+        await vi.advanceTimersByTimeAsync(250);
+        expect(seen).toEqual([]);
         watcher.emit("ready");
       } else {
         watcher.emit("all", event, changedPath);

@@ -386,6 +386,8 @@ publish and sync.
     Managed `~/.openclaw/skills` and personal `~/.agents/skills` may contain
     symlinked skill folders, but every `SKILL.md` realpath must still stay
     inside its resolved skill directory.
+    Optional `skill-card.md` files must be regular files inside that directory
+    and no larger than 256 KiB, including when they grow during a read.
   </Accordion>
   <Accordion title="Operator install policy">
     Configure `security.installPolicy` to run a trusted local policy command
@@ -758,6 +760,10 @@ restoring watch capacity to enable native watching again.
 
     Offline nodes do **not** make remote-only skills visible. If a node stops
     answering bin probes, OpenClaw clears its cached bin matches.
+
+    Connect-time bin probes wait briefly for the node's command handlers.
+    Gateway shutdown cancels this readiness wait and still joins probes that
+    have already started.
 
   </Accordion>
 </AccordionGroup>

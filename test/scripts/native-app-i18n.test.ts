@@ -190,6 +190,30 @@ describe("native app i18n inventory", () => {
     },
   );
 
+  it.each([
+    { surface: "apple", value: "Before \\(outer(inner(value))) after" },
+    { surface: "apple", value: 'Before \\(format(")", "escaped \\")")) after' },
+    { surface: "android", value: "Before ${outer({ inner(value) })} after" },
+    { surface: "android", value: 'Before ${format("}", "escaped \\"}")} after' },
+  ] as const)(
+    "preserves $surface nested and quoted interpolation delimiters: $value",
+    ({ surface, value }) => {
+      const repoPath = `apps/${surface}/Fixture.${surface === "apple" ? "swift" : "kt"}`;
+      const source = `// fixture\nText("${value}")`;
+      expect(extractNativeI18nCandidates(surface, repoPath, source)).toEqual([
+        { kind: "ui-call", line: 2, path: repoPath, source: value, sourceContext: source, surface },
+      ]);
+    },
+  );
+
+  it.each([
+    { surface: "apple", value: "Before \\(outer(value)" },
+    { surface: "android", value: "Before ${outer(value)" },
+  ] as const)("rejects $surface unclosed interpolation", ({ surface, value }) => {
+    const repoPath = `apps/${surface}/Fixture.${surface === "apple" ? "swift" : "kt"}`;
+    expect(extractNativeI18nCandidates(surface, repoPath, `Text("${value}")`)).toEqual([]);
+  });
+
   it.each(["apple", "android"] as const)(
     "preserves compact %s prose and the candidate length boundary",
     (surface) => {
@@ -666,7 +690,7 @@ describe("native app i18n inventory", () => {
       entries.some(
         (entry) =>
           entry.source ===
-          "The current gateway.remote.token value is not plain text. OpenClaw for macOS cannot use it directly; enter a plaintext token here to replace it.",
+          "Use the credential for this destination. Leave both fields empty only if this route already has device pairing or does not require a shared credential. Changing the destination clears this form's saved credentials.",
       ),
     ).toBe(true);
     expect(
@@ -687,16 +711,16 @@ describe("native app i18n inventory", () => {
       entries.some(
         (entry) =>
           entry.source ===
-          "Paste the token configured on the gateway host. On the gateway host, run `openclaw gateway auth-token --show` in an interactive terminal, then paste its output.",
+          "A setup code supplies the address and available certificate information automatically. For token or password authentication, enter the ordinary Gateway credential below.",
       ),
     ).toBe(true);
     expect(
       entries.some((entry) =>
         [
-          "The current gateway.remote.token value is not plain text. ",
+          "Use the credential for this destination. Leave both fields empty only if this route ",
           "Cron changes require operator.admin. Setup codes intentionally do not grant it. ",
           "Writes a rotating, local-only log under ~/Library/Logs/OpenClaw/. ",
-          "Paste the token configured on the gateway host. ",
+          "A setup code supplies the address and available certificate information automatically. ",
         ].includes(entry.source),
       ),
     ).toBe(false);

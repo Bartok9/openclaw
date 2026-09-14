@@ -612,8 +612,11 @@ describe("buildAgentSystemPrompt", () => {
     expect(presentation).toContain("`show_widget`");
     expect(presentation).toContain("pin=true");
     expect(presentation).toContain("result.presentation");
-    expect(presentation).toContain("inline support varies by surface");
+    expect(presentation).toContain("this turn's schema");
+    expect(presentation).toContain("status=pinned means the widget is on the session dashboard");
     expect(presentation).toContain("`dashboard`");
+    expect(presentation).toContain('action="focus_tab" with its tabId');
+    expect(presentation).toContain("do not open hosting URLs as browser pages");
     expect(presentation).toContain("`portal`");
     expect(presentation).toContain("publicUrl");
     expect(presentation).toContain("token URLs stay private");
@@ -647,8 +650,16 @@ describe("buildAgentSystemPrompt", () => {
       capabilityToolNames: [],
       codeModeActive: true,
     },
-    { name: "minimal", toolNames: ["show_widget", "dashboard", "portal"], promptMode: "minimal" },
-    { name: "none", toolNames: ["show_widget", "dashboard", "portal"], promptMode: "none" },
+    {
+      name: "minimal",
+      toolNames: ["screen", "show_widget", "dashboard", "portal"],
+      promptMode: "minimal",
+    },
+    {
+      name: "none",
+      toolNames: ["screen", "show_widget", "dashboard", "portal"],
+      promptMode: "none",
+    },
   ] satisfies Array<{ name: string } & Partial<Parameters<typeof buildAgentSystemPrompt>[0]>>)(
     "omits UI presentation guidance when $name",
     (surface) => {
@@ -745,20 +756,41 @@ describe("buildAgentSystemPrompt", () => {
     expect(withYield).toContain("Wait with `sessions_yield`");
   });
 
-  it("limits screen guidance to web/app tool surfaces", () => {
+  it.each([
+    { name: "screen only", toolNames: ["screen"] },
+    { name: "direct", toolNames: ["screen", "browser", "dashboard", "show_widget"] },
+    {
+      name: "Code Mode",
+      toolNames: ["exec", "wait"],
+      capabilityToolNames: ["screen", "browser", "dashboard", "show_widget"],
+      codeModeActive: true,
+    },
+  ])("routes browser sidebar requests through screen for $name tools", (surface) => {
     const withoutScreen = buildAgentSystemPrompt({
       workspaceDir: "/tmp/openclaw",
-      toolNames: ["sessions"],
+      toolNames: ["sessions", "browser", "dashboard", "show_widget"],
     });
     const withScreen = buildAgentSystemPrompt({
       workspaceDir: "/tmp/openclaw",
-      toolNames: ["sessions", "screen"],
+      ...surface,
     });
 
     expect(withoutScreen).not.toContain("web/app turn may drive UI");
-    expect(withScreen).toContain("- screen: Drive operator web UI");
-    expect(withScreen).toContain(
-      "`screen` present: web/app turn may drive UI; messaging turn: don't.",
+    expect(withoutScreen).not.toContain('action="browser_show"');
+    if (surface.toolNames.includes("screen")) {
+      expect(withScreen).toContain("- screen: Drive operator web UI");
+      expect(withScreen).toContain(
+        "`screen` present: web/app turn may drive UI; messaging turn: don't.",
+      );
+    }
+    const presentation = withScreen.split("## UI Presentation\n")[1]?.split("\n## ")[0] ?? "";
+    expect(presentation).toContain('screen(action="browser_show")');
+    expect(presentation).toContain("browser sidebar");
+    expect(presentation).toContain("side panel");
+    expect(presentation).toContain("sidebar_show/sidebar_hide control the session list");
+    expect(presentation).toContain("Do not create or expand a dashboard to open a panel");
+    expect(withScreen.indexOf("## UI Presentation")).toBeGreaterThan(
+      withScreen.indexOf(SYSTEM_PROMPT_CACHE_BOUNDARY),
     );
   });
 
@@ -1294,13 +1326,13 @@ describe("buildAgentSystemPrompt", () => {
     });
 
     expect(prompt).toContain(
-      "Config read: `gateway` (`config.get|config.schema.lookup`). Write/restart unavailable; ask human.",
+      "Config read: `gateway` (`config.get|config.schema.lookup`) only when those actions are exposed by its schema. Write/restart unavailable; ask human.",
     );
     expect(prompt).not.toContain("config.patch");
     expect(prompt).not.toContain("config.apply");
     expect(prompt).not.toContain("`config.schema.lookup|get|patch|apply`, `restart`");
     expect(prompt).toContain(
-      "Update OpenClaw: `gateway` action update.run, only on explicit user request; restart and completion notice are automatic.",
+      "Update OpenClaw: `gateway` action update.run, only on an explicit owner request; the runtime coordinates restart and completion notices.",
     );
     expect(prompt).toContain(
       "Never run openclaw update, npm install -g openclaw, or stop/restart the gateway service via exec.",
@@ -1324,25 +1356,30 @@ describe("buildAgentSystemPrompt", () => {
         "Gateway restart, config, channels, plugins, agents, models/providers: ask `openclaw`.",
       );
       expect(prompt).toContain(
-        "Never run npm install -g openclaw or stop the gateway service via exec.",
+        "Never run openclaw update, npm install -g openclaw, or stop/restart the gateway service via exec.",
       );
-      expect(prompt).toContain(
-        "Updates need the OpenClaw owner: tell the user to run `openclaw update` in a terminal or use the Control UI.",
-      );
+      expect(prompt).toContain("For a chat update request, direct the user to `/update`.");
       expect(prompt).not.toContain("System controls unavailable");
       expect(prompt).toContain(
-        "`visible:true` for work the user follows or asked for; else hidden.",
+        "Default to subagents for internal work; use `visible:true` only for a separate session the user requests or needs to revisit and steer independently.",
       );
     },
   );
 
-  it.each([{ toolNames: ["exec"] }, { toolNames: [] }])(
-    "keeps updates out of exec without gateway ($toolNames)",
+  it.each([{ toolNames: ["exec"] }, { toolNames: ["message"] }, { toolNames: [] }])(
+    "keeps chat updates discoverable without gateway ($toolNames)",
     ({ toolNames }) => {
       const prompt = buildAgentSystemPrompt({ workspaceDir: "/tmp/openclaw", toolNames });
       expect(prompt).toContain(
-        "System controls unavailable. Updates and restarts need the OpenClaw owner: tell the user to run `openclaw update` in a terminal or use the Control UI. Never run npm install -g openclaw or stop the gateway service via exec.",
+        "In a connected chat, the owner can send `/update` with commands.restart enabled (the default), regardless of the agent's tool profile.",
       );
+      expect(prompt).toContain("For a chat update request, direct the user to `/update`.");
+      expect(prompt).toContain("Outside chat, use the Control UI or ask the operator");
+      expect(prompt).toContain("Missing chat ownership needs owner setup");
+      expect(prompt).toContain(
+        "Never run openclaw update, npm install -g openclaw, or stop/restart the gateway service via exec.",
+      );
+      expect(prompt).not.toContain("System controls unavailable");
       expect(prompt).not.toContain("update.run");
     },
   );
@@ -1764,7 +1801,12 @@ describe("buildAgentSystemPrompt", () => {
     expect(preferPrompt).toContain("Multi-step or slow work");
     expect(preferPrompt).toContain("objective, output, write scope, verification");
     expect(preferPrompt).toContain("spawn `sessions_spawn` with `visible=true`");
-    expect(preferPrompt).toContain("Hidden children are invisible to the user");
+    expect(preferPrompt).toContain(
+      "Use subagents for internal QA, research, coding, review, and test lanes",
+    );
+    expect(preferPrompt).toContain(
+      "A request to use subagents does not request separate sessions.",
+    );
     expect(preferPrompt).toContain("Child output is evidence");
     expect(preferPrompt).toContain("`subagents(action=list)` only for requested status");
     expect(preferPrompt).not.toContain("- Subagents: `sessions_spawn`");

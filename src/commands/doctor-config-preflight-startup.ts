@@ -1,3 +1,4 @@
+import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { note } from "../../packages/terminal-core/src/note.js";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
@@ -22,7 +23,17 @@ import type {
 } from "../infra/state-migrations.types.js";
 import { setActiveDegradedPlugins } from "../plugins/runtime-degraded-state.js";
 import { ExitError } from "../runtime.js";
-import { withArtifactPreservingStateReads } from "../state/openclaw-state-db-readonly.js";
+import {
+  canIsolateAgentDatabase,
+  evaluateAgentDatabaseAdmissions,
+  listAgentDatabaseAdmissionRefusals,
+  readAgentDatabaseAdmissionRefusal,
+  recordAgentDatabaseAdmissions,
+} from "../state/agent-database-admission.js";
+import {
+  withArtifactPreservingStateReads,
+  withOpenClawStateDatabaseReadSnapshot,
+} from "../state/openclaw-state-db-readonly.js";
 import {
   migrationCheckpointIdentitiesMatch,
   resolveMigrationCheckpointIdentity,
@@ -78,15 +89,24 @@ export async function readStartupMigrationSnapshot(params: {
       if (startupConfig) {
         await params.validateConfig?.(startupConfig);
       }
-      let read: DoctorConfigPreflightPluginSnapshotRead = coreRecovery
-        ? {
-            ...(await createConfigIO({
-              ...recoveryOptions,
-              env: cloneEnvWithPlatformSemantics(params.env),
-            }).readConfigFileSnapshotWithPluginMetadata({ allowCurrentPluginMetadata: false })),
-            pluginMigrationFingerprint: null,
-          }
-        : await params.readSnapshot();
+      // Discovery policy and the persisted index must see one admitted generation.
+      // End its private read scope before recovery, guards, or lease acquisition.
+      let read: DoctorConfigPreflightPluginSnapshotRead =
+        await withOpenClawStateDatabaseReadSnapshot(
+          async () =>
+            coreRecovery
+              ? {
+                  ...(await createConfigIO({
+                    ...recoveryOptions,
+                    env: cloneEnvWithPlatformSemantics(params.env),
+                  }).readConfigFileSnapshotWithPluginMetadata({
+                    allowCurrentPluginMetadata: false,
+                  })),
+                  pluginMigrationFingerprint: null,
+                }
+              : await params.readSnapshot(),
+          { env: params.env },
+        );
       assertStartupConfigUnchanged(selected, read.snapshot);
       const recovery = await createConfigIO(recoveryOptions).prepareConfigRecovery(read.snapshot);
       if (Boolean(coreRecovery) !== Boolean(recovery)) {
@@ -147,14 +167,19 @@ async function assertStartupStateMigrationReady(params: {
     await import("../state/openclaw-agent-db-registry.js");
   const targets = resolveAllAgentSessionStoreCandidateTargetsSync(params.cfg, {
     env: params.env,
-    registeredDatabases: inspectOpenClawRegisteredAgentDatabases({
+    registeredDatabases: await inspectOpenClawRegisteredAgentDatabases({
       env: params.env,
       includeIncompatibleSchemaVersions: true,
     }),
-  });
+  }).filter((target) => !readAgentDatabaseAdmissionRefusal(target.agentId, { env: params.env }));
   assertSessionStoreMigrationComplete({ ...params, targets });
+  recordStartupMigrationWarnings(
+    listAgentDatabaseAdmissionRefusals({ env: params.env }).map(
+      (refusal) => `${refusal.reason}\n${refusal.repairHint}`,
+    ),
+  );
   const { assertConfiguredWorkspaceStateReady } = await import("../agents/workspace-state-dirs.js");
-  assertConfiguredWorkspaceStateReady(params);
+  await assertConfiguredWorkspaceStateReady(params);
 }
 
 type MigrationCheckpoint = {
@@ -297,6 +322,32 @@ export async function assertDoctorPreflightMigrationsComplete(params: {
   stepReceipts: readonly LegacyStateMigrationStepReceipt[];
   report: (result: MigrationMessages) => void;
 }): Promise<void> {
+  const scopedRefusals = params.stepReceipts.filter(
+    (receipt) =>
+      receipt.outcome === "refused" &&
+      (receipt.refusal?.code === "agent-database-ownership-mismatch" ||
+        receipt.refusal?.code === "blocked-by-agent-database-refusal") &&
+      receipt.refusedAgentDatabasePaths?.length,
+  );
+  const admissions =
+    scopedRefusals.length > 0 ? await evaluateAgentDatabaseAdmissions(params.cfg) : [];
+  if (scopedRefusals.length > 0) {
+    recordAgentDatabaseAdmissions(admissions);
+  }
+  const isolatedPaths = new Set(
+    admissions
+      .filter((refusal) => canIsolateAgentDatabase(params.cfg, refusal.agentId))
+      .flatMap((refusal) => refusal.paths.map((pathname) => path.resolve(pathname))),
+  );
+  for (const receipt of scopedRefusals) {
+    if (
+      receipt.refusedAgentDatabasePaths?.every((pathname) =>
+        isolatedPaths.has(path.resolve(pathname)),
+      )
+    ) {
+      receipt.outcome = "warning";
+    }
+  }
   try {
     throwIfDoctorStateMigrationRefused(params.stepReceipts);
   } catch (error) {
@@ -306,7 +357,7 @@ export async function assertDoctorPreflightMigrationsComplete(params: {
       const { assertConfiguredWorkspaceStateReady } =
         await import("../agents/workspace-state-dirs.js");
       try {
-        assertConfiguredWorkspaceStateReady({ cfg: params.cfg, operation: "doctor" });
+        await assertConfiguredWorkspaceStateReady({ cfg: params.cfg, operation: "doctor" });
       } catch (workspaceError) {
         params.report({ changes: [], warnings: [String(workspaceError)] });
       }

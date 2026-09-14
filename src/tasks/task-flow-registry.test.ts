@@ -276,6 +276,7 @@ describe("task-flow-registry", () => {
     const deleteFlow = vi.fn();
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot,
         upsertFlow,
         deleteFlow,
@@ -349,11 +350,8 @@ describe("task-flow-registry", () => {
   });
 
   it("does not throw or mutate memory when flow update persistence fails", () => {
-    let failUpsert = false;
-    const upsertFlow = vi.fn(() => {
-      if (failUpsert) {
-        throw new Error("SQLITE_IOERR: disk I/O error");
-      }
+    const updateFlow = vi.fn(() => {
+      throw new Error("SQLITE_IOERR: disk I/O error");
     });
     configureTaskFlowRegistryRuntime({
       store: {
@@ -361,7 +359,7 @@ describe("task-flow-registry", () => {
         loadSnapshot: () => ({
           flows: new Map(),
         }),
-        upsertFlow,
+        updateFlow,
       },
     });
     const created = createManagedTaskFlow({
@@ -370,7 +368,6 @@ describe("task-flow-registry", () => {
       goal: "Update while persistence fails",
     });
 
-    failUpsert = true;
     const result = setFlowWaiting({
       flowId: created.flowId,
       expectedRevision: created.revision,
@@ -398,6 +395,7 @@ describe("task-flow-registry", () => {
     });
     configureTaskFlowRegistryRuntime({
       store: {
+        ...createInMemoryTaskFlowRegistryStore(),
         loadSnapshot: () => ({
           flows: new Map(),
         }),
@@ -505,6 +503,25 @@ describe("task-flow-registry", () => {
       expect(delivered.status).toBe("blocked");
       expect(delivered.endedAt).toBe(200);
       expect(delivered.updatedAt).toBe(200);
+      expect(delivered.revision).toBe(blocked.revision);
+
+      const stale = syncFlowFromTaskForTest({
+        taskId: "task-blocked",
+        parentFlowId: mirrored.flowId,
+        status: "failed",
+        notifyPolicy: "done_only",
+        label: "Fix permissions",
+        task: "Fix permissions",
+        lastEventAt: 260,
+        endedAt: 260,
+        terminalSummary: "Provider failed.",
+      });
+      if (!stale) {
+        throw new Error("Expected stale mirrored flow repair");
+      }
+      expect(stale.status).toBe("failed");
+      expect(stale.endedAt).toBe(260);
+      expect(stale.revision).toBe(blocked.revision + 1);
 
       const terminalCreated = createTaskFlowForTask({
         task: {

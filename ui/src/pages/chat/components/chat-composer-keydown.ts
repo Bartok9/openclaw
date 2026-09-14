@@ -104,6 +104,7 @@ export function createComposerKeyDownHandler({
         keyCode: event.keyCode,
       });
       if (result.handled) {
+        state.editRevision += 1;
         if (result.preventDefault) {
           event.preventDefault();
         }
@@ -146,8 +147,12 @@ export function createComposerKeyDownHandler({
         // connected + composable gate), or offline Enter would swallow the key
         // and invoke a lifecycle that returns with no visible outcome.
         const queued =
-          showAbortableUi && props.connected && props.canSend && props.onQueueSteer
-            ? steerableQueuedMessage(props.queue)
+          showAbortableUi &&
+          props.connected &&
+          props.canSend &&
+          !props.submitDisabledReason &&
+          props.onQueueSteer
+            ? steerableQueuedMessage(props.displayQueue ?? props.queue)
             : undefined;
         if (queued) {
           event.preventDefault();

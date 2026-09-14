@@ -4,6 +4,9 @@ import {
   setActiveEmbeddedRun,
 } from "../../agents/embedded-agent-runner/runs.js";
 import { createEmbeddedRunHandle } from "../../agents/embedded-agent-runner/runs.test-support.js";
+import { createDashboardTool } from "../../agents/tools/dashboard-tool.js";
+import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
+import { callInProcessGatewayTool } from "../../agents/tools/in-process-gateway.js";
 import {
   loadSessionEntry,
   upsertSessionEntryCore,
@@ -12,7 +15,11 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { registerInternalHook, unregisterInternalHook } from "../../hooks/internal-hooks.js";
 import { trackAsyncWork } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
+import {
+  closeOpenClawAgentDatabaseByPath,
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { dispatchGatewayMethodInProcess } from "../server-plugins.js";
@@ -97,6 +104,108 @@ async function invoke(params: {
 }
 
 describe("sessions.patch", () => {
+  it("saves and reads dashboard defaults through the agent tool without connected clients", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const sessionKey = "agent:main:dashboard-default";
+      const scope = { agentId: "main", env: state.env, sessionKey };
+      await upsertSessionEntryCore(scope, {
+        sessionId: "dashboard-default",
+        updatedAt: 1,
+        boardFace: "chat",
+      });
+      const requestContext = context({});
+      requestContext.getClientConnIds = () => new Set();
+      requestContext.resolveGatewayContext = () => requestContext;
+      const tool = createDashboardTool({ agentSessionKey: sessionKey, agentId: "main" });
+      await withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey,
+          operationalRunInstance: { instanceId: "dashboard-instance", runId: "dashboard-run" },
+          receiptAuthority: () => true,
+          gatewayContextResolver: () => requestContext,
+        },
+        async () => {
+          const initial = await tool.execute("initial", { action: "read" });
+          expect(initial.details).toMatchObject({ defaultPresentation: "split" });
+          expect(loadSessionEntry(scope)).not.toHaveProperty("boardPresentation");
+
+          const saved = await tool.execute("save", {
+            action: "set_default_presentation",
+            presentation: "expanded",
+          });
+          expect(saved.details).toEqual({ ok: true, sessionKey, defaultPresentation: "expanded" });
+          const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+          expect(closeOpenClawAgentDatabaseByPath(database.path)).toBe(true);
+          expect(loadSessionEntry(scope)).toMatchObject({
+            boardFace: "chat",
+            boardPresentation: "expanded",
+          });
+          const reopened = await tool.execute("reopened", { action: "read" });
+          expect(reopened.details).toMatchObject({ defaultPresentation: "expanded" });
+
+          await tool.execute("split", {
+            action: "set_default_presentation",
+            presentation: "split",
+          });
+          expect(loadSessionEntry(scope)?.boardPresentation).toBe("split");
+          await callInProcessGatewayTool("sessions.patch", {
+            key: sessionKey,
+            boardPresentation: null,
+          });
+          const cleared = await tool.execute("cleared", { action: "read" });
+          expect(cleared.details).toMatchObject({ defaultPresentation: "split" });
+          expect(loadSessionEntry(scope)).not.toHaveProperty("boardPresentation");
+          expect(requestContext.broadcastToConnIds).not.toHaveBeenCalledWith(
+            "board.command",
+            expect.anything(),
+            expect.anything(),
+          );
+        },
+      );
+    });
+  });
+
+  it("rechecks dashboard tool authority inside the actual session write transaction", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const sessionKey = "agent:main:dashboard-authority";
+      const scope = { agentId: "main", env: state.env, sessionKey };
+      await upsertSessionEntryCore(scope, {
+        sessionId: "dashboard-authority",
+        updatedAt: 1,
+        boardPresentation: "split",
+      });
+      const before = loadSessionEntry(scope);
+      const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+      const requestContext = context({});
+      let revoked = false;
+      let rejectedInsideTransaction = false;
+      const tool = createDashboardTool({ agentSessionKey: sessionKey, agentId: "main" });
+      await expect(
+        withGatewayToolCallerIdentity(
+          {
+            agentId: "main",
+            sessionKey,
+            operationalRunInstance: { instanceId: "dashboard-instance", runId: "dashboard-run" },
+            gatewayContextResolver: () => requestContext,
+            receiptAuthority: () => {
+              if (database.db.isTransaction) {
+                rejectedInsideTransaction = true;
+                revoked = true;
+              }
+              return !revoked;
+            },
+          },
+          () =>
+            tool.execute("save", { action: "set_default_presentation", presentation: "expanded" }),
+        ),
+      ).rejects.toThrow(/authority.*no longer active/i);
+      expect(rejectedInsideTransaction).toBe(true);
+      expect(loadSessionEntry(scope)).toEqual(before);
+      expect(requestContext.broadcastToConnIds).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(["thinking", "context", "both"] as const)(
     "persists %s preference clears with an agent model rollback marker",
     async (field) => {
@@ -219,13 +328,26 @@ describe("sessions.patch", () => {
         const entered = createDeferredCore();
         const release = createDeferredCore();
         const catalogEntered = createDeferredCore();
-        const catalogRelease = createDeferredCore();
-        const loadGatewayModelCatalog = vi.fn(async () => {
+        type CatalogSnapshot = Awaited<
+          ReturnType<GatewayRequestContext["loadGatewayModelCatalogSnapshot"]>
+        >;
+        const catalogRelease = createDeferredCore<CatalogSnapshot>();
+        const snapshot: CatalogSnapshot = {
+          agentId: "main",
+          agentDir: state.agentDir("main"),
+          workspaceDir: state.workspaceDir,
+          config: cfg,
+          catalogComplete: true,
+          entries: [],
+          routeVariants: [],
+        };
+        const loadGatewayModelCatalogSnapshot = vi.fn<
+          GatewayRequestContext["loadGatewayModelCatalogSnapshot"]
+        >(async () => {
           catalogEntered.resolve();
-          await catalogRelease.promise;
-          return [];
+          return catalogRelease.promise;
         });
-        requestContext.loadGatewayModelCatalog = loadGatewayModelCatalog;
+        requestContext.loadGatewayModelCatalogSnapshot = loadGatewayModelCatalogSnapshot;
         const applyPermissionMode = vi.fn(async (_mode: string | null, revoke: () => void) => {
           revoke();
           entered.resolve();
@@ -242,7 +364,7 @@ describe("sessions.patch", () => {
             params: {
               key: sessionKey,
               permissionMode,
-              ...(prepareCatalog && index === 0 ? { thinkingLevel: "off" } : {}),
+              ...(prepareCatalog && index === 0 ? { thinkingLevel: "low" } : {}),
             },
             client: requestClient,
             context: requestContext,
@@ -253,7 +375,7 @@ describe("sessions.patch", () => {
         try {
           if (prepareCatalog) {
             await Promise.race([catalogEntered.promise, first]);
-            expect(loadGatewayModelCatalog).toHaveBeenCalledOnce();
+            expect(loadGatewayModelCatalogSnapshot).toHaveBeenCalledOnce();
             expect(applyPermissionMode).not.toHaveBeenCalled();
             expect(patched).not.toHaveBeenCalled();
             expect(isSessionPermissionChangePending(sessionId)).toBe(false);
@@ -262,7 +384,7 @@ describe("sessions.patch", () => {
               loadSessionEntry({ agentId: "main", env: state.env, sessionKey })?.permissionMode,
             ).toBe("guarded");
           }
-          catalogRelease.resolve();
+          catalogRelease.resolve(snapshot);
           await Promise.race([entered.promise, first]);
           expect(applyPermissionMode).toHaveBeenCalledTimes(1);
           expect(responses[0]).not.toHaveBeenCalled();
@@ -282,7 +404,7 @@ describe("sessions.patch", () => {
           expect(responses[0]).toHaveBeenCalledWith(true, expect.any(Object), undefined);
           expect(responses[1]).toHaveBeenCalledWith(true, expect.any(Object), undefined);
           expect(patched).toHaveBeenCalledTimes(2);
-          expect(loadGatewayModelCatalog).toHaveBeenCalledTimes(prepareCatalog ? 1 : 0);
+          expect(loadGatewayModelCatalogSnapshot).toHaveBeenCalledTimes(prepareCatalog ? 1 : 0);
           expect(isSessionPermissionChangePending(sessionId)).toBe(false);
           expect(
             loadSessionEntry({ agentId: "main", env: state.env, sessionKey })?.permissionMode,
@@ -290,10 +412,10 @@ describe("sessions.patch", () => {
           if (prepareCatalog) {
             expect(
               loadSessionEntry({ agentId: "main", env: state.env, sessionKey })?.thinkingLevel,
-            ).toBe("off");
+            ).toBe("low");
           }
         } finally {
-          catalogRelease.resolve();
+          catalogRelease.resolve(snapshot);
           release.resolve();
           await Promise.allSettled([first, second]);
           unregisterInternalHook("session:patch", patched);

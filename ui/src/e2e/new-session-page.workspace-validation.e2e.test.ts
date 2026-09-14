@@ -14,6 +14,7 @@ import {
   captureUiProof,
   controlUiSessionPath,
   createNewSessionPageE2eSuite,
+  createdSessionListResult,
   installMockGateway,
   pollLocatorText,
   replaceGatewayClient,
@@ -342,8 +343,9 @@ suite.define(() => {
     });
   });
 
-  it("blocks a custom cloud worktree when Git rediscovery is unavailable", async () => {
+  it("blocks an unavailable cloud source until New workspace is explicitly selected", async () => {
     await withNewSessionPage(BASE_CONTEXT, async (page) => {
+      const sessionKey = "agent:main:cleared-unavailable-source";
       const gateway = await installMockGateway(page, {
         workspace: WORKSPACE,
         workspaceGit: true,
@@ -354,6 +356,10 @@ suite.define(() => {
           },
           "fs.listDir": { path: WORKSPACE, home: "/home/peter", entries: [] },
           "worktrees.branches": branchList(),
+          "sessions.create": { key: sessionKey },
+          "sessions.list": createdSessionListResult(sessionKey),
+          "sessions.dispatch": { placement: { state: "active", generation: 1 } },
+          "sessions.send": { runId: "run-cleared-source", status: "started" },
         },
       });
       await page.goto(`${suite.server.baseUrl}new`);
@@ -363,7 +369,7 @@ suite.define(() => {
       const where = page.locator("wa-popover.new-session-page__where-popover");
       const checkoutTrigger = page.locator("#new-session-checkout-trigger");
       await whereTrigger.click();
-      await where.getByRole("button", { name: "Cloud · aws" }).click();
+      await where.getByRole("button", { name: "aws", exact: true }).click();
       await expect.poll(() => whereTrigger.getAttribute("data-cloud-profile")).toBe("aws");
       await expect.poll(() => checkoutTrigger.getAttribute("data-worktree")).toBe("true");
 
@@ -379,11 +385,10 @@ suite.define(() => {
       const start = page.getByRole("button", { name: "Start session" });
       await expect.poll(() => start.isDisabled()).toBe(true);
       await whereTrigger.click();
-      const cloud = where.getByRole("button", { name: "Cloud · aws" });
-      expect(await cloud.isDisabled()).toBe(true);
-      await expect
-        .poll(() => tooltipTitleText(cloud))
-        .toBe("Couldn't verify Git for this folder. Choose it again to retry.");
+      const cloud = where.getByRole("button", { name: "aws", exact: true });
+      expect(await cloud.isEnabled()).toBe(true);
+      await cloud.click();
+      await expect.poll(() => start.isDisabled()).toBe(true);
       await page.keyboard.press("Escape");
       await checkoutTrigger.click();
       const checkout = page.locator("wa-popover.new-session-page__checkout-popover");
@@ -391,6 +396,41 @@ suite.define(() => {
       await checkout.getByLabel("From").waitFor();
       await checkout.getByLabel("Name", { exact: true }).waitFor();
       expect(await gateway.getRequests("sessions.create")).toHaveLength(0);
+      await page.keyboard.press("Escape");
+
+      const projectTrigger = page.locator("#new-session-project-trigger");
+      await pollLocatorText(projectTrigger.locator(".new-session-page__trigger-label")).toBe(
+        "target-repo",
+      );
+      await projectTrigger.click();
+      await page.locator('.new-session-page__project-popover [data-value="new-workspace"]').click();
+      await pollLocatorText(projectTrigger.locator(".new-session-page__trigger-label")).toBe(
+        "New workspace",
+      );
+      expect(await checkoutTrigger.count()).toBe(0);
+      await expect.poll(() => start.isEnabled()).toBe(true);
+      await start.click();
+      const create = await gateway.waitForRequest("sessions.create");
+      expect(create.params).toMatchObject({
+        agentId: "main",
+        message: "",
+        titleSource: "do not run directly",
+        worktree: true,
+        worktreeSource: "empty",
+      });
+      for (const field of ["cwd", "projectId", "repository", "worktreeBaseRef", "worktreeName"]) {
+        expect(create.params).not.toHaveProperty(field);
+      }
+      expect((await gateway.waitForRequest("sessions.dispatch")).params).toEqual({
+        key: sessionKey,
+        agentId: "main",
+        profileId: "aws",
+      });
+      expect((await gateway.waitForRequest("sessions.send")).params).toMatchObject({
+        key: sessionKey,
+        message: "do not run directly",
+      });
+      await page.waitForURL((url) => url.pathname === controlUiSessionPath(sessionKey));
     });
   });
 
@@ -417,6 +457,11 @@ suite.define(() => {
       const projectSelect = page.locator("wa-popover.new-session-page__project-popover");
       const projectTrigger = page.locator("#new-session-project-trigger");
       await message.fill("preserve this replacement draft");
+      await page.locator("#new-session-checkout-trigger").click();
+      await page
+        .getByRole("button", { name: "New worktree Isolated copy of the repo", exact: true })
+        .click();
+      await page.keyboard.press("Escape");
       await whereTrigger.click();
       await whereSelect.getByRole("button", { name: "Old device" }).click();
 

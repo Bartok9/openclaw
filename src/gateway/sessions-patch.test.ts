@@ -2,9 +2,11 @@
 // aliases, model catalog validation, and rejected invalid patch payloads.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { SessionCreatedActor } from "../../packages/gateway-protocol/src/index.js";
+import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { contextBudgetStatusFixture } from "../config/sessions/context-budget.test-support.js";
+import { projectCanonicalSessionEntryShape } from "../config/sessions/store-entry-shape.js";
 import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
 import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
@@ -18,10 +20,20 @@ async function applySessionsPatchToStore(
   params: Omit<
     Parameters<typeof projectSessionsPatchEntry>[0],
     "existingEntry" | "isLabelInUse"
-  > & { store: Record<string, SessionEntry> },
+  > & {
+    store: Record<string, SessionEntry>;
+    loadGatewayModelCatalog?: () => Promise<ModelCatalogEntry[]>;
+  },
 ) {
+  const load = params.loadGatewayModelCatalog;
   const projected = await projectSessionsPatchEntry({
     ...params,
+    loadGatewayModelCatalogSnapshot: load
+      ? async () => {
+          const entries = await load();
+          return { entries, routeVariants: entries };
+        }
+      : undefined,
     existingEntry: params.store[params.storeKey],
     isLabelInUse: (label) =>
       Object.entries(params.store).some(
@@ -316,6 +328,23 @@ describe("gateway sessions patch", () => {
     acpSessionMetaMocks.readAcpSessionMetaForEntry.mockReset();
     clearPluginMetadataLifecycleCaches();
     resetPluginRuntimeStateForTest();
+  });
+
+  test("keeps a custom SVG icon through store normalization, unrelated patches, and clearing", async () => {
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>';
+    const icon = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    const store = mainStoreEntry({ label: "Night watch", color: "purple" });
+    const patch = async (fields: { icon?: string | null; label?: string }) =>
+      runPatch({ store, patch: { key: MAIN_SESSION_KEY, ...fields } });
+    const entry = expectPatchOk(await patch({ icon: svg }));
+    expect(entry).toMatchObject({ icon, color: "purple" });
+    store[MAIN_SESSION_KEY] = projectCanonicalSessionEntryShape({ ...entry });
+    expect(expectPatchOk(await patch({ label: "Updated night watch" }))).toMatchObject({ icon });
+    expectPatchError(await patch({ icon: "https://example.com/icon.svg" }), "icon must be");
+    expect(store[MAIN_SESSION_KEY].icon).toBe(icon);
+    expect(expectPatchOk(await patch({ icon: null })).icon).toBeUndefined();
+    expect(store[MAIN_SESSION_KEY].color).toBe("purple");
   });
 
   test("keeps manual renames independent of automatic device-label writes and clears", async () => {
@@ -1755,6 +1784,58 @@ describe("gateway sessions patch", () => {
     );
 
     expect(entry.thinkingLevel).toBe("ultra");
+  });
+
+  test("clearing a runtime pin remaps thinking through configured routing and invalidates derived context", async () => {
+    const entry = expectPatchOk(
+      await runPatch({
+        cfg: { agents: { defaults: { model: "openai/gpt-5.6-luna" } } },
+        store: mainStoreEntry({
+          agentRuntimeOverride: "openclaw",
+          thinkingLevel: "ultra",
+          contextTokens: 1000,
+        }),
+        patch: { key: MAIN_SESSION_KEY, agentRuntime: null },
+        loadGatewayModelCatalog: loadCatalog("openai/gpt-5.6-luna"),
+      }),
+    );
+    expect(entry).toMatchObject({ thinkingLevel: "max", liveModelSwitchPending: true });
+    expect(entry).not.toHaveProperty("agentRuntimeOverride");
+    expect(entry).not.toHaveProperty("contextTokens");
+  });
+
+  test.each([null, "openclaw"])(
+    "retains locked model and runtime ownership (%s)",
+    async (agentRuntime) => {
+      const store = mainStoreEntry({ modelSelectionLocked: true, agentRuntimeOverride: "codex" });
+      expectPatchError(
+        await runPatch({
+          store,
+          patch: {
+            key: MAIN_SESSION_KEY,
+            agentRuntime,
+            ...(agentRuntime ? { model: "openai/gpt-5.6-sol" } : {}),
+          },
+        }),
+        MODEL_SELECTION_LOCKED_MESSAGE,
+      );
+      expect(store[MAIN_SESSION_KEY]?.agentRuntimeOverride).toBe("codex");
+    },
+  );
+
+  test("does not persist a misleading runtime pin on an ACP-owned session", async () => {
+    acpSessionMetaMocks.readAcpSessionMetaForEntry.mockReturnValue({
+      backend: "codex",
+      agent: "main",
+      state: "idle",
+    });
+    expectPatchError(
+      await runPatch({
+        store: mainStoreEntry({}),
+        patch: { key: MAIN_SESSION_KEY, agentRuntime: null },
+      }),
+      "owned by this ACP session",
+    );
   });
 
   test("uses ACP backend metadata on canonical agent keys for thinking validation", async () => {

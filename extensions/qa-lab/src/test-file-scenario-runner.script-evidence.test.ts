@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { validateQaEvidenceSummaryJson } from "./evidence-summary.js";
 import type { QaSeedScenarioWithSource } from "./scenario-catalog.js";
 import {
+  resolveQaScriptRuntimeExecutable,
   runQaTestFileScenarios,
   type QaScenarioCommandExecution,
 } from "./test-file-scenario-runner.js";
@@ -189,16 +190,16 @@ describe("qa test file scenario runner", () => {
       ],
     ]);
     expect(commands.map((command) => command.timeoutMs)).toEqual([30 * 60_000]);
+    expect(commands.map((command) => command.command)).toEqual([
+      resolveQaScriptRuntimeExecutable(),
+    ]);
     const evidence = validateQaEvidenceSummaryJson(
       JSON.parse(await fs.readFile(result.evidencePath, "utf8")),
     );
     expect(evidence.entries).toHaveLength(1);
     expect(evidence.entries[0]).toMatchObject({
       test: { kind: "script-producer-check", id: "script-producer.web-ui.smoke" },
-      coverage: [
-        { id: "qa.coverage", role: "primary" },
-        { id: "qa.reporting", role: "secondary" },
-      ],
+      coverage: [],
       execution: {
         runner: "evidence-producer-script",
         artifacts: [
@@ -285,10 +286,7 @@ describe("qa test file scenario runner", () => {
     expect(evidence.entries).toHaveLength(2);
     expect(evidence.entries[0]).toMatchObject({
       test: { kind: "script-producer-check", id: "script-producer.web-ui.smoke" },
-      coverage: [
-        { id: "qa.coverage", role: "primary" },
-        { id: "qa.reporting", role: "secondary" },
-      ],
+      coverage: [],
       result: {
         status: "fail",
         failure: { reason: "Script producer check failed." },
@@ -341,7 +339,7 @@ describe("qa test file scenario runner", () => {
   ])(
     "makes a $terminal failure override colliding $producerStatus producer evidence",
     async ({ producerStatus, terminal }) => {
-      const commandName = path.basename(process.execPath);
+      const commandName = path.basename(resolveQaScriptRuntimeExecutable());
       const tempRoot = await makeTempRepo(`qa-script-terminal-${terminal}-${producerStatus}-`);
       const outputDir = path.join(tempRoot, "out");
       const scriptPath = path.join(tempRoot, "terminal-evidence-producer.mjs");
@@ -409,10 +407,7 @@ describe("qa test file scenario runner", () => {
       expect(
         result.evidence.entries.find((entry) => entry.test.id === "scenario-script"),
       ).toMatchObject({
-        coverage: [
-          { id: "qa.coverage", role: "primary" },
-          { id: "qa.reporting", role: "secondary" },
-        ],
+        coverage: [],
         execution: {
           artifacts: [{ kind: "log", path: expect.stringContaining("producer.log") }],
           runner: "evidence-producer-script",

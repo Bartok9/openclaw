@@ -3,7 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { admitUpdateCommandRun } from "../cli/update-cli/update-command-run.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../config/config.js";
+import { getUpdateRun } from "../infra/update-run-ledger.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { makeTempWorkspace } from "../test-helpers/workspace.js";
 import { captureEnv } from "../test-utils/env.js";
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
@@ -31,10 +34,6 @@ beforeEach(() => {
   probePortUsage.mockReset();
   probePortUsage.mockRejectedValue(new Error("unexpected port probe"));
 });
-
-function setPlatform(value: NodeJS.Platform) {
-  mockProcessPlatform(value);
-}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -89,15 +88,18 @@ describe("resolveGatewayService", () => {
     { platform: "linux" as const, label: "systemd user", loadedText: "enabled" },
     { platform: "win32" as const, label: "Scheduled Task", loadedText: "registered" },
   ])("returns the registered adapter for $platform", ({ platform, label, loadedText }) => {
-    setPlatform(platform);
+    mockProcessPlatform(platform);
     const service = resolveGatewayService();
     expect(service.label).toBe(label);
     expect(service.loadedText).toBe(loadedText);
   });
 
-  it("returns a read-only unsupported-platform adapter", async () => {
-    setPlatform("aix");
-    const service = resolveGatewayService();
+  it.each([
+    { name: "Gateway", resolve: resolveGatewayService },
+    { name: "node", resolve: resolveNodeService },
+  ])("returns a read-only unsupported-platform $name adapter", async ({ resolve }) => {
+    mockProcessPlatform("aix");
+    const service = resolve();
 
     await expect(service.readCommand(process.env)).resolves.toBeNull();
     await expect(service.isLoaded({ env: process.env })).rejects.toThrow(
@@ -113,6 +115,63 @@ describe("resolveGatewayService", () => {
     await expect(service.restart({ env: process.env, stdout: process.stdout })).rejects.toThrow(
       "Gateway service install not supported on aix",
     );
+  });
+
+  it("keeps FreeBSD service ownership external and explains the package and foreground paths", async () => {
+    mockProcessPlatform("freebsd");
+    const service = resolveGatewayService();
+    const runtime = await service.readRuntime(process.env);
+    expect(runtime.status).toBe("unknown");
+    expect(runtime.detail).toContain("not supported by this CLI on FreeBSD");
+    expect(runtime.detail).toContain("openclaw_user to your onboarding account");
+    expect(runtime.detail).toContain('openclaw_enable="YES" in /etc/rc.conf');
+    expect(runtime.detail).toContain("`service openclaw start` (or stop/restart/status) as root");
+    expect(runtime.detail).toContain("`openclaw gateway run` as your onboarding account");
+
+    const args = {
+      env: process.env,
+      stdout: process.stdout,
+      programArguments: ["openclaw", "gateway", "run"],
+    };
+    for (const action of ["stage", "install", "uninstall", "start", "stop", "restart"] as const) {
+      await expect(service[action](args)).rejects.toThrow(runtime.detail);
+    }
+    await expect(service.isLoaded(args)).rejects.toThrow(runtime.detail);
+    await expect(service.readCommand(process.env)).resolves.toBeNull();
+    await expect(readGatewayServiceState(service)).resolves.toMatchObject({
+      installed: false,
+      loadState: { status: "unknown", detail: `Error: ${runtime.detail}` },
+      running: false,
+      command: null,
+      runtime,
+    });
+  });
+
+  it("gives FreeBSD node hosts their own foreground recovery command", async () => {
+    mockProcessPlatform("freebsd");
+    const service = resolveNodeService();
+    const runtime = await service.readRuntime(process.env);
+    expect(runtime.status).toBe("unknown");
+    expect(runtime.detail).toContain("Node service management is not supported");
+    expect(runtime.detail).toContain("`openclaw node run`");
+    expect(runtime.detail).not.toContain("service openclaw");
+    expect(runtime.detail).not.toContain("openclaw gateway run");
+    const args = {
+      env: process.env,
+      stdout: process.stdout,
+      programArguments: ["openclaw", "node", "run"],
+    };
+    for (const action of ["stage", "install", "uninstall", "start", "stop", "restart"] as const) {
+      await expect(service[action](args)).rejects.toThrow(runtime.detail);
+    }
+    await expect(service.isLoaded(args)).rejects.toThrow(runtime.detail);
+    await expect(service.readCommand(process.env)).resolves.toBeNull();
+    await expect(readGatewayServiceState(service)).resolves.toMatchObject({
+      installed: false,
+      loadState: { status: "unknown", detail: `Error: ${runtime.detail}` },
+      running: false,
+      runtime,
+    });
   });
 
   it("guards mutating service adapters when config was written by a newer OpenClaw", async () => {
@@ -154,7 +213,7 @@ describe("resolveGatewayService", () => {
   });
 
   it("guards every native service mutation when an external supervisor owns lifecycle", async () => {
-    setPlatform("darwin");
+    mockProcessPlatform("darwin");
     const service = resolveGatewayService();
     const env = { OPENCLAW_SUPERVISOR_MODE: "external" };
     const installArgs = {
@@ -248,12 +307,13 @@ describe("readGatewayServiceState", () => {
       ];
       const snapshot = captureEnv(keys);
       try {
-        setPlatform("linux");
+        mockProcessPlatform("linux");
         for (const key of keys) {
           delete process.env[key];
         }
         process.env.HOME = home;
         process.env.PATH = home;
+        process.env.XDG_RUNTIME_DIR = path.join(home, "runtime");
         const expectedPort = portSource === "config" ? 19902 : 19901;
         if (portSource === "config") {
           await fs.mkdir(path.join(home, ".openclaw"), { recursive: true });
@@ -335,6 +395,14 @@ describe("readGatewayServiceState", () => {
           }
           return;
         }
+        if (condition === "absent") {
+          const run = await admitUpdateCommandRun({
+            opts: { restart: shouldRestart },
+            root: home,
+          });
+          expect(run.env.HOME).toBe(home);
+          expect(getUpdateRun(run.runId, { env: run.env })?.status).toBe("running");
+        }
         const result = await maybeStopManagedServiceBeforeMutableUpdate({
           root: home,
           updateInstallKind,
@@ -351,7 +419,7 @@ describe("readGatewayServiceState", () => {
           expect(result.blockMessage).toContain("Refusing to mutate code");
           expect(result.serviceUpdateVerdict).toMatchObject({ kind: "unavailable" });
         } else {
-          expect(result.blockMessage).toContain("Refusing to mutate code");
+          expect(result.blockMessage).toContain("busctl executable is unavailable");
           expect(result.serviceUpdateVerdict?.kind).not.toBe("absent");
         }
         expect(result.serviceMutationAllowed).toBe(false);
@@ -363,6 +431,7 @@ describe("readGatewayServiceState", () => {
           expect(probePortUsage).not.toHaveBeenCalled();
         }
       } finally {
+        closeOpenClawStateDatabaseForTest();
         snapshot.restore();
         await fs.rm(home, { recursive: true, force: true });
       }
@@ -486,6 +555,7 @@ describe("readGatewayServiceState", () => {
     expect(readCommand).toHaveBeenCalledWith(process.env, {
       timeoutMs: undefined,
       requireEffective: true,
+      onCommandInspection: expect.any(Function),
     });
   });
 
@@ -501,7 +571,10 @@ describe("readGatewayServiceState", () => {
 
     const state = await readGatewayServiceState(service, { timeoutMs: 100 });
 
-    expect(readCommand).toHaveBeenCalledWith(process.env, { timeoutMs: 100 });
+    expect(readCommand).toHaveBeenCalledWith(process.env, {
+      timeoutMs: 100,
+      onCommandInspection: expect.any(Function),
+    });
     expect(state.running).toBe(false);
     expect(state.runtime).toEqual({
       status: "unknown",

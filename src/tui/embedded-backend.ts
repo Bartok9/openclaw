@@ -33,6 +33,7 @@ import { resolveThinkingDefault } from "../agents/model-selection.js";
 import { resolvePublishedModelCatalogOwner } from "../agents/prepared-model-catalog-owner.js";
 import {
   readPreparedModelCatalog,
+  loadPreparedModelCatalogSnapshot,
   withPreparedModelCatalogOwner,
 } from "../agents/prepared-model-catalog.js";
 import { getPreparedModelRuntimeAuthMaterializations } from "../agents/prepared-model-runtime-auth.js";
@@ -127,6 +128,8 @@ import type {
   TuiModelChoice,
   TuiSessionList,
   TuiSessionCreateOptions,
+  TuiImageRequest,
+  TuiImageData,
 } from "./tui-backend.js";
 import { formatTuiErrorMessage } from "./tui-formatters.js";
 
@@ -626,6 +629,11 @@ export class EmbeddedTuiBackend implements TuiBackend {
     return { ok: true, aborted: true, runIds: [opts.runId] };
   }
 
+  async loadImage(opts: TuiImageRequest): Promise<TuiImageData> {
+    const { loadEmbeddedImage } = await import("./embedded-image-loader.js");
+    return await loadEmbeddedImage(opts);
+  }
+
   async loadHistory(opts: { sessionKey: string; agentId?: string; limit?: number }) {
     await this.ready;
     await this.preparedModelRuntime.waitUntilReady();
@@ -788,8 +796,12 @@ export class EmbeddedTuiBackend implements TuiBackend {
           storeKey: primaryKey,
           agentId: target.agentId,
           patch: opts,
-          loadGatewayModelCatalog: () =>
-            readPreparedModelCatalog({ config: cfg, agentId: target.agentId, readOnly: true }),
+          loadGatewayModelCatalogSnapshot: () =>
+            loadPreparedModelCatalogSnapshot({
+              config: cfg,
+              agentId: target.agentId,
+              readOnly: true,
+            }),
         }),
     });
     if (!applied.ok) {
@@ -840,8 +852,8 @@ export class EmbeddedTuiBackend implements TuiBackend {
       armSessionDiffBaselineCapture: true,
       emitCommandHooks: Boolean(opts.parentSessionKey),
       commandSource: "tui:embedded",
-      loadGatewayModelCatalog: () =>
-        readPreparedModelCatalog({
+      loadGatewayModelCatalogSnapshot: () =>
+        loadPreparedModelCatalogSnapshot({
           config: cfg,
           agentId: resolveSessionAgentId({
             sessionKey: opts.key,

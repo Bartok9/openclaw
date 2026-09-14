@@ -8,6 +8,7 @@ import type { BrowserTabSelection } from "../../components/browser/browser-targe
 import { icons } from "../../components/icons.ts";
 import { renderPanelLoadingSkeleton } from "../../components/panel-loading-skeleton.ts";
 import { t } from "../../i18n/index.ts";
+import { registerBackgroundTasksEnglish } from "../../i18n/locales/en-background-tasks.ts";
 import { formatKeyboardShortcutCombo } from "../../lib/keyboard-shortcut-catalog.ts";
 import type { ControlUiRegistration } from "../../plugins/control-ui-capability.ts";
 import { renderPluginContribution } from "../../plugins/control-ui-view.ts";
@@ -16,6 +17,11 @@ import { resolveAssistantAttachmentAuthToken } from "./chat-pane-state.ts";
 import type { ChatSessionCompanionThread } from "./chat-session-companion.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { openTaskDetailId } from "./components/chat-detail-slot.ts";
+import {
+  getSessionWorkspace,
+  selectSessionWorkspacePreview,
+  closeSessionWorkspacePreview,
+} from "./components/chat-session-workspace-state.ts";
 import { resolveSessionDiffSidebarContent } from "./components/chat-session-workspace.ts";
 import type {
   SidebarPanelDefinition,
@@ -25,12 +31,17 @@ import type { SidebarContent } from "./components/chat-sidebar.ts";
 import { resetTaskDetail } from "./components/chat-task-detail-state.ts";
 import type { SessionDiscussionPanelConfig } from "./components/session-discussion-panel.ts";
 import type { SidebarSlotId } from "./sidebar-layout-types.ts";
+import { sidebarMainPanel } from "./sidebar-layout.ts";
+
+registerBackgroundTasksEnglish();
 
 type SidebarPanelDefinitionParams = {
   state: ChatPageHost;
   themeMode: "dark" | "light";
   agentId: string | null;
   browserPresented: boolean;
+  browserTabsInHeader: boolean;
+  terminalTabsInHeader: boolean;
   browserRefreshOnPresentation: boolean;
   preferredBrowserTab?: BrowserTabSelection;
   desktopPresented: boolean;
@@ -51,6 +62,9 @@ type SidebarPanelDefinitionParams = {
   lastReadAt: number | undefined;
   pullRequests: ControlUiSessionPullRequest[];
   companion: ChatSessionCompanionThread;
+  companionPresented: boolean;
+  companionFocusRequest: (() => boolean) | undefined;
+  canFocusCompanion: () => boolean;
   onCompanionSubmit: (question: string) => void;
   onCompanionDraftChange: (draft: string) => void;
   onCompanionVisibilityChange: (visible: boolean) => void;
@@ -118,7 +132,7 @@ export function sidebarPanelDefinitions(
         : textKey === "dashboard"
           ? "board"
           : textKey,
-      t("common.loading"),
+      t(textKey === "desktop" ? "desktop.connecting" : "common.loading"),
     ),
     empty: { description: t(`chat.sidePanel.${textKey}Empty`) },
     headerAction,
@@ -129,6 +143,7 @@ export function sidebarPanelDefinitions(
   const terminal = state?.terminalAvailable
     ? html`<openclaw-terminal-panel
         embedded
+        .tabsInHeader=${params?.terminalTabsInHeader ?? false}
         .client=${state.connected ? state.client : null}
         .available=${state.terminalAvailable}
         .agentId=${params?.agentId ?? null}
@@ -148,6 +163,7 @@ export function sidebarPanelDefinitions(
           hello: state.hello,
         })}
         .presented=${params?.browserPresented ?? false}
+        .tabsInHeader=${params?.browserTabsInHeader ?? false}
         .refreshOnPresentation=${params?.browserRefreshOnPresentation ?? true}
         .sessionKey=${state.sessionKey}
         .preferredTab=${params?.preferredBrowserTab}
@@ -158,6 +174,9 @@ export function sidebarPanelDefinitions(
   const companion = params
     ? html`<openclaw-chat-session-rail
         embedded
+        .presented=${params.companionPresented}
+        .focusRequest=${params.companionFocusRequest}
+        .canFocus=${params.canFocusCompanion}
         .sessionKey=${state?.sessionKey}
         .digest=${params.digest}
         .running=${Boolean(params.activeRunId)}
@@ -167,6 +186,7 @@ export function sidebarPanelDefinitions(
         .pullRequests=${params.pullRequests}
         .companion=${params.companion}
         .connected=${state?.connected === true}
+        .sendShortcut=${state?.settings.chatSendShortcut ?? "enter"}
         .onSubmit=${params.onCompanionSubmit}
         .onDraftChange=${params.onCompanionDraftChange}
         .onVisibilityChange=${params.onCompanionVisibilityChange}
@@ -196,14 +216,22 @@ export function sidebarPanelDefinitions(
         .onStateChange=${params.discussion.onStateChange}
       ></openclaw-session-discussion>`
     : null;
-  const attachmentContent = state?.attachmentSidebarContent ?? null;
+  const workspace = state ? getSessionWorkspace(state) : null;
   // The region owns mounting and visibility. Hidden Review tabs must keep the
   // same cached diff loader so their live content and selection survive.
   const detailContent =
     state?.sidebarContent ?? (state ? resolveSessionDiffSidebarContent(state) : null);
   const workspaceContent =
-    attachmentContent && params
-      ? params.renderDetail(attachmentContent)
+    state && params && workspace
+      ? html`<openclaw-chat-files-panel
+          .tabsInHeader=${sidebarMainPanel(state.sidebarLayout)?.slot !== "workspace"}
+          .previews=${workspace.previews}
+          .activeId=${workspace.activePreviewId}
+          .browser=${params.workspace}
+          .renderDetail=${params.renderDetail}
+          .onSelect=${(id: string | null) => selectSessionWorkspacePreview(state, id)}
+          .onClose=${(id: string) => closeSessionWorkspacePreview(state, id)}
+        ></openclaw-chat-files-panel>`
       : (params?.workspace ?? null);
   const pluginPanels = new Map<SidebarSlotId, ControlUiRegistration<ControlUiPanel> | undefined>(
     (params?.pluginPanels ?? []).map((entry) => [`plugin:${entry.key}`, entry]),

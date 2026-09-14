@@ -2,6 +2,7 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { html, nothing, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
+import { isSensitiveConfigPath } from "../../../src/config/sensitive-paths.js";
 import type { ConfigUiHints } from "../api/types.ts";
 import { icons } from "../components/icons.ts";
 import { t } from "../i18n/index.ts";
@@ -14,6 +15,8 @@ import type { ConfigSearchCriteria } from "./config-form.search.ts";
 import {
   configFieldId,
   hasSensitiveConfigData,
+  hintForPath,
+  pathKey as configPathKey,
   redactedPlaceholder,
   type JsonSchema,
 } from "./config-form.shared.ts";
@@ -50,6 +53,7 @@ export type ConfigNodeRenderParams = {
   showHeaderMeta?: boolean;
   searchCriteria?: ConfigSearchCriteria;
   revealSensitive?: boolean;
+  maskSensitive?: boolean;
   isSensitivePathRevealed?: (path: Array<string | number>) => boolean;
   onToggleSensitivePath?: (path: Array<string | number>) => void;
   onPatch: (path: Array<string | number>, value: unknown) => boolean | void;
@@ -62,6 +66,7 @@ export type ConfigNodeRenderer = (
 
 type SensitiveRenderState = {
   isSensitive: boolean;
+  isMasked: boolean;
   isRedacted: boolean;
   isRevealed: boolean;
   canReveal: boolean;
@@ -92,27 +97,6 @@ export function schemaWithDefault(schema: JsonSchema, value: unknown): JsonSchem
   return { ...schema, default: value };
 }
 
-function formatComparablePrimitive(value: unknown): string | null {
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean" ||
-    typeof value === "bigint"
-  ) {
-    return String(value);
-  }
-  return null;
-}
-
-function matchesComparablePrimitiveValue(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) {
-    return true;
-  }
-  const leftComparable = formatComparablePrimitive(left);
-  const rightComparable = formatComparablePrimitive(right);
-  return leftComparable !== null && leftComparable === rightComparable;
-}
-
 export function isSecretRefObject(value: unknown): value is {
   source: string;
   id: string;
@@ -132,7 +116,8 @@ export function getSensitiveRenderState(params: {
   path: Array<string | number>;
   value: unknown;
   hints: ConfigUiHints;
-  revealSensitive: boolean;
+  revealSensitive?: boolean;
+  maskSensitive?: boolean;
   isSensitivePathRevealed?: (path: Array<string | number>) => boolean;
 }): SensitiveRenderState {
   const isSensitive = hasSensitiveConfigData(params.value, params.path, params.hints);
@@ -146,6 +131,14 @@ export function getSensitiveRenderState(params: {
     (params.revealSensitive || (params.isSensitivePathRevealed?.(params.path) ?? false));
   return {
     isSensitive,
+    isMasked:
+      params.maskSensitive === true &&
+      !params.revealSensitive &&
+      !isRevealed &&
+      (params.value === undefined || typeof params.value === "string") &&
+      (hintForPath(params.path, params.hints)?.sensitive ||
+        isSensitiveConfigPath(configPathKey(params.path)) ||
+        isSensitive),
     isRedacted: isSensitive && !isRevealed,
     isRevealed,
     canReveal: isSensitive && !sentinel,
@@ -277,21 +270,6 @@ export function renderFieldRow(params: {
   `;
 }
 
-export function renderFlatDefaultRow(
-  description: TemplateResult | typeof nothing,
-): TemplateResult | typeof nothing {
-  if (description === nothing) {
-    return nothing;
-  }
-  return html`
-    <div class="settings-row">
-      <div class="settings-row__text">
-        <span class="settings-row__desc">${description}</span>
-      </div>
-    </div>
-  `;
-}
-
 export function renderCollectionDefaultDescription(
   params: ConfigNodeRenderParams,
   effectiveValue: unknown,
@@ -326,7 +304,7 @@ export function renderSegmentedControl(params: {
   onSelect: (value: unknown) => boolean | void;
 }): TemplateResult {
   const selectedIndex = params.options.findIndex((option) =>
-    matchesComparablePrimitiveValue(option, params.resolvedValue),
+    configValuesEqual(option, params.resolvedValue),
   );
   return renderSettingsSegmented({
     value: selectedIndex < 0 ? "" : String(selectedIndex),

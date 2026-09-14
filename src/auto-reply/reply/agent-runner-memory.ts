@@ -61,6 +61,7 @@ import { readSessionMessagesAsync } from "../../gateway/session-transcript-reade
 import { logVerbose } from "../../globals.js";
 import { isAbortError } from "../../infra/abort-signal.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent-run-registry.js";
+import { emitAgentRunStatusEvent } from "../../infra/agent-run-status-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveMemoryFlushPlan, type MemoryFlushPlan } from "../../plugins/memory-state.js";
@@ -1129,12 +1130,9 @@ export async function runSessionCompactionIfNeeded(params: {
               typeof activeTranscriptBytes === "number" &&
               typeof maxActiveTranscriptBytes === "number"
                 ? {
-                    withCompactionPersistence: (
-                      append: () => string,
-                      validateAppend: (entryId: string, appendedText: string) => boolean,
-                    ) => {
+                    withCompactionPersistence: (prepared) => {
                       assertActive();
-                      const entryId = persistCompactionBoundaryWithSessionEntrySync(
+                      const committed = persistCompactionBoundaryWithSessionEntrySync(
                         {
                           ...compactionTarget,
                           expectedLifecycleRevision: expectedSession.lifecycleRevision,
@@ -1142,17 +1140,16 @@ export async function runSessionCompactionIfNeeded(params: {
                           sessionId: expectedSession.sessionId,
                         },
                         {
-                          append,
+                          prepared,
                           transcriptByteCompactionLatch: {
                             activeBytes: activeTranscriptBytes,
                             sessionId: expectedSession.sessionId,
                             maxBytes: maxActiveTranscriptBytes,
                           },
-                          validateAppend,
                         },
                       );
                       hostAccountingCommitted = true;
-                      return entryId;
+                      return committed;
                     },
                   }
                 : {}),
@@ -1280,7 +1277,7 @@ export async function runMemoryFlushIfNeeded(params: {
   cfg: OpenClawConfig;
   followupRun: FollowupRun;
   promptForEstimate?: string;
-  opts?: Pick<GetReplyOptions, "promptCacheKey">;
+  opts?: Pick<GetReplyOptions, "promptCacheKey" | "runId">;
   defaultModel: string;
   resolvedVerboseLevel: VerboseLevel;
   sessionEntry?: SessionEntry;
@@ -1629,6 +1626,15 @@ export async function runMemoryFlushIfNeeded(params: {
   });
   const flushedCompactionCount = activeSessionEntry?.compactionCount ?? 0;
   let visibleErrorPayloads: ReplyPayload[] = [];
+  // Only the bounded phase belongs to the parent turn; maintenance content stays private.
+  const parentRunId = params.opts?.runId;
+  if (parentRunId) {
+    emitAgentRunStatusEvent({
+      runId: parentRunId,
+      sessionKey: params.sessionKey,
+      phase: "memory_flushing",
+    });
+  }
   // Only runnable maintenance owns a run context. The matching finally is
   // the sole cleanup path so setup, execution, and persistence exits cannot orphan it.
   try {
@@ -1751,7 +1757,9 @@ export async function runMemoryFlushIfNeeded(params: {
           abortSignal: deferredLifecycle.signal,
           onDeferredLifecycleOwner: deferredLifecycle.adopt,
           onDeferredLifecycleAbort: deferredLifecycle.abort,
+          onRetryWait: deferredLifecycle.beginRetryWait,
           assistantErrorTranscript: runOptions.assistantErrorTranscript,
+          authProfileFailurePolicy: runOptions.authProfileFailurePolicy,
           contextEngineLogicalTurnLease: runOptions.contextEngineLogicalTurnLease,
           onContextEngineTurnCandidate: runOptions.onContextEngineTurnCandidate,
         });
@@ -1787,6 +1795,13 @@ export async function runMemoryFlushIfNeeded(params: {
   } catch (error) {
     return await recordFailure(error);
   } finally {
+    if (parentRunId && !abortSignal?.aborted) {
+      emitAgentRunStatusEvent({
+        runId: parentRunId,
+        sessionKey: params.sessionKey,
+        phase: "preparing_context",
+      });
+    }
     await deferredLifecycle.complete();
     if (flushRunRegistered) {
       clearAgentRunContext(flushRunId);

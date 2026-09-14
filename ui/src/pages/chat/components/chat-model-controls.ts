@@ -1,6 +1,12 @@
 import { html, nothing } from "lit";
-import type { ModelCatalogEntry, SessionsListResult } from "../../../api/types.ts";
+import type { ChatAccountSelection } from "../../../../../packages/gateway-protocol/src/index.ts";
+import type {
+  ModelAuthStatusResult,
+  ModelCatalogEntry,
+  SessionsListResult,
+} from "../../../api/types.ts";
 import { t } from "../../../i18n/index.ts";
+import { registerModelControlsEnglish } from "../../../i18n/locales/en-model-controls.ts";
 import {
   normalizeChatModelProviderId,
   resolvePreferredServerChatModelValue,
@@ -15,12 +21,29 @@ import {
   resolveChatThinkingSelectState,
   type ChatThinkingTarget,
 } from "../../../lib/chat/thinking.ts";
+import {
+  canonicalModelAuthProviderId,
+  listEffectiveModelAuthProviders,
+} from "../../../lib/model-auth.ts";
+import { describeModelProviderAuth } from "../../../lib/model-provider-auth-label.ts";
+import {
+  isSessionRuntimePinned,
+  resolveModelRuntimeEntry,
+} from "../../../lib/model-runtime-choice.ts";
 import { renderChatEffortPicker } from "./chat-effort-picker.ts";
-import type {
-  ChatModelPickerOption,
-  ChatModelPickerTargetGroup,
+import type { ChatModelAccountSection } from "./chat-model-account-control.ts";
+import {
+  isModelPickerOptionSelected,
+  type ChatModelPickerOption,
+  type ChatModelPickerTargetGroup,
 } from "./chat-model-picker-options.ts";
-import { renderChatModelPicker, type ChatModelCatalogState } from "./chat-model-picker.ts";
+import {
+  renderChatModelPicker,
+  type ChatModelCatalogState,
+  type ChatModelProviderAuth,
+} from "./chat-model-picker.ts";
+
+registerModelControlsEnglish();
 
 export type { ChatModelCatalogState } from "./chat-model-picker.ts";
 
@@ -30,7 +53,9 @@ type ChatContextWindowTarget = Pick<
 >;
 
 type ChatModelControlsProps = {
-  renderAccountControl?: (model: string) => unknown;
+  modelAuthStatusResult?: ModelAuthStatusResult | null;
+  accountSelection?: ChatAccountSelection | null;
+  renderAccountSection?: (model: string) => ChatModelAccountSection | undefined;
   activeRunId: string | null;
   agentDefaultModel?: string;
   connected: boolean;
@@ -47,10 +72,12 @@ type ChatModelControlsProps = {
   modelsLoading?: boolean;
   modelMutationDisabledReason?: string;
   effortMutationDisabledReason?: string;
+  contextWindowMutationDisabledReason?: string;
   fastModeTarget?: ChatFastModeTarget;
   sending: boolean;
   sessionKey: string;
   selectedSession: SessionsListResult["sessions"][number] | undefined;
+  selectedAgentRuntime?: string;
   sessionsResult: SessionsListResult | null;
   stream: string | null;
   contextWindowTarget?: ChatContextWindowTarget;
@@ -61,7 +88,7 @@ type ChatModelControlsProps = {
   onModelSetup?: () => void;
   onModelPickerOpen?: () => unknown;
   onModelPickerOpenChange?: (open: boolean) => void;
-  onModelSelect?: (value: string, sessionKey: string) => unknown;
+  onModelSelect?: (value: string, sessionKey: string, agentRuntime?: string | null) => unknown;
   onModelPickerTargetRetry?: (groupId: string) => unknown;
   onModelPickerTargetSelect?: (groupId: string, value: string) => unknown;
   onRequestUpdate?: () => void;
@@ -198,6 +225,27 @@ function resolveCatalogTriggerStatus(
 
 export function renderChatModelControls(props: ChatModelControlsProps) {
   const catalog = prepareChatModelCatalog(props.modelCatalog);
+  const providerAuth = new Map<string, ChatModelProviderAuth>();
+  const headingKey = (id: string) =>
+    normalizeChatModelProviderGroupId(
+      canonicalModelAuthProviderId(normalizeChatModelProviderId(id)),
+    );
+  // Alias records (e.g. google and google-gemini-cli) share one heading, so merge
+  // them under that key first; iterating raw records let the later one overwrite it.
+  for (const provider of listEffectiveModelAuthProviders(
+    (props.modelAuthStatusResult?.providers ?? []).map((record) =>
+      Object.assign({}, record, { provider: headingKey(record.provider) }),
+    ),
+  )) {
+    const selectedId =
+      props.accountSelection?.kind === "automatic"
+        ? undefined
+        : props.accountSelection?.authProfileId;
+    const auth = describeModelProviderAuth(provider, { authProfileId: selectedId });
+    if (auth) {
+      providerAuth.set(headingKey(provider.provider), auth);
+    }
+  }
   const {
     currentOverride,
     defaultModel,
@@ -237,6 +285,7 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
     ? { ...resolvedFastMode, disabled: true }
     : resolvedFastMode;
   const activeSession = props.selectedSession;
+  const runtimeSelectionLocked = activeSession?.runtimeSelectionLocked === true;
   const currentProviderHint = activeSession?.modelProvider ?? "";
   const hasPendingModelSelection = Object.hasOwn(props.modelOverrides ?? {}, props.sessionKey);
   const activeModelValue = hasPendingModelSelection
@@ -255,7 +304,7 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
       ? t("chat.modelControls.defaultWithModel", { model: canonicalDefaultLabel })
       : defaultLabel;
   const normalizedDefaultModel = defaultModel.trim().toLowerCase();
-  const modelOptions: ChatModelPickerOption[] = selectOptions.map((option) => {
+  const modelOptions: ChatModelPickerOption[] = selectOptions.flatMap((option) => {
     const catalogEntry = catalog.entry(option.value);
     const isDefault =
       option.value.trim().toLowerCase() === normalizedDefaultModel ||
@@ -268,6 +317,9 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
         ? agentRuntime.id.trim()
         : undefined;
     const pickerOption: ChatModelPickerOption = {
+      ...(catalogEntry?.runtimeChoices?.length && !runtimeSelectionLocked
+        ? { agentRuntime: agentRuntime?.id ?? null, agentRuntimeId: agentRuntime?.id }
+        : {}),
       commitValue: isDefault ? "" : option.value,
       isDefault,
       value: option.value,
@@ -294,8 +346,47 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
       pickerOption.disabled = true;
       pickerOption.unavailableReason = option.unavailableReason;
     }
-    return pickerOption;
+    const options = [pickerOption];
+    for (const choice of runtimeSelectionLocked ? [] : (catalogEntry?.runtimeChoices ?? [])) {
+      options.push({
+        value: option.value,
+        commitValue: option.value,
+        isDefault: false,
+        label: pickerOption.label,
+        provider: pickerOption.provider,
+        agentRuntime: choice.agentRuntime.id,
+        runtimeOverride: choice.agentRuntime.id,
+        agentRuntimeId: choice.agentRuntime.id,
+        contextWindow: choice.contextWindow,
+        supportsTools: choice.supportsTools,
+        disabled: choice.available === false,
+        unavailableReason: choice.unavailableReason,
+      });
+    }
+    return options;
   });
+  // Only a pin recorded on the session row makes Default a reset target: New Session
+  // drafts have no row, and a local optimistic override is not yet a recorded pin.
+  const sessionModelPinned =
+    props.selectedSession?.modelOverrideSource === "user" ||
+    (!runtimeSelectionLocked && isSessionRuntimePinned(props.selectedSession?.agentRuntime));
+  // That pin must stay clearable even when the configured default is absent from
+  // this catalog. Without it the row has no job (an agent-scoped catalog may
+  // legitimately omit the Gateway default), so nothing is synthesized.
+  if (
+    defaultModel &&
+    sessionModelPinned &&
+    modelOptions.length > 0 &&
+    !modelOptions.some((option) => option.isDefault)
+  ) {
+    modelOptions.unshift({
+      commitValue: "",
+      isDefault: true,
+      value: defaultModel,
+      label: formatPickerModelLabel(pickerDefaultLabel),
+      provider: catalog.provider(defaultModel, defaultProviderHint),
+    });
+  }
   const currentCatalogEntry = catalog.entry(currentOverride);
   if (
     currentOverride &&
@@ -320,11 +411,21 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
     });
   }
   // A persisted pin can match a changed default; equality cannot establish inheritance.
-  const pickerValue = modelOverrideSource === null ? "" : currentOverride;
-  const activeModelOption =
-    pickerValue === ""
-      ? modelOptions.find((option) => option.isDefault)
-      : modelOptions.find((option) => option.value === pickerValue);
+  const selectedAgentRuntime =
+    props.selectedAgentRuntime ??
+    props.selectedSession?.agentRuntime?.id ??
+    catalog.entry(currentOverride || defaultModel)?.agentRuntime?.id;
+  const defaultRuntime =
+    defaultCatalogEntry?.agentRuntime?.id ?? props.sessionsResult?.defaults?.agentRuntime?.id;
+  // A default model can still have a runtime pin; only the configured model/runtime pair inherits Default.
+  const pickerValue =
+    modelOverrideSource === null &&
+    (!selectedAgentRuntime || selectedAgentRuntime === defaultRuntime)
+      ? ""
+      : currentOverride || defaultModel;
+  const activeModelOption = modelOptions.find((option) =>
+    isModelPickerOptionSelected(option, pickerValue, selectedAgentRuntime),
+  );
   const activeSessionModel = activeSession?.model
     ? catalog.entry(
         resolvePreferredServerChatModelValue(
@@ -337,7 +438,8 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
   const activeOptionModel = activeModelOption ? catalog.entry(activeModelOption.value) : undefined;
   const activeSessionRuntime = activeSession?.agentRuntime?.id.trim().toLowerCase();
   const activeOptionRuntime = (
-    activeOptionModel?.agentRuntime?.id ??
+    resolveModelRuntimeEntry(activeOptionModel, activeModelOption?.agentRuntime)?.agentRuntime
+      ?.id ??
     (activeModelOption?.isDefault ? props.sessionsResult?.defaults?.agentRuntime?.id : undefined)
   )
     ?.trim()
@@ -380,12 +482,10 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
     modelOptions.length,
     selectionKnown,
   );
-  // A verified-empty catalog means there is nothing to reason about: the effort
-  // picker would only steer a model that cannot be selected, so it hides with it.
   const hasResolvableModel =
     managedCatalog.status === "ready" &&
-    (modelOptions.some((option) => !option.disabled) ||
-      (props.modelSelectionLocked === true && activeModelOption !== undefined));
+    activeModelOption?.disabled !== true &&
+    modelOptions.some((option) => !option.disabled);
   const busy =
     props.loading || props.sending || Boolean(props.activeRunId) || props.stream !== null;
   const commonDisabled =
@@ -421,20 +521,20 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
   return html`
     <div class="chat-controls__session chat-controls__model chat-controls__model-settings">
       ${renderChatModelPicker({
-        accountControl: props.renderAccountControl?.(currentOverride || defaultModel),
+        providerAuth: props.modelAuthStatusResult ? providerAuth : undefined,
+        accountSection: props.renderAccountSection?.(currentOverride || defaultModel),
         contextWindow:
           contextWindows.length > 1
             ? {
                 options: contextWindows,
                 selected: selectedContextWindow,
                 ...(defaultContextWindow ? { defaultId: defaultContextWindow } : {}),
-                disabled: commonDisabled || effortMutationDisabled,
+                disabled: commonDisabled || Boolean(props.contextWindowMutationDisabledReason),
                 onSelect: async (next, targetSessionKey) => {
                   await props.onContextWindowSelect?.(next, targetSessionKey);
                 },
               }
             : undefined,
-        defaultModelLabel: formatPickerModelLabel(pickerDefaultLabel),
         disabled: modelDisabled,
         disabledReason: props.modelMutationDisabledReason,
         modelCatalogState: managedCatalog,
@@ -446,7 +546,8 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
         modelOptions,
         targetGroups: props.modelPickerTargetGroups,
         selectedModelValue: pickerValue,
-        sessionModelPinned: modelOverrideSource === "user",
+        selectedAgentRuntime,
+        sessionModelPinned,
         sessionKey: props.sessionKey,
         triggerModelLabel: formatPickerModelLabel(committedModelLabel),
         triggerModelValue,
@@ -456,8 +557,8 @@ export function renderChatModelControls(props: ChatModelControlsProps) {
         onModelSetup: props.onModelSetup,
         onOpen: props.onModelPickerOpen,
         onOpenChange: props.onModelPickerOpenChange,
-        onModelSelect: async (next, targetSessionKey) =>
-          props.onModelSelect?.(next, targetSessionKey),
+        onModelSelect: async (next, targetSessionKey, agentRuntime) =>
+          props.onModelSelect?.(next, targetSessionKey, agentRuntime),
         onTargetRetry: props.onModelPickerTargetRetry,
         onTargetSelect: props.onModelPickerTargetSelect,
         onRequestUpdate: props.onRequestUpdate,

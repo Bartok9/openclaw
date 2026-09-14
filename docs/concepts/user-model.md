@@ -61,13 +61,15 @@ My GitHub requires an authenticated, durable Gateway profile, including the loca
 
 Open the compact account arrow beside **Publish PR** to inspect the publisher and account help. This is available for an idle session with a reconciled worktree or accepted repository checkpoint. The effective shared account remains the default. When only a shared account is available, the popover is informational, with no redundant selector. When multiple accounts are available, choose the publisher in the popover. **My GitHub** always requires explicit selection, even when it is the only available account. If the agent has its own override, the shared account is labeled as an override rather than System.
 
-The account arrow appears only while publication is idle and the account selection is unlocked, before a publication request or result. Pending status, retry actions, confirmation details, errors, and publication results remain inline, not inside the popover.
+The composer shows either unpublished branch changes or PR rows. New changes replace earlier PR history, including changes made after merging on the same branch. The account arrow appears only while publication is idle and the account selection is unlocked. Pending status, retry actions, confirmation details, and errors stay inside the current row. Successful publication shows a compact PR link until GitHub metadata supplies the normal PR row; it does not add a separate publication card.
 
-If the Gateway rejects the selected account before accepting the first publication request, choose **Refresh publication**, review the current account, then explicitly publish again. An unknown outcome keeps the original account and request locked: **Retry publication** checks that same request instead of switching accounts or starting another publication.
+If the Gateway rejects the selected account before accepting the first publication request, choose **Refresh publication**, review the current account, then explicitly publish again. An unknown outcome keeps the original account and request locked. For shared publication, **Refresh publication** looks up the receipt using the original invocation key; finding no receipt does not prove that the request never ran. **Retry publication** is an explicit replay of that same idempotent request, not a switch of account or a new publication.
 
-Publication state survives navigation between chats, including when an inactive chat pane is unloaded. Split panes showing the same chat share its publication progress and retry. The page retains up to 32 publication attempts within the current authenticated Gateway connection. At capacity, existing retries remain available. Complete and review an existing publication, then select **Choose a new publication** before starting another. Read-only operators can **Dismiss** an observed completed result without publishing or confirming anything.
+Publication state survives navigation between chats, including when an inactive chat pane is unloaded. Split panes showing the same chat share its publication progress and retry. The page retains up to 32 publication attempts within the current authenticated Gateway connection. At capacity, existing retries remain available. Dismiss a completed PR row, or select **Choose a new publication** after a failed attempt, before starting another. Read-only operators can dismiss an observed completed result without publishing or confirming anything.
 
-Pending session deletion blocks publication actions without discarding the original request. A failed deletion restores its retry. Confirmed deletion retires the attempt. The page clears this memory on reload or connection changes. Profile and session access changes also retire affected attempts.
+Shared publication progress comes from Gateway-owned receipts. **Check status** reads the recorded outcome without executing publication again. Receipt changes refresh the UI through the existing session event stream, with bursts coalesced behind an active request; recovering that event subscription also refreshes any pending observation. Reloading or reconnecting discovers the latest applicable shared receipt for the current session and workspace, including a completion missed while offline. Dismissing the completed PR row or choosing a new publication after failure acknowledges that terminal receipt for the current presentation, so a refresh does not immediately restore it. Completed shared requests can be recovered from the Gateway instead of retaining an offscreen browser operation. Personal receipts and confirmation remain bound to their original authenticated owner.
+
+Pending session deletion blocks publication actions without discarding the original request. A failed deletion restores its retry. Confirmed deletion retires the attempt. The page clears this memory on reload or connection changes. Profile, session access, and workspace changes also retire affected browser state; they never retarget an existing Gateway request.
 
 Publication requires `operator.write` and current access to change the session. Connecting your account alone does not grant either permission.
 
@@ -148,10 +150,20 @@ Keep the superseded entry next to its replacement so the current directive is un
 
 ## Keep it compact
 
-`USER.md` has a deliberately smaller bootstrap budget than general workspace files. When it becomes crowded, remove stale superseded entries and move project detail that does not change behavior into daily memory or `MEMORY.md`.
+`USER.md` has a fixed 4,000-character bootstrap cap, smaller than the general per-file budget. The `agents.defaults.bootstrapMaxChars` and `agents.entries.*.bootstrapMaxChars` settings can only lower this cap for `USER.md`; they cannot raise it. Profile guidance is meant to stay directive-sized so it cannot crowd project rules or durable facts out of the shared prompt budget.
+
+When `USER.md` approaches the cap:
+
+1. Remove stale superseded entries (keep the replacement next to the old entry so the current directive stays unambiguous).
+2. Move durable facts and lessons that do not change how you should be assisted into `MEMORY.md`.
+3. Move detailed observations and running project context into daily `memory/YYYY-MM-DD.md` files.
+4. Use [standing intents](/concepts/standing-intents) for event-conditioned future actions, so the trigger stays injected without the full detail.
+
+`MEMORY.md` is injected with the workspace bootstrap under the normal per-file budget in eligible private sessions — subagent, cron, group, and channel sessions omit root memory, and memory without trusted provenance is filtered out (see [Memory provenance](/concepts/memory-provenance)). Daily memory files are retrieved on demand, so detail moved to daily memory stays reachable without spending the always-injected `USER.md` budget. When the fixed cap limits `USER.md`, `openclaw doctor` names the cap and recommends compacting the file. If the shared total budget also limits injection, Doctor keeps the advice to reduce total bootstrap content or tune `bootstrapTotalMaxChars`.
 
 ## Related
 
 - [Memory overview](/concepts/memory)
+- [Memory architecture](/concepts/memory-architecture)
 - [Standing intents](/concepts/standing-intents)
 - [Agent workspace](/concepts/agent-workspace)

@@ -117,12 +117,20 @@ export async function recoverEmbeddedRunAttempt(input: {
   } = projectAgentRunAttemptTerminal(attempt.terminal);
   const terminalInterrupted = isEmbeddedRunTerminalInterrupted(terminalState.outcome);
   const currentAttemptReplaySafe = isCurrentAttemptReplaySafe(attempt);
+  const settledEvidence = resolveSettledToolBatchEvidence(attempt);
+  // A model idle timeout after settled tools can resume their recorded results.
+  // Side effects still forbid replaying the original prompt or switching models.
+  const canContinueSettledIdleTimeout =
+    idleTimedOut &&
+    settledEvidence.allToolsProvenSettled &&
+    !settledEvidence.intentionalTermination &&
+    !hasAsyncActivity(attempt.toolMetas) &&
+    !attempt.didSendDeterministicApprovalPrompt;
   // Mid-turn overflow continues from the persisted tool results and never
   // replays the assistant call. Generic tools must still be fully settled; only
   // a batch whose exec result parked a Code Mode run (producer-recorded) may
   // continue with lifecycle items active — the nested call stays owned by the
   // code-mode run registry and resumes through `wait`, exactly as across turns.
-  const settledEvidence = resolveSettledToolBatchEvidence(attempt);
   const midTurnBatchSettled =
     settledEvidence.allToolsProvenSettled || settledEvidence.parkedCodeModeRun;
   const canContinueSettledMidTurnOverflow =
@@ -130,6 +138,18 @@ export async function recoverEmbeddedRunAttempt(input: {
     attempt.preflightRecovery?.source === "mid-turn" &&
     midTurnBatchSettled &&
     !hasAsyncActivity(attempt.toolMetas);
+  // A provider can reject the next prompt after writes have settled. Compact
+  // their recorded results under this owner without replaying the original task.
+  const canRecoverSettledToolResults =
+    !runtime.pluginHarnessOwnsTransport &&
+    !terminalInterrupted &&
+    (!promptError || promptErrorSource === "prompt") &&
+    settledEvidence.allToolsProvenSettled &&
+    !settledEvidence.intentionalTermination &&
+    !hasAsyncActivity(attempt.toolMetas) &&
+    !attempt.yieldDetected &&
+    !attempt.clientToolCalls &&
+    !attempt.didSendDeterministicApprovalPrompt;
   const { signalOwnedInterruption } = terminalState;
   const assistantOverflowCandidate =
     currentAttemptCompletedAssistant !== undefined
@@ -308,7 +328,9 @@ export async function recoverEmbeddedRunAttempt(input: {
     !timedOutByRunBudget &&
     !timedOutDuringCompaction &&
     !timedOutDuringToolExecution &&
-    (!terminalInterrupted || (currentAttemptReplaySafe && !runtime.pluginHarnessOwnsTransport)) &&
+    (!terminalInterrupted ||
+      (!runtime.pluginHarnessOwnsTransport &&
+        (currentAttemptReplaySafe || canContinueSettledIdleTimeout))) &&
     !attempt.yieldDetected &&
     !attempt.clientToolCalls &&
     !attempt.codexAppServerFailure &&
@@ -351,7 +373,11 @@ export async function recoverEmbeddedRunAttempt(input: {
     });
     return retry({ lastRetryFailoverReason: failureReason });
   }
-  if (!currentAttemptReplaySafe && !canContinueSettledMidTurnOverflow) {
+  if (
+    !currentAttemptReplaySafe &&
+    !canContinueSettledMidTurnOverflow &&
+    !canRecoverSettledToolResults
+  ) {
     return { action: "proceed" };
   }
 

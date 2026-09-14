@@ -7,7 +7,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { upsertAcpSessionMeta } from "../acp/runtime/session-meta.js";
 import { bindActiveOperatorTurnAuthority } from "../agents/cron-creator-authority-context.js";
 import type { EmbeddedAgentQueueHandle } from "../agents/embedded-agent-runner/run-state.js";
@@ -28,6 +28,7 @@ import {
   loadSessionEntry,
   loadExactSessionEntry,
   loadTranscriptEventsSync,
+  listSessionPendingInputs,
   patchSessionEntryCore,
   replaceTranscriptEvents,
   replaceSessionEntry,
@@ -43,6 +44,9 @@ import { rotateAgentEventLifecycleGeneration } from "../infra/agent-events.js";
 import { onDiagnosticEvent, type DiagnosticPayloadLargeEvent } from "../infra/diagnostic-events.js";
 import { flushDiagnosticsTimeline } from "../infra/diagnostics-timeline.js";
 import { ExecApprovalsMigrationRequiredError } from "../infra/exec-approvals-migration-gate.js";
+import { isPathInside } from "../infra/path-guards.js";
+import { readPersistedMediaFacts } from "../media/media-facts.js";
+import { resolveMediaReferenceLocalPath } from "../media/media-reference.js";
 import { getMediaDir } from "../media/store.js";
 import { withPluginMetadataSnapshotScope } from "../plugins/current-plugin-metadata-snapshot.js";
 import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
@@ -55,11 +59,15 @@ import {
 import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { buildPersistedUserTurnMessage } from "../sessions/user-turn-transcript.js";
 import { recordAgentProvenance } from "../state/agent-provenance.js";
-import { openOpenClawAgentDatabase } from "../state/openclaw-agent-db.js";
+import { unregisterOpenClawAgentDatabase } from "../state/openclaw-agent-db-registry.js";
+import {
+  closeOpenClawAgentDatabasesAsync,
+  listOpenClawRegisteredAgentDatabases,
+  openOpenClawAgentDatabase,
+} from "../state/openclaw-agent-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
-import * as chatDisplayProjection from "./chat-display-projection.js";
 import { assertPluginMetadataSnapshotConsistency } from "./plugin-metadata.test-helpers.js";
 import {
   createDirectChatContext,
@@ -265,7 +273,21 @@ function createGatewayPluginMetadataSnapshot(config: OpenClawConfig): PluginMeta
     diagnostics: [],
   });
 }
-const autoCleanupTempDirs = useAutoCleanupTempDirTracker(afterEach);
+const autoCleanupTempDirs = createTempDirTracker();
+
+afterEach(async () => {
+  const roots = [...autoCleanupTempDirs.dirs];
+  for (const root of roots) {
+    await closeOpenClawAgentDatabasesAsync(root);
+  }
+  // The shared Gateway must not retain registrations for deleted fixture stores.
+  for (const database of listOpenClawRegisteredAgentDatabases()) {
+    if (roots.some((root) => isPathInside(root, database.path))) {
+      unregisterOpenClawAgentDatabase(database);
+    }
+  }
+  autoCleanupTempDirs.cleanup();
+});
 
 beforeAll(async () => {
   harness = await createGatewaySuiteHarness();
@@ -958,6 +980,7 @@ describe("gateway server chat", () => {
       const handler = createAgentEventHandler({
         broadcast: context.broadcast,
         broadcastToConnIds: context.broadcastToConnIds,
+        nodeHasSessionSubscribers: () => false,
         nodeSendToSession: context.nodeSendToSession,
         agentRunSeq: context.agentRunSeq,
         chatRunState: context.chatRunState,
@@ -1200,6 +1223,7 @@ describe("gateway server chat", () => {
       const handler = createAgentEventHandler({
         broadcast: context.broadcast,
         broadcastToConnIds: context.broadcastToConnIds,
+        nodeHasSessionSubscribers: () => false,
         nodeSendToSession: context.nodeSendToSession,
         agentRunSeq: context.agentRunSeq,
         chatRunState: context.chatRunState,
@@ -1224,6 +1248,7 @@ describe("gateway server chat", () => {
           sessionKey: "main",
           clientRunId: "run-active",
         });
+        const toolArgs = { path: "a" };
 
         handler({
           runId: "provider-run",
@@ -1237,7 +1262,7 @@ describe("gateway server chat", () => {
           seq: 2,
           stream: "tool",
           ts: 1_002,
-          data: { phase: "start", name: "read", toolCallId: "tool-active", args: { path: "a" } },
+          data: { phase: "start", name: "read", toolCallId: "tool-active", args: toolArgs },
         });
         handler({
           runId: "provider-run",
@@ -1291,6 +1316,7 @@ describe("gateway server chat", () => {
           },
         });
 
+        toolArgs.path = "producer changed after emission";
         const responses: Array<{ ok: boolean; payload?: unknown }> = [];
         await callDirectChat(method, {
           id: method,
@@ -2967,7 +2993,11 @@ describe("gateway server chat", () => {
         }),
         client: {
           connId: "conn-owner",
-          connect: { device: { id: "dev-owner" }, scopes: ["operator.write"] },
+          connect: {
+            ...makeGatewayWebchatClient(),
+            device: { id: "dev-owner" },
+            scopes: ["operator.write"],
+          },
         } as never,
         respond: ((ok, payload, error) => {
           responses.push({ ok, payload, error });
@@ -2984,16 +3014,15 @@ describe("gateway server chat", () => {
     }
   });
 
-  test("chat.send discards prepared inbound media when setup throws before the ACK", async () => {
-    openDirectChatSession();
+  test("chat.send retains durably admitted media when later setup throws before the ACK", async () => {
+    const { storePath } = openDirectChatSession();
     try {
       await writeStoredMainSession({
         modelProvider: "test-provider",
         model: "vision-model",
       });
       const context = createDirectChatContext({
-        // Throwing from addChatRun exercises handleChatSendSetupError — one of
-        // the pre-persistence exits that previously leaked staged media.
+        // addChatRun runs after durable input admission but before the ACK.
         addChatRun: vi.fn(() => {
           throw new Error("setup exploded before ack");
         }),
@@ -3009,8 +3038,6 @@ describe("gateway server chat", () => {
           idempotencyKey: "idem-setup-error-media",
           attachments: [
             {
-              // Non-image attachments always offload into the inbound media
-              // store during preparation; the failed send must discard them.
               type: "file",
               mimeType: "text/plain",
               fileName: "notes.txt",
@@ -3020,7 +3047,16 @@ describe("gateway server chat", () => {
         }),
         client: {
           connId: "conn-owner",
-          connect: { device: { id: "dev-owner" }, scopes: ["operator.write"] },
+          connect: {
+            client: {
+              id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+              mode: GATEWAY_CLIENT_MODES.BACKEND,
+              version: "1.0.0",
+              platform: "node",
+            },
+            device: { id: "dev-owner" },
+            scopes: ["operator.write"],
+          },
         } as never,
         respond: ((ok, payload, error) => {
           responses.push({ ok, payload, error });
@@ -3034,13 +3070,28 @@ describe("gateway server chat", () => {
           error: expect.anything(),
         },
       ]);
-      // Prepared inbound media has no transcript reference on this exit; the
-      // admission cleanup owner must discard it or the file is orphaned
-      // forever (the inbound sweep is off unless attachments.ttlHours is set).
-      await waitForFast(async () => {
-        const remaining = await fs.readdir(inboundDir).catch(() => []);
-        expect(remaining.filter((name) => !inboundBaseline.has(name))).toEqual([]);
-      }, FAST_WAIT_OPTS);
+      const pending = listSessionPendingInputs({
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        sessionId: "sess-main",
+        storePath,
+      });
+      expect(pending).toMatchObject({
+        total: 1,
+        items: [{ state: "interrupted", runId: "idem-setup-error-media" }],
+      });
+      const media = readPersistedMediaFacts(
+        expectDefined(pending.items[0]?.message, "Expected the retained pending input"),
+      );
+      expect(media).toHaveLength(1);
+      const retainedUrl = expectDefined(media?.[0]?.url, "Expected the pending attachment URL");
+      expect(retainedUrl).toMatch(/^media:\/\/inbound\//);
+      const retainedPath = await resolveMediaReferenceLocalPath(retainedUrl);
+      await expect(fs.readFile(retainedPath, "utf8")).resolves.toBe("offloaded inbound media");
+      const remaining = await fs.readdir(inboundDir);
+      expect(remaining.filter((name) => !inboundBaseline.has(name))).toEqual([
+        path.basename(retainedPath),
+      ]);
     } finally {
       resetDirectChatSession();
     }
@@ -3643,6 +3694,78 @@ describe("gateway server chat", () => {
       releaseMutation.resolve();
       releaseTerminalMutation.resolve();
       resetDirectChatSession();
+    }
+  });
+
+  test("chat.send exposes inline image uploads as managed media without duplicating vision input", async () => {
+    openDirectChatSession();
+    try {
+      testState.agentConfig = { model: { primary: "test-provider/vision-model" } };
+      await writeStoredMainSession({
+        modelProvider: "test-provider",
+        model: "vision-model",
+      });
+
+      const context = createDirectChatContext({
+        getRuntimeConfig,
+        loadGatewayModelCatalogSnapshot: vi
+          .fn<GatewayRequestContext["loadGatewayModelCatalogSnapshot"]>()
+          .mockResolvedValue(createChatVisionModelCatalogSnapshot()),
+      });
+      const pngB64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/woAAn8B9FD5fHAAAAAASUVORK5CYII=";
+      let captured: { ctx?: Record<string, unknown>; replyOptions?: GetReplyOptions } | undefined;
+      dispatchInboundMessageMock.mockImplementation(async (...args: unknown[]) => {
+        const [params] = args as [
+          {
+            ctx: Record<string, unknown>;
+            replyOptions?: GetReplyOptions;
+          },
+        ];
+        if (params.replyOptions?.runId === "idem-inline-image-managed-media") {
+          captured = {
+            ctx: params.ctx,
+            replyOptions: params.replyOptions,
+          };
+        }
+      });
+
+      const responses: Array<{ ok: boolean; payload?: unknown; error?: unknown }> = [];
+      await callDirectChat("chat.send", {
+        id: "inline-image-managed-media",
+        params: makeChatSendParams({
+          message: "inspect the uploaded file",
+          idempotencyKey: "idem-inline-image-managed-media",
+          attachments: [
+            {
+              type: "image",
+              mimeType: "image/png",
+              fileName: "dot.png",
+              content: pngB64,
+            },
+          ],
+        }),
+        respond: captureChatResponse(responses),
+        context,
+      });
+
+      expect(responses[0]?.ok).toBe(true);
+      await waitForFast(() => expect(captured).toBeDefined(), FAST_WAIT_OPTS);
+      expect(captured?.replyOptions?.images).toEqual([
+        { type: "image", data: pngB64, mimeType: "image/png", sourceIndex: 0 },
+      ]);
+      expect(captured?.ctx?.media).toEqual([
+        expect.objectContaining({
+          path: expect.any(String),
+          contentType: "image/png",
+          hydrationSuppressed: true,
+        }),
+      ]);
+      await waitForFast(() => expect(context.removeChatRun).toHaveBeenCalledTimes(1));
+    } finally {
+      dispatchInboundMessageMock.mockReset();
+      testState.agentConfig = undefined;
+      testState.sessionStorePath = undefined;
     }
   });
 
@@ -5278,6 +5401,7 @@ describe("gateway server chat", () => {
       expect(onQueuedFollowupReplyBatch).toBeTypeOf("function");
       await onQueuedFollowupReplyBatch?.({
         kind: "queued-followup",
+        completion: { kind: "completed" },
         runId: "queued-followup-agent-run",
         originatingChannel: "webchat",
         payloads: [{ text: "queued follow-up answer" }],
@@ -5348,10 +5472,19 @@ describe("gateway server chat", () => {
       turnAdoptionLifecycle?.onSettled?.();
       expect(context.chatQueuedTurns.has("idem-queued-followup")).toBe(false);
       expect(isSessionWorkAdmissionActive(storePath, ["agent:main:main", "sess-main"])).toBe(false);
-      await waitForFast(
-        () => expect(context.removeChatRun).toHaveBeenCalledTimes(1),
-        FAST_WAIT_OPTS,
-      );
+      await waitForFast(() => {
+        expect(context.removeChatRun).toHaveBeenCalledTimes(2);
+        expect(context.removeChatRun).toHaveBeenCalledWith(
+          "idem-queued-followup",
+          "idem-queued-followup",
+          "agent:main:main",
+        );
+        expect(context.removeChatRun).toHaveBeenCalledWith(
+          "queued-followup-agent-run",
+          "queued-followup-agent-run",
+          "agent:main:main",
+        );
+      }, FAST_WAIT_OPTS);
 
       let failedDispatchLifecycle: GetReplyOptions["turnAdoptionLifecycle"];
       dispatchInboundMessageMock.mockImplementationOnce(async (args: unknown) => {
@@ -5372,10 +5505,14 @@ describe("gateway server chat", () => {
         context,
       });
 
-      await waitForFast(
-        () => expect(context.removeChatRun).toHaveBeenCalledTimes(2),
-        FAST_WAIT_OPTS,
-      );
+      await waitForFast(() => {
+        expect(context.removeChatRun).toHaveBeenCalledTimes(3);
+        expect(context.removeChatRun).toHaveBeenCalledWith(
+          "idem-queued-followup-post-error",
+          "idem-queued-followup-post-error",
+          "agent:main:main",
+        );
+      }, FAST_WAIT_OPTS);
       const acceptedErrorEvents = broadcast.mock.calls.filter(
         ([event, payload]) =>
           event === "chat" &&
@@ -7581,7 +7718,7 @@ describe("gateway server chat", () => {
     });
   });
 
-  test("chat.history fills sparse pages without repeatedly projecting scanned transcript rows", async () => {
+  test("chat.history fills sparse pages with correct visible pagination", async () => {
     await withGatewayChatHarness(async ({ ws, createSessionDir }) => {
       await prepareMainHistoryHarness({ ws, createSessionDir });
       const startedAt = Date.now();
@@ -7594,31 +7731,16 @@ describe("gateway server chat", () => {
       );
       await writeMainSessionTranscript(events);
 
-      let projectedRows = 0;
-      const project = chatDisplayProjection.projectChatDisplayMessagesWithState;
-      const projectionSpy = vi
-        .spyOn(chatDisplayProjection, "projectChatDisplayMessagesWithState")
-        .mockImplementation((messages, options) => {
-          projectedRows += messages.length;
-          return project(messages, options);
-        });
-
-      try {
-        const page = await rpcReq<{
-          messages?: Array<{ __openclaw?: { seq?: number } }>;
-          nextOffset?: number;
-          hasMore?: boolean;
-        }>(ws, "chat.history", makeMainSessionParams({ limit: 25, offset: 0 }));
-        expect(page.ok).toBe(true);
-        expect(page.payload?.messages?.map(readOpenClawSeq)).toEqual(
-          Array.from({ length: 25 }, (_, index) => (index + 5) * 50 + 1),
-        );
-        expect(page.payload).toMatchObject({ hasMore: true, nextOffset: 1_250 });
-        expect(projectedRows).toBeGreaterThan(0);
-        expect(projectedRows).toBeLessThanOrEqual(events.length * 2);
-      } finally {
-        projectionSpy.mockRestore();
-      }
+      const page = await rpcReq<{
+        messages?: Array<{ __openclaw?: { seq?: number } }>;
+        nextOffset?: number;
+        hasMore?: boolean;
+      }>(ws, "chat.history", makeMainSessionParams({ limit: 25, offset: 0 }));
+      expect(page.ok).toBe(true);
+      expect(page.payload?.messages?.map(readOpenClawSeq)).toEqual(
+        Array.from({ length: 25 }, (_, index) => (index + 5) * 50 + 1),
+      );
+      expect(page.payload).toMatchObject({ hasMore: true, nextOffset: 1_250 });
     });
   });
 
@@ -8155,7 +8277,15 @@ describe("gateway server chat", () => {
       let aborted = false;
       await connectOk(ws);
 
-      await createSessionDir();
+      const sessionDir = await createSessionDir();
+      // Keep ACK timing independent of earlier custom-store fixture registrations.
+      testState.sessionStorePath = path.join(
+        sessionDir,
+        "agents",
+        "main",
+        "agent",
+        "openclaw-agent.sqlite",
+      );
       await writeMainSessionStore();
 
       mockGetReplyFromConfigOnce(async (_ctx, opts) => {
@@ -8186,7 +8316,6 @@ describe("gateway server chat", () => {
           idempotencyKey: "idem-abort-1",
           timeoutMs: 30_000,
         }),
-        2_000,
       );
 
       expect(sendRes.ok).toBe(true);

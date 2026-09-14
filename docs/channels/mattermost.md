@@ -30,7 +30,7 @@ Details: [Plugins](/tools/plugin)
 
 <Steps>
   <Step title="Ensure plugin is available">
-    Install `@openclaw/mattermost` with the command above, then restart the Gateway if it is already running.
+    Install `@openclaw/mattermost` with the command above. Check the [application result](/plugins/manage-plugins#apply-changes-and-inspect) before continuing.
   </Step>
   <Step title="Create a Mattermost bot">
     Create a Mattermost bot account, copy the **bot token**, and add the bot to the teams and channels it should read.
@@ -346,6 +346,7 @@ openclaw message read --channel mattermost --target channel:<channelId> --limit 
 - Direct operator calls rely on Mattermost's channel membership and `read_channel` permission. A provider 403 remains a normal, visible tool error.
 - Delegated reads of the current Mattermost conversation are allowed for the current account. Cross-channel delegated reads additionally require the destination channel ID under `channels.mattermost.groups`, a `"*"` groups entry, or `groupPolicy: "open"`. Cross-account and cross-channel DM reads fail closed.
 - History reads are disabled by default. Set `channels.mattermost.actions.messages: true` to enable them. Override the setting per account with `channels.mattermost.accounts.<id>.actions.messages`.
+- These access rules apply to both the bundled plugin and the official plugin installed through npm or ClawHub. Delegated reads require the calling run and plugin registration to remain active.
 
 ## Reactions (message tool)
 
@@ -372,6 +373,14 @@ Config:
 Send messages with clickable buttons. When a user clicks a button, the agent receives the selection and can respond.
 
 Buttons come from the semantic `presentation` payload (in normal agent replies and in `message action=send`). OpenClaw renders value buttons as Mattermost interactive buttons, keeps URL buttons visible in the message text, and downgrades select menus to readable text.
+
+The options an `ask_user` question offers are also rendered as buttons, and tapping one answers
+that question directly. The question stays answerable by typing, and an option the Gateway does
+not index stays in the prose instead: the "Other…" choice, and any prompt that asks more than one
+question or whose question is multi-select, secret, or does not offer two to four distinct options.
+Every other typed presentation action (`command`, `callback`, `approval`) stays readable text on
+Mattermost rather than becoming a button: a click here reaches the agent as a message rather than
+running the action, so a control would do something other than what it says.
 
 ```text
 message action=send channel=mattermost target=channel:<channelId> presentation={"blocks":[{"type":"buttons","buttons":[{"label":"Yes","value":"yes"},{"label":"No","value":"no"}]}]}

@@ -1,4 +1,3 @@
-import { resolve, isAbsolute } from "node:path";
 import { Type } from "typebox";
 import { findCapabilityProviderById } from "../../../packages/media-generation-core/src/capability-model-ref.js";
 import { normalizeMediaProviderId } from "../../../packages/media-understanding-common/src/provider-id.js";
@@ -31,13 +30,9 @@ import {
 } from "../../plugin-sdk/media-understanding.js";
 import { resolvePluginCapabilityProvider } from "../../plugins/capability-provider-runtime.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
-import { resolveUserPath } from "../../utils.js";
 import type { AuthProfileStore } from "../auth-profiles/types.js";
 import { isMinimaxVlmProvider } from "../minimax-vlm.js";
-import {
-  resolveImageFallbackCandidates,
-  resolveImageFallbackDefaultProvider,
-} from "../model-fallback-candidates.js";
+import { resolveImageFallbackCandidates } from "../model-fallback-candidates.js";
 import type { PreparedModelRuntimeSnapshot } from "../prepared-model-runtime.js";
 import { optionalFiniteNumberSchema, optionalPositiveIntegerSchema } from "../schema/typebox.js";
 import { readFiniteNumberParam, readPositiveIntegerParam } from "./common.js";
@@ -423,6 +418,7 @@ function resolveCompressionModelCandidates(params: {
   cfg?: OpenClawConfig;
   imageModelConfig?: ImageModelConfig | null;
   modelOverride?: string;
+  preparedModelRuntime?: PreparedModelRuntimeSnapshot;
 }): Array<{ provider: string; model: string }> {
   const overrideConfig = resolveImageModelConfigForOverride({
     cfg: params.cfg,
@@ -440,7 +436,7 @@ function resolveCompressionModelCandidates(params: {
     : params.cfg;
   return resolveImageFallbackCandidates({
     cfg: effectiveCfg,
-    defaultProvider: resolveImageFallbackDefaultProvider(effectiveCfg),
+    manifestPlugins: params.preparedModelRuntime?.metadataSnapshot,
   });
 }
 
@@ -607,6 +603,7 @@ async function runImagePrompt(params: {
 
   const result = await runWithImageModelFallback({
     cfg: effectiveCfg,
+    manifestPlugins: params.preparedModelRuntime?.metadataSnapshot,
     modelOverride: params.modelOverride,
     abortSignal: params.signal,
     run: async (provider, modelId) => {
@@ -637,6 +634,22 @@ async function runImagePrompt(params: {
         provider,
         providerRegistry,
       );
+      const request = {
+        provider,
+        model: modelId,
+        prompt: params.prompt,
+        maxTokens: resolveImageToolMaxTokens(undefined),
+        timeoutMs,
+        ...(params.signal ? { signal: params.signal } : {}),
+        cfg: providerCfg,
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+        agentDir: params.agentDir,
+        authStore: params.authStore,
+        ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+        ...(params.preparedModelRuntime
+          ? { preparedModelRuntime: params.preparedModelRuntime }
+          : {}),
+      };
       if (
         params.images.length > 1 &&
         (imageProvider?.describeImages || !imageProvider?.describeImage)
@@ -651,54 +664,12 @@ async function runImagePrompt(params: {
             fileName: `image-${index + 1}`,
             mime: image.mimeType,
           })),
-          provider,
-          model: modelId,
-          prompt: params.prompt,
-          maxTokens: resolveImageToolMaxTokens(undefined),
-          timeoutMs,
-          ...(params.signal ? { signal: params.signal } : {}),
-          cfg: providerCfg,
-          ...(params.agentId ? { agentId: params.agentId } : {}),
-          agentDir: params.agentDir,
-          authStore: params.authStore,
-          ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-          ...(params.preparedModelRuntime
-            ? { preparedModelRuntime: params.preparedModelRuntime }
-            : {}),
+          ...request,
         });
         return { text: described.text, provider, model: described.model ?? modelId };
       }
       const describeImage =
         imageProvider?.describeImage ?? imageToolProviderDeps.describeImageWithModel;
-      if (params.images.length === 1) {
-        const image = params.images.at(0);
-        if (!image) {
-          throw new Error("Image input disappeared during model execution");
-        }
-        // A run cancelled mid-dispatch must not buy another provider call.
-        params.signal?.throwIfAborted();
-        const described = await describeImage({
-          buffer: image.buffer,
-          fileName: "image-1",
-          mime: image.mimeType,
-          provider,
-          model: modelId,
-          prompt: params.prompt,
-          maxTokens: resolveImageToolMaxTokens(undefined),
-          timeoutMs,
-          ...(params.signal ? { signal: params.signal } : {}),
-          cfg: providerCfg,
-          ...(params.agentId ? { agentId: params.agentId } : {}),
-          agentDir: params.agentDir,
-          authStore: params.authStore,
-          ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-          ...(params.preparedModelRuntime
-            ? { preparedModelRuntime: params.preparedModelRuntime }
-            : {}),
-        });
-        return { text: described.text, provider, model: described.model ?? modelId };
-      }
-
       const parts: string[] = [];
       for (const [index, image] of params.images.entries()) {
         // A run cancelled mid-dispatch must not buy another provider call.
@@ -707,21 +678,15 @@ async function runImagePrompt(params: {
           buffer: image.buffer,
           fileName: `image-${index + 1}`,
           mime: image.mimeType,
-          provider,
-          model: modelId,
-          prompt: `${params.prompt}\n\nDescribe image ${index + 1} of ${params.images.length}.`,
-          maxTokens: resolveImageToolMaxTokens(undefined),
-          timeoutMs,
-          ...(params.signal ? { signal: params.signal } : {}),
-          cfg: providerCfg,
-          ...(params.agentId ? { agentId: params.agentId } : {}),
-          agentDir: params.agentDir,
-          authStore: params.authStore,
-          ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-          ...(params.preparedModelRuntime
-            ? { preparedModelRuntime: params.preparedModelRuntime }
-            : {}),
+          ...request,
+          prompt:
+            params.images.length === 1
+              ? params.prompt
+              : `${params.prompt}\n\nDescribe image ${index + 1} of ${params.images.length}.`,
         });
+        if (params.images.length === 1) {
+          return { text: described.text, provider, model: described.model ?? modelId };
+        }
         parts.push(`Image ${index + 1}:\n${described.text.trim()}`);
       }
       return {
@@ -752,6 +717,7 @@ export function createImageTool(options?: {
   workspaceDir?: string;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
   sandbox?: ImageSandboxConfig;
+  cwd?: string;
   fsPolicy?: ToolFsPolicy;
   agentChannel?: string | null;
   agentAccountId?: string | null;
@@ -939,7 +905,7 @@ export function createImageTool(options?: {
         // shared image registry here, so fail gracefully instead of attempting to
         // `fs.readFile("image:0")` and producing a noisy ENOENT.
         const refInfo = classifyMediaReferenceSource(normalizedRef);
-        const { isDataUrl, isFileUrl, isHttpUrl, isMediaStoreUrl } = refInfo;
+        const { isDataUrl, isHttpUrl } = refInfo;
         if (refInfo.hasUnsupportedScheme) {
           return {
             content: [
@@ -959,45 +925,19 @@ export function createImageTool(options?: {
           throw new Error("Sandboxed view_image does not allow remote URLs.");
         }
 
-        const resolvedImage = (() => {
-          if (sandboxConfig) {
-            return normalizedRef;
-          }
-          if (normalizedRef.startsWith("~")) {
-            return resolveUserPath(normalizedRef);
-          }
-          // Resolve relative paths against workspaceDir so agents can reference
-          // workspace-relative paths (e.g. "inbox/photo.png") without needing to
-          // know the absolute workspace location — matching the read tool behaviour.
-          if (
-            !isDataUrl &&
-            !isFileUrl &&
-            !isHttpUrl &&
-            !isMediaStoreUrl &&
-            !refInfo.looksLikeWindowsDrivePath &&
-            !isAbsolute(normalizedRef) &&
-            options?.workspaceDir
-          ) {
-            return resolve(options.workspaceDir, normalizedRef);
-          }
-          return normalizedRef;
-        })();
         const {
           resolvedPath,
           localRoots: mediaLocalRoots,
           rewrittenFrom,
         } = await resolveMediaToolReferenceAccess({
-          input: resolvedImage,
+          input: normalizedRef,
           isDataUrl,
           workspaceDir: options?.workspaceDir,
+          cwd: options?.cwd,
+          fsPolicy: options?.fsPolicy,
           sandbox: sandboxConfig,
-          rootOptions: {
-            workspaceOnly: options?.fsPolicy?.workspaceOnly === true,
-            cfg: options?.config,
-            channelId: options?.agentChannel ?? options?.currentChannelId,
-            accountId: options?.agentAccountId,
-          },
         });
+        const resolvedImage = resolvedPath ?? normalizedRef;
         const mediaInboundRoots = resolveMediaToolInboundRoots({
           workspaceOnly: options?.fsPolicy?.workspaceOnly === true,
           cfg: options?.config,

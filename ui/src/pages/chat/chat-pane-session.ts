@@ -27,6 +27,7 @@ import { parseAgentSessionKey, scopedSessionArtifactKey } from "../../lib/sessio
 import { releaseChatAttachmentPayloads } from "./attachment-payload-store.ts";
 import { catalogMessageId } from "./catalog-message-id.ts";
 import { loadChatBranches } from "./chat-history-branches.ts";
+import { getAcceptedChatHistorySession } from "./chat-history-state.ts";
 import {
   CATALOG_TOOL_RESULT_PREVIEW_MAX_CHARS,
   catalogRawResult,
@@ -37,14 +38,36 @@ import { retirePullRequestRefreshes } from "./chat-pull-request-refresh.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { resolveChatAgentId, selectedChatSessionRow } from "./chat-state-route.ts";
 import {
+  chatPullRequestId,
   dismissChatPullRequest,
   listDismissedChatPullRequests,
 } from "./components/chat-pull-requests.ts";
+import { scheduleControlUiAfterPaint } from "./performance.ts";
 import { scheduleChatScroll } from "./scroll.ts";
 
 export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
   private deferredSessionHydrationActive = false;
   private pendingDeferredSessionHydration: (() => void) | null = null;
+
+  protected secondarySessionReadsReady(explicit = false): boolean {
+    const state = this.state;
+    return Boolean(
+      state?.connected &&
+      this.presented &&
+      document.visibilityState !== "hidden" &&
+      (explicit ||
+        (!this.deferredSessionHydrationActive &&
+          (parseCatalogSessionKey(state.sessionKey) ||
+            this.transcriptReady ||
+            getAcceptedChatHistorySession(state)))),
+    );
+  }
+
+  protected get visibleSessionPullRequests(): ControlUiSessionPullRequest[] {
+    return this.sessionPullRequests.filter(
+      (pullRequest) => !this.dismissedSessionPullRequestIds.has(chatPullRequestId(pullRequest)),
+    );
+  }
 
   protected refreshSessionPullRequests(options: { refresh?: boolean } = {}): boolean {
     if (!this.presented) {
@@ -65,7 +88,7 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
       this.sessionPullRequests = [];
       this.sessionPullRequestsBranch = undefined;
       this.githubRepo = null;
-      this.sessionPullRequestsRateLimited = false;
+      this.sessionPullRequestsStatus = "ready";
       this.requestUpdate();
       return false;
     }
@@ -75,7 +98,7 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
       this.sessionPullRequests = [];
       this.sessionPullRequestsBranch = undefined;
       this.githubRepo = null;
-      this.sessionPullRequestsRateLimited = false;
+      this.sessionPullRequestsStatus = "ready";
       this.requestUpdate();
       return false;
     }
@@ -99,7 +122,7 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
       this.sessionPullRequests = [];
       this.sessionPullRequestsBranch = undefined;
       this.githubRepo = null;
-      this.sessionPullRequestsRateLimited = false;
+      this.sessionPullRequestsStatus = "ready";
       this.dismissedSessionPullRequestIds = new Set();
       this.requestUpdate();
       return refreshAdmitted;
@@ -137,7 +160,7 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
       this.githubPublication?.reset();
     }
     this.sessionPullRequestsBranch = result.branch;
-    this.sessionPullRequestsRateLimited = result.rateLimited;
+    this.sessionPullRequestsStatus = result.status;
     this.dismissedSessionPullRequestIds = listDismissedChatPullRequests(sessionKey);
     this.requestUpdate();
     return refreshAdmitted;
@@ -151,7 +174,7 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
     this.sessionPullRequests = [];
     this.sessionPullRequestsBranch = undefined;
     this.githubRepo = null;
-    this.sessionPullRequestsRateLimited = false;
+    this.sessionPullRequestsStatus = "ready";
     this.sessionPullRequestsExpanded = false;
     this.githubPublication?.detach();
     this.githubPublication = null;
@@ -200,18 +223,23 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
         retireIfCurrent();
         return;
       }
-      if (!this.presented) {
+      if (!this.presented || document.visibilityState === "hidden") {
         this.pendingDeferredSessionHydration = () => scheduleHydration(historyCommitted);
         return;
       }
       this.pendingDeferredSessionHydration = null;
       // These affordances do not shape the transcript. Start them together only
-      // after the authoritative history has committed so they cannot delay chat paint.
-      state.renderLifecycle.afterCommit((complete) => {
-        if (isCurrent() && this.presented) {
+      // after the transcript paints; a DOM commit still runs before the browser can paint.
+      scheduleControlUiAfterPaint(state, () => {
+        if (isCurrent() && this.presented && document.visibilityState !== "hidden") {
           this.deferredSessionHydrationActive = false;
+          state.requestUpdate?.();
+          void this.refreshTaskSuggestions({ automatic: true });
           if (historyCommitted) {
             this.markSessionRead(selectedChatSessionRow(state));
+          }
+          if (client) {
+            void this.loadHeaderPlatform(client, connectionGeneration);
           }
           void loadChatBranches(state);
           void this.probeSessionDiscussion(sessionKey);
@@ -222,7 +250,6 @@ export abstract class ChatPaneSession extends ChatPaneTaskSuggestions {
         } else {
           retireIfCurrent();
         }
-        complete();
       });
     };
     void transcriptLoad.then(scheduleHydration, () => scheduleHydration(false));

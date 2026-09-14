@@ -117,6 +117,7 @@ export type RunEmbeddedAgentParams = {
   messageProvider?: string;
   /** Capabilities declared by the gateway client that originated this run. */
   clientCaps?: string[];
+  gatewayUiCommandTarget?: import("../../../gateway/ui-command-target.types.js").GatewayUiCommandTarget;
   /** Host-admitted dashboard authoring without an originating inline renderer. */
   pinnedWidgetAuthoring?: boolean;
   /** Out-of-band plugin bindings attached by the run initiator. */
@@ -292,6 +293,8 @@ export type RunEmbeddedAgentParams = {
   expectedAgentHarnessRuntimeArtifact?: ExpectedAgentHarnessRuntimeArtifact;
   authProfileId?: string;
   authProfileIdSource?: "auto" | "user";
+  /** Disable fallback from the user-selected auth profile for a verification run. */
+  allowAuthProfileFallback?: boolean;
   thinkLevel?: ThinkLevel;
   fastMode?: FastMode;
   /** Stable outer-run start time for auto fast-mode cutoff across retries/fallbacks. */
@@ -490,6 +493,7 @@ export type EmbeddedForegroundPromptContext = Pick<
   | "messageChannel"
   | "messageProvider"
   | "clientCaps"
+  | "gatewayUiCommandTarget"
   | "toolBindings"
   | "chatType"
   | "agentAccountId"

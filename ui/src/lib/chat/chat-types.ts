@@ -7,6 +7,7 @@ import type {
   ChatSendIntent,
   QueueMode,
 } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
+import type { MessageClientSource } from "../../../../src/chat/message-client-source.js";
 import type { ClawHubRecommendation } from "../../../../src/shared/clawhub-recommendations.js";
 import type { BrowserTabTarget } from "../../components/browser/browser-target.ts";
 import type { toolIcons } from "../../components/icons-tools.ts";
@@ -193,8 +194,8 @@ export type ChatStreamSegment = {
   persisted?: true;
   /** Keyed item that consumed this cumulative occurrence; late updates cannot consume another. */
   retiredItemId?: string;
-  /** Original cumulative prefix when the item overtook its final chat delta. */
-  pendingStreamText?: string;
+  /** In-flight handoff owned by the retired cumulative prefix, not its live display. */
+  pendingCommentary?: { text: string; prefixLength: number };
   toolCallId?: string;
   itemId?: string;
 };
@@ -253,17 +254,45 @@ export type MessageGroup = {
   senderLabel?: string | null;
   senderSession?: { sessionKey?: string; agentId?: string } | null;
   sender?: SenderIdentity;
+  sourceClients?: MessageClientSource[];
   replyToSender?: SenderIdentity;
-  messages: Array<{ message: unknown; key: string; duplicateCount?: number }>;
+  messages: Array<{
+    message: unknown;
+    key: string;
+    duplicateCount?: number;
+    /** Rendered reply content, excluding assistant thinking tags. */
+    hasVisibleContent: boolean;
+  }>;
   visibleContent: "none" | "text" | "non-text";
   timestamp: number;
   isStreaming: boolean;
   runId?: string;
 };
 
+export type MessageImageSource = {
+  url?: string;
+  dataUrl?: string;
+  preferData?: true;
+  mimeType?: string;
+  artifactId?: string;
+  fileName?: string;
+  openUrl?: string;
+  alt?: string;
+  sizeBytes?: number;
+  width?: number;
+  height?: number;
+};
+
 /** Content item types in a normalized message */
 export type MessageContentItem =
   | ClawHubRecommendation
+  | {
+      type: "image";
+      sources: MessageImageSource[];
+      /** Canonical image blocks consume a persisted inline-layout slot, even if empty. */
+      inlineSlot?: true;
+      expiresAtMs?: number;
+    }
   | {
       type: "text" | "tool_call" | "tool_result";
       text?: string;
@@ -321,6 +350,7 @@ export type NormalizedMessage = {
   senderLabel?: string | null;
   senderSession?: { sessionKey?: string; agentId?: string } | null;
   sender?: SenderIdentity;
+  sourceClients?: MessageClientSource[];
   audioAsVoice?: boolean;
   replyPreview?: { text: string; senderLabel?: string | null };
   replyTarget?:
@@ -338,6 +368,8 @@ export type NormalizedMessage = {
 export type ToolCard = {
   id: string;
   callId?: string;
+  runId?: string;
+  parentToolCallId?: string;
   name: string;
   args?: unknown;
   inputText?: string;

@@ -703,6 +703,9 @@ describe("runCommandBuffered", () => {
             const closed = once(parent, "close", { signal: AbortSignal.timeout(1_000) });
             await vi.advanceTimersByTimeAsync(timeoutMs - 101);
             await vi.advanceTimersByTimeAsync(100);
+            // Output release runs in the next timers phase so buffered pipe I/O
+            // gets a poll turn on both Node and Bun.
+            await vi.advanceTimersByTimeAsync(1);
             await closed;
             expect(await command).toMatchObject({ code: null, termination: "timeout" });
             expect(isPidAlive(descendantPid)).toBe(true);
@@ -914,24 +917,31 @@ describe("attachChildProcessBridge", () => {
 });
 
 describe("child input admission", () => {
-  it("publishes input only after binding the actual spawned PID", async () => {
+  it("publishes input only after binding the actual spawned PID and argv", async () => {
     let admittedPid: number | undefined;
+    let admittedArgv: readonly string[] | undefined;
     const result = await runCommandWithTimeout(
       [
         process.execPath,
         "-e",
-        "let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({pid:process.pid,input})))",
+        "let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({pid:process.pid,argv:[process.argv0,...process.execArgv,...process.argv.slice(1)],input})))",
       ],
       {
         input: "owned",
         timeoutMs: 5_000,
-        beforeInput: (pid) => {
+        beforeInput: (pid, argv) => {
           admittedPid = pid;
+          admittedArgv = argv;
         },
       },
     );
     expect(result.code).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ pid: admittedPid, input: "owned" });
+    expect(admittedArgv).toBeDefined();
+    expect(JSON.parse(result.stdout)).toEqual({
+      pid: admittedPid,
+      argv: admittedArgv,
+      input: "owned",
+    });
   });
 
   it("joins the child without delivering input when admission rejects", async () => {

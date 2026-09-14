@@ -908,11 +908,17 @@ describe("buildGatewayCronService", () => {
 
       await vi.advanceTimersByTimeAsync(60_000);
 
-      expect(state.cron.getJob(job.id)?.state).toMatchObject({
-        lastStatus: "ok",
-        consecutiveErrors: 0,
-        lastError: undefined,
-      });
+      await vi.waitFor(
+        () => {
+          expect(state.cron.getJob(job.id)?.state).toMatchObject({
+            lastStatus: "ok",
+            consecutiveErrors: 0,
+            lastError: undefined,
+          });
+          expect(getCronState(state).activeTimerTicks).toBe(0);
+        },
+        { interval: 0 },
+      );
       expectIsolatedRunFields({ agentId: "main" });
     } finally {
       state.cron.stop();
@@ -927,6 +933,7 @@ describe("buildGatewayCronService", () => {
         cron: { store: path.join(tmpDir, "cron.json") },
         agents: {
           ownership: "explicit",
+          defaults: { systemAgent: { agentId: "ops" } },
           entries: { ops: {}, research: {} },
         },
       } as OpenClawConfig,
@@ -1150,7 +1157,7 @@ describe("buildGatewayCronService", () => {
   );
 
   it("fires an on-exit payload after persisting its terminal disable", async () => {
-    let resolveWait!: (result: {
+    const { promise: wait, resolve: resolveWait } = createDeferred<{
       reason: "exit";
       exitCode: number;
       exitSignal: null;
@@ -1159,10 +1166,7 @@ describe("buildGatewayCronService", () => {
       stderr: string;
       timedOut: false;
       noOutputTimedOut: false;
-    }) => void;
-    const wait = new Promise<Parameters<typeof resolveWait>[0]>((resolve) => {
-      resolveWait = resolve;
-    });
+    }>();
     const spawn = vi.fn(async () => ({
       runId: "run-on-exit-fire",
       startedAtMs: Date.now(),
@@ -1438,10 +1442,7 @@ describe("buildGatewayCronService", () => {
   });
 
   it("keeps a stream source running when a conditional or invalid update is rejected", async () => {
-    let resolveWait!: (result: RunExit) => void;
-    const wait = new Promise<Parameters<typeof resolveWait>[0]>((resolve) => {
-      resolveWait = resolve;
-    });
+    const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
     const cancel = vi.fn(() => resolveWait(runExit()));
     const detachOutput = vi.fn();
     const spawn = vi.fn(async () => ({
@@ -1489,10 +1490,7 @@ describe("buildGatewayCronService", () => {
   });
 
   it("discards a stale reconcile list snapshot that raced a direct mutation route", async () => {
-    let resolveWait!: (result: RunExit) => void;
-    const wait = new Promise<Parameters<typeof resolveWait>[0]>((resolve) => {
-      resolveWait = resolve;
-    });
+    const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
     const cancel = vi.fn(() => resolveWait(runExit()));
     const detachOutput = vi.fn();
     const spawn = vi.fn(async () => ({
@@ -1618,6 +1616,7 @@ describe("buildGatewayCronService", () => {
       const firstFailure = expect(state.cron.stopAndDrain?.()).rejects.toThrow(
         "stream source did not exit",
       );
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1), { interval: 0 });
       await vi.advanceTimersByTimeAsync(10_000);
       await firstFailure;
       await expect(state.cron.stopAndDrain?.()).resolves.toBeUndefined();
@@ -1663,6 +1662,7 @@ describe("buildGatewayCronService", () => {
       // The durable disable commits before teardown settles; a stop timeout
       // must not surface as a failed update after the mutation persisted.
       const updatePromise = state.cron.update(streamJob.id, { enabled: false });
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1), { interval: 0 });
       await vi.advanceTimersByTimeAsync(30_000);
       const updated = await updatePromise;
       expect(updated.enabled).toBe(false);
@@ -1709,6 +1709,7 @@ describe("buildGatewayCronService", () => {
       const streamJob = "job" in added ? added.job : added;
       const removal = state.cron.remove(streamJob.id);
       const removalFailure = expect(removal).rejects.toThrow("stream source did not exit");
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1), { interval: 0 });
       await vi.advanceTimersByTimeAsync(10_000);
 
       await removalFailure;

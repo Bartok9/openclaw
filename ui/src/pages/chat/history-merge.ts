@@ -26,7 +26,7 @@ import {
   resolveUiConversationIdentity,
 } from "../../lib/sessions/session-key.ts";
 import { matchesCompactionOperation } from "./chat-progress.ts";
-import type { CompactionStatus } from "./tool-stream-contract.ts";
+import type { CompactionStatus, ProviderPolicyNotice } from "./tool-stream-contract.ts";
 
 const chatSessionProjections = new WeakMap<
   object,
@@ -53,6 +53,7 @@ type ChatSessionProjectionOwner = ChatComposerScope & {
   chatDisplayedLeafEntryId?: string | null;
   compactionStatus?: CompactionStatus | null;
   compactionClearTimer?: number | null;
+  providerPolicyNotice?: ProviderPolicyNotice | null;
 };
 
 function resetCompactionProjection(owner: ChatSessionProjectionOwner): void {
@@ -105,6 +106,16 @@ function readChatSubmissionBatch(owner: ChatSessionProjectionOwner, scope: Sessi
       const receipt = persisted || identity.id !== null || identity.sequence !== null;
       if (receipt) {
         retire(runId);
+      }
+      const delivered = submissions.readDelivered(key + runId, client ?? owner);
+      if (
+        !receipt &&
+        !identity.isImported &&
+        delivered?.kind === "delivered" &&
+        !delivered.pending &&
+        (!delivered.sessionId || !scope.sessionId || delivered.sessionId === scope.sessionId)
+      ) {
+        return undefined;
       }
       if (!handoff || identity.isImported || runId !== handoff.pendingRunId) {
         return message;
@@ -219,6 +230,9 @@ export function publishChatSessionProjection(
         previousScope[key] !== undefined &&
         previousScope[key] !== projection.scope[key],
     );
+    if (sessionChanged) {
+      owner.providerPolicyNotice = null;
+    }
     // Appending the completed marker advances the active leaf. Retain its live
     // identity through that refresh, but never carry it into another session or branch.
     if (
@@ -349,14 +363,26 @@ export function reconcileChatInputCustody(
   page: ChatPendingInputsPage | undefined,
   receipts: ChatInputReceipts = [],
 ) {
-  const scope = readChatSessionProjectionScope(owner, {
-    agentId: resolveUiSelectedSessionAgentId(owner),
-  });
   const acceptedRunIds = new Set(
     [...(page?.items ?? []), ...receipts]
       .map((item) => item.runId)
       .filter((runId) => typeof runId === "string"),
   );
+  retireChatSubmissionDisplay(owner, acceptedRunIds);
+  return {
+    acceptedRunIds,
+    page: page ?? { items: [], total: 0 },
+  };
+}
+
+/** Canonical custody retires local display ownership even outside the loaded history page. */
+export function retireChatSubmissionDisplay(
+  owner: ChatSessionProjectionOwner,
+  acceptedRunIds: ReadonlySet<string>,
+): void {
+  const scope = readChatSessionProjectionScope(owner, {
+    agentId: resolveUiSelectedSessionAgentId(owner),
+  });
   const submissions = readChatSubmissionBatch(owner, scope);
   submissions?.accept(acceptedRunIds);
   if (acceptedRunIds.size) {
@@ -379,10 +405,6 @@ export function reconcileChatInputCustody(
       });
     }
   }
-  return {
-    acceptedRunIds,
-    page: page ?? { items: [], total: 0 },
-  };
 }
 
 export function shouldDisplayChatSubmission(
@@ -471,6 +493,7 @@ export function reduceChatSessionProjection(
   projection = reduceSessionProjection(projection, { ...preparedEvent, scope });
   if (event.type === "sessionReset" && projection !== current) {
     resetCompactionProjection(owner);
+    owner.providerPolicyNotice = null;
   }
   // Without a transcript anchor this is best-effort display chronology, assuming
   // comparable browser/Gateway clocks. Never assign a sequence or reorder canonical

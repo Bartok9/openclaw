@@ -3,7 +3,7 @@ import {
   GATEWAY_OWNER_PROFILE_ID,
   GIT_COAUTHOR_PREFERENCE_KEY,
   isGitCoauthorCreditEnabled,
-} from "../../packages/gateway-protocol/src/schema/users.js";
+} from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
 import type { UserProfileGitHubIdentity } from "../../packages/gateway-protocol/src/schema/users.js";
 import { executeSqliteQuerySync, executeSqliteQueryTakeFirstSync } from "../infra/kysely-sync.js";
 import { normalizeGitHubLogin } from "../utils/github-login.js";
@@ -11,7 +11,7 @@ import {
   openOpenClawStateDatabase,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db.js";
-import { mutateUserPreference, selectUserPreferenceValues } from "./user-preferences.js";
+import { mutateUserPreference, selectUserPreferenceValues } from "./user-preferences.store.js";
 import { selectResolvedUserProfileById, userProfilesDb } from "./user-profiles-internal.js";
 import { ensureUserProfilesSchema, UserProfileOwnerError } from "./user-profiles-schema.js";
 
@@ -40,7 +40,7 @@ function toPublicGitHubIdentity(identity: StoredGitHubIdentity): UserProfileGitH
   };
 }
 
-function selectStoredGitHubIdentities(
+export function selectStoredGitHubIdentities(
   db: DatabaseSync,
   profileIds?: readonly string[],
 ): Map<string, StoredGitHubIdentity> {

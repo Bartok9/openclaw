@@ -2,13 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import {
-  readPersistedInstalledPluginIndexInstallRecords,
-  writePersistedInstalledPluginIndexInstallRecords,
-} from "../plugins/installed-plugin-index-records.js";
+import { readPersistedInstalledPluginIndexInstallRecords } from "../plugins/installed-plugin-index-records.js";
 import { listOfficialExternalPluginCatalogEntries } from "../plugins/official-external-plugin-catalog.js";
 import { createPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
 import { createColdPluginFixture } from "../plugins/test-helpers/cold-plugin-fixtures.js";
+import { seedInstalledPluginIndex } from "../plugins/test-helpers/installed-plugin-index.js";
 import {
   formatStartupPluginVerificationFailure,
   runStartupUpgradeConvergence,
@@ -86,7 +84,7 @@ describe.each(["startup", "repair"] as const)("%s consent inventory", (first) =>
       };
       const cfg = { plugins: { allow: ["selected-fixture"] } };
       await withPluginCache(createPluginCache(), async () => {
-        await writePersistedInstalledPluginIndexInstallRecords(
+        await seedInstalledPluginIndex(
           retained
             ? {
                 [pluginId]: {
@@ -109,7 +107,7 @@ describe.each(["startup", "repair"] as const)("%s consent inventory", (first) =>
           expect(repair.installRecords).toEqual({});
         });
         // A completed lifecycle changes the next generation, not the invoking snapshot.
-        const persisted = await withPluginCache(createPluginCache(), () =>
+        const persisted = withPluginCache(createPluginCache(), () =>
           readPersistedInstalledPluginIndexInstallRecords({ env }),
         );
         expect(persisted).toEqual({});

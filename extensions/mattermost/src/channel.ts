@@ -337,6 +337,7 @@ async function listMattermostDirectoryPeers(params: MattermostDirectoryListParam
 
 const mattermostMessageActions: ChannelMessageActionAdapter = {
   providerOwnedReadGates: ["read"],
+  readAuthorityActions: ["read"],
   describeMessageTool: describeMattermostMessageTool,
   extractToolSend: ({ args }) => extractMattermostToolSend(args),
   prepareSendPayload: ({ ctx, payload }) => {
@@ -586,7 +587,11 @@ const mattermostOutbound: ChannelOutboundAdapter = {
     if (payload.mediaUrls && payload.mediaUrls.length > 1) {
       return null;
     }
-    const { text, buttons } = resolveMattermostPresentation({ text: payload.text, presentation });
+    const { text, buttons } = resolveMattermostPresentation({
+      text: payload.text,
+      presentation,
+      channelData: payload.channelData,
+    });
     if (!buttons.length && !hasMattermostPresentationNavigation(presentation)) {
       return null;
     }

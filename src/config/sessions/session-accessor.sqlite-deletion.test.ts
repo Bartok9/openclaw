@@ -11,7 +11,7 @@ import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import {
   markPluginRegistryActive,
   markPluginRegistryRetired,
-  revokePluginRecordLifecycleEpoch,
+  revokePluginRecord,
 } from "../../plugins/registry-lifecycle.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createPluginRecord } from "../../plugins/status.test-helpers.js";
@@ -156,7 +156,12 @@ describe("session deletion and native owner state", () => {
   const read = (key = sessionKey) =>
     loadSessionEntry({ sessionKey: key, storePath, readConsistency: "latest" });
 
-  it.each(["no windows", "a shared window", "a placeholder successor"] as const)(
+  it.each([
+    "no windows",
+    "owned without windows",
+    "a shared window",
+    "a placeholder successor",
+  ] as const)(
     "does not materialize surviving prompts when deleting a node with %s",
     async (scenario) => {
       const reclaimedKey = "agent:main:reclaimed-node";
@@ -188,7 +193,7 @@ describe("session deletion and native owner state", () => {
         path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
       };
       const database = openOpenClawAgentDatabase(scope);
-      if (scenario === "no windows") {
+      if (scenario === "no windows" || scenario === "owned without windows") {
         database.db.prepare("DELETE FROM session_windows WHERE session_key = ?").run(reclaimedKey);
       } else {
         replaceTranscriptEventsSync(
@@ -215,13 +220,21 @@ describe("session deletion and native owner state", () => {
         await withSqliteSessionDeletions(scope, [{ sessionKey: reclaimedKey, entry }], async () => {
           runSqliteSessionDeletionTransaction((current) => {
             deleteSessionEntryRows(current, reclaimedKey, {
-              deleteOwnedWindows: scenario === "a shared window",
+              deleteOwnedWindows:
+                scenario === "a shared window" || scenario === "owned without windows",
+              deliveryCleanupKeys:
+                scenario === "owned without windows" ? [reclaimedKey, reclaimedKey] : undefined,
             });
           }, scope);
         });
         const rows = queries.mock.results.flatMap((result) =>
           result.type === "return" ? result.value.rows : [],
         );
+        if (scenario === "owned without windows") {
+          for (const survivorKey of survivorKeys) {
+            expect(rows).not.toContainEqual(expect.objectContaining({ session_key: survivorKey }));
+          }
+        }
         if (scenario === "no windows") {
           for (const survivorKey of survivorKeys) {
             expect(rows).not.toContainEqual(
@@ -246,7 +259,7 @@ describe("session deletion and native owner state", () => {
       }
       expect(loadSessionEntry({ sessionKey: reclaimedKey, storePath })).toBeUndefined();
       expect(readSurvivors()).toEqual(survivorsBefore);
-      if (scenario !== "no windows") {
+      if (scenario !== "no windows" && scenario !== "owned without windows") {
         expect(
           database.db
             .prepare("SELECT session_key FROM session_windows WHERE session_id = ?")
@@ -517,20 +530,26 @@ describe("session deletion and native owner state", () => {
     },
   );
 
-  it("uses an explicitly scoped prepared registry without globally activating it", async () => {
-    await seed();
-    let retainedGuard: (() => void) | undefined;
-    const owner = nativeOwner({
-      activate: false,
-      prepare: async ({ assertCurrent }) => {
-        retainedGuard = assertCurrent;
-      },
-    });
-    await owner.run(() => remove());
-    expect(read()).toBeUndefined();
-    expect(bindings.has(sessionKey)).toBe(false);
-    expect(() => retainedGuard?.()).toThrow("harness owner changed");
-  });
+  it.each(["scoped", "published during preparation"] as const)(
+    "uses the exact prepared owner while %s",
+    async (publication) => {
+      await seed();
+      let retainedGuard: (() => void) | undefined;
+      const owner = nativeOwner({
+        activate: false,
+        prepare: async ({ assertCurrent }) => {
+          retainedGuard = assertCurrent;
+          if (publication === "published during preparation") {
+            markPluginRegistryActive(owner.registry);
+          }
+        },
+      });
+      await owner.run(() => remove());
+      expect(read()).toBeUndefined();
+      expect(bindings.has(sessionKey)).toBe(false);
+      expect(() => retainedGuard?.()).toThrow("harness owner changed");
+    },
+  );
 
   it.each(["retired", "reactivated", "record revoked", "registration replaced"] as const)(
     "rejects a prepared owner after its registry is %s",
@@ -551,9 +570,10 @@ describe("session deletion and native owner state", () => {
       if (change === "retired") {
         markPluginRegistryRetired(owner.registry);
       } else if (change === "reactivated") {
+        markPluginRegistryRetired(owner.registry);
         markPluginRegistryActive(owner.registry);
       } else if (change === "record revoked") {
-        revokePluginRecordLifecycleEpoch(owner.registry, owner.record);
+        revokePluginRecord(owner.registry, owner.record);
       } else {
         owner.registry.agentHarnesses = owner.registry.agentHarnesses.map((registration) =>
           Object.assign({}, registration),

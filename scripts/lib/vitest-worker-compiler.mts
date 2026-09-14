@@ -3,15 +3,21 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolveBuildInfo } from "../write-build-info.ts";
 import { createManagedHandoffBuildConfig } from "./managed-handoff-build-config.mts";
+import {
+  sharedRuntimeProcessBuildEntries,
+  shouldBundleRuntimeSqliteDependency,
+  standaloneRuntimeProcessBuildEntries,
+} from "./runtime-process-core-build-entries.mts";
 import { createStateSchemaInlinePlugin } from "./state-schema-inline-plugin.mts";
 import {
   hashVitestWorkerArtifact,
   verifyVitestWorkerArtifacts,
-  vitestWorkerDeclarationEntries,
   type VitestWorkerManifest,
 } from "./vitest-worker-artifacts.mts";
 import { vitestWorkerBuildEntries } from "./vitest-worker-build-entries.mts";
+import { vitestWorkerDeclarationEntries } from "./vitest-worker-declarations.mts";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -40,6 +46,7 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
     "package.json",
     "pnpm-lock.yaml",
     "scripts/lib/vitest-worker-artifacts.mts",
+    "scripts/lib/vitest-worker-declarations.mts",
     "scripts/lib/managed-handoff-build-config.mts",
     "scripts/lib/vitest-worker-run.mts",
     "scripts/lib/vitest-worker-compiler.mts",
@@ -51,6 +58,12 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
     "scripts/lib/runtime-process-core-build-entries.mts",
     "scripts/lib/vitest-worker-build-entries.mts",
     "scripts/lib/state-schema-inline-plugin.mts",
+    "scripts/write-build-info.ts",
+    "scripts/lib/direct-run.mjs",
+    "ui/src/build-info-normalizers.ts",
+    "packages/normalization-core/src/record-coerce.ts",
+    "packages/normalization-core/src/string-coerce.ts",
+    "packages/normalization-core/src/utf16-slice.ts",
     "scripts/lib/vitest-cli-mode.mts",
   ]) {
     recordInput(path.join(root, name));
@@ -61,10 +74,14 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
   };
   const schemaPlugin = createStateSchemaInlinePlugin(root);
   const outDir = path.join(directory, "dist");
+  const shouldBundleWorkspaceDependency = (id: string) =>
+    (id.startsWith("@openclaw/") || id.startsWith("openclaw/")) &&
+    id !== "@openclaw/fs-safe" &&
+    !id.startsWith("@openclaw/fs-safe/");
   const config: NonNullable<Parameters<typeof build>[0]> = {
     config: false,
     cwd: root,
-    entry,
+    entry: sharedRuntimeProcessBuildEntries(entry),
     outDir,
     format: "esm",
     platform: "node",
@@ -74,11 +91,9 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
     clean: false,
     outExtensions: () => ({ js: ".js" }),
     deps: {
-      // Root runtime dependencies stay external; bundled workspace code owns its private deps.
+      // Runtime entries share bundled query builders; other root dependencies stay external.
       alwaysBundle: (id) =>
-        (id.startsWith("@openclaw/") || id.startsWith("openclaw/")) &&
-        id !== "@openclaw/fs-safe" &&
-        !id.startsWith("@openclaw/fs-safe/"),
+        shouldBundleWorkspaceDependency(id) || shouldBundleRuntimeSqliteDependency(id),
     },
     logLevel: "warn",
     plugins: [
@@ -141,6 +156,13 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
     ],
   };
   await build(config);
+  for (const [name, source] of Object.entries(standaloneRuntimeProcessBuildEntries)) {
+    await build({
+      ...config,
+      entry: { [name]: source },
+      outputOptions: { codeSplitting: false },
+    });
+  }
   await build({
     ...createManagedHandoffBuildConfig(),
     config: false,
@@ -153,6 +175,11 @@ async function compileVitestWorkerArtifacts(directory: string): Promise<void> {
   for (const name of Object.keys(entry)) {
     fs.accessSync(path.join(directory, "dist", `${name}.js`));
   }
+  // Version consumers need the built source identity without making this
+  // disposable generation a competing OpenClaw installation root.
+  const buildInfo = `${JSON.stringify(resolveBuildInfo({ rootDir: root }), null, 2)}\n`;
+  fs.writeFileSync(path.join(outDir, "build-info.json"), buildInfo, { flag: "wx" });
+  outputs["build-info.json"] = hashVitestWorkerArtifact(buildInfo);
   const sortedInputs = Object.fromEntries(
     Object.entries(inputs).toSorted(([a], [b]) => a.localeCompare(b)),
   );

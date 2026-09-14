@@ -1103,7 +1103,12 @@ export const agentsHandlers: GatewayRequestHandlers = {
           let databasePlan: AgentDeleteDatabasePlan | undefined;
           try {
             prepareJournaledAgentDirOwnership(lockedConfig, agentId, journal.agentDir);
-            databasePlan = prepareAgentDeleteDatabases(lockedConfig, agentId, journal.agentDir);
+            databasePlan = await prepareAgentDeleteDatabases(
+              lockedConfig,
+              agentId,
+              journal.agentDir,
+            );
+            deletion.assertCurrent();
             deletion.fenceDatabasePaths([
               ...journal.databasePaths,
               ...databasePlan.fileGroups.flat(),
@@ -1469,11 +1474,12 @@ export const agentsHandlers: GatewayRequestHandlers = {
                   assertCurrent: deletion.assertCurrent,
                 });
                 deletion.assertCurrent();
-                deleteWorkspaceState(statePlan);
+                await deleteWorkspaceState(statePlan, { assertCurrent: deletion.assertCurrent });
               } catch {
                 // Best-effort cleanup. A later explicit reset can remove stale rows.
               }
             }
+            deletion.assertCurrent();
             const agentDirCleanupPaths = cleanupPaths.filter((cleanupPath) =>
               cleanupPathCovers(cleanupPath, deleteResult.agentDir, agentDirRegistryPath),
             );

@@ -41,6 +41,7 @@ import {
   buildModelIdentityPromptLine,
 } from "../../system-prompt.js";
 import { log } from "../logger.js";
+import { normalizeAssistantReplayContent } from "../replay-history.js";
 import {
   cloneToolResultPromptProjectionState,
   type ToolResultPromptProjectionState,
@@ -54,7 +55,6 @@ import {
 } from "../tool-result-truncation.js";
 import {
   normalizeCurrentPromptTextForLlmBoundary,
-  projectRuntimeContextFragments,
   usesEscapedRuntimeContext,
   normalizeMessagesForCurrentPromptBoundary,
 } from "./attempt-llm-boundary.js";
@@ -70,7 +70,6 @@ import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import {
   buildCurrentInboundPrompt,
   buildRuntimeContextCustomMessage,
-  buildRuntimeContextMessageContent,
   resolveRuntimeContextPromptParts,
   type RuntimeContextCustomMessage,
 } from "./runtime-context-prompt.js";
@@ -89,6 +88,7 @@ type EmbeddedAttemptSteeringLease = {
 };
 
 type EmbeddedAttemptPromptAssembly = {
+  assertHostActive?: () => void;
   hookCtx: PromptBuildHookContext;
   effectivePrompt: string;
   promptBuildPrependContext?: string;
@@ -333,6 +333,7 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
       : undefined;
 
   return {
+    assertHostActive,
     hookCtx,
     effectivePrompt,
     promptBuildPrependContext,
@@ -392,7 +393,7 @@ type EmbeddedAttemptPromptContext = {
   systemPromptForHook: string;
 };
 
-export function prepareEmbeddedAttemptPromptContext(input: {
+export async function prepareEmbeddedAttemptPromptContext(input: {
   sessionVersion?: number;
   appendOnlyRuntimeContext?: boolean;
   attempt: PromptContextAttempt;
@@ -405,22 +406,24 @@ export function prepareEmbeddedAttemptPromptContext(input: {
   prompt: PromptAssemblyContext;
   replaceSessionMessages: (messages: AgentMessage[]) => void;
   sessionAgentId: string;
-  setActiveSessionSystemPrompt: (systemPrompt: string) => void;
   systemPromptReport?: SessionSystemPromptReport;
   systemPromptText: string;
   toolResultPromptProjectionState: ToolResultPromptProjectionState;
-}): EmbeddedAttemptPromptContext {
+}): Promise<EmbeddedAttemptPromptContext> {
   const { attempt } = input;
   const preparedUserTurnTimestamp = (
     input.preparedUserTurnMessage as { timestamp?: unknown } | undefined
   )?.timestamp;
-  let sessionMessages = filterHeartbeatTranscriptArtifacts(
+  const heartbeatFiltered = filterHeartbeatTranscriptArtifacts(
     input.messages,
     input.prompt.heartbeatSummary?.ackMaxChars,
     input.prompt.heartbeatSummary?.prompt,
   );
-  if (sessionMessages.length < input.messages.length) {
+  let sessionMessages = normalizeAssistantReplayContent(heartbeatFiltered);
+  if (sessionMessages !== heartbeatFiltered || sessionMessages.length < input.messages.length) {
     input.replaceSessionMessages(sessionMessages);
+  } else {
+    sessionMessages = input.messages;
   }
   // Raw probes temporarily hide durable history; only normal prepared history
   // is authoritative for reclaiming session-owned provider projections.
@@ -511,29 +514,11 @@ export function prepareEmbeddedAttemptPromptContext(input: {
           ...(promptForModel !== promptForSession ? { alternateText: promptForModel } : {}),
         }
       : undefined;
-  const runtimeSystemContext = promptSubmission.runtimeOnly
-    ? buildRuntimeContextMessageContent({
-        runtimeContext: escapedProjection
-          ? projectRuntimeContextFragments(eventFragments)
-          : (promptSubmission.runtimeContext ?? ""),
-        kind: "runtime-event",
-      })
-    : undefined;
-  let systemPromptForHook = input.systemPromptText;
-  if (promptSubmission.runtimeOnly && runtimeSystemContext) {
-    const runtimeSystemPrompt = composeSystemPromptWithHookContext({
-      baseSystemPrompt: input.systemPromptText,
-      appendSystemContext: runtimeSystemContext,
-    });
-    if (runtimeSystemPrompt) {
-      systemPromptForHook = runtimeSystemPrompt;
-      input.setActiveSessionSystemPrompt(runtimeSystemPrompt);
-    }
-  }
+  const systemPromptForHook = input.systemPromptText;
   const runtimeFacts =
     input.isRawModelRun || attempt.operation === "settled-tool-finalization"
       ? []
-      : buildRuntimeFactsContext({
+      : await buildRuntimeFactsContext({
           capabilityToolNames: input.capabilityToolNames,
           cfg: attempt.config ?? {},
           sessionKey: attempt.sessionKey,
@@ -541,7 +526,7 @@ export function prepareEmbeddedAttemptPromptContext(input: {
           agentId: input.sessionAgentId,
         });
   const contextFragments = promptSubmission.runtimeOnly
-    ? runtimeFacts
+    ? [...eventFragments, ...runtimeFacts]
     : [...fragments, ...runtimeFacts];
   const runtimeContextForHook =
     contextFragments
@@ -573,9 +558,7 @@ export function prepareEmbeddedAttemptPromptContext(input: {
     input.systemPromptReport.currentTurn = {
       ...(attempt.currentInboundEventKind ? { kind: attempt.currentInboundEventKind } : {}),
       promptChars: promptForModel.length,
-      runtimeContextChars:
-        (runtimeContextForHook?.length ?? 0) +
-        (promptSubmission.runtimeOnly ? (runtimeSystemContext?.length ?? 0) : 0),
+      runtimeContextChars: runtimeContextForHook?.length ?? 0,
       // Hook context reaches only the model, so count the delta beyond the
       // transcript prompt or downstream context accounting undercounts it.
       modelOnlyPromptChars: Math.max(0, promptForModel.length - promptForSession.length),

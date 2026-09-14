@@ -2,7 +2,9 @@ import type { PropertyValues } from "lit";
 import { property, query, state } from "lit/decorators.js";
 import type { GatewayBrowserClient, GatewayEventFrame } from "../api/gateway.ts";
 import "../components/app-topbar.ts";
+import "../components/assistant-panel.ts";
 import "../components/modal-dialog.ts";
+import "../pages/debug/debug-overlay.ts";
 import {
   formatDocumentTitle,
   isSettingsNavigationRoute,
@@ -19,7 +21,10 @@ import type { ThemeModeChangeDetail } from "../components/theme-mode-toggle.ts";
 import { i18n, t } from "../i18n/index.ts";
 import { normalizeAgentLabel } from "../lib/agents/display.ts";
 import type { BoardFace } from "../lib/board/settings.ts";
-import { invalidateChatMetadataStore } from "../lib/chat/chat-metadata-store.ts";
+import {
+  invalidateChatMetadataForSessionEvent,
+  invalidateChatMetadataStore,
+} from "../lib/chat/chat-metadata-cache.ts";
 import { createIdleImport } from "../lib/idle-import.ts";
 import { invalidateModelAuthStatusRequests } from "../lib/model-auth-request-state.ts";
 import { resolveSessionDisplayName } from "../lib/session-display.ts";
@@ -35,7 +40,11 @@ import { OpenClawLightDomElement } from "../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../lit/subscriptions-controller.ts";
 import type { ChatPage } from "../pages/chat/chat-page.ts";
 import type { NewSessionTarget } from "../pages/new-session/location.ts";
-import { selectShellRouteState, type ShellRouteState } from "./app-host-route-state.ts";
+import {
+  equalShellRouteState,
+  selectShellRouteState,
+  type ShellRouteState,
+} from "./app-host-route-state.ts";
 import { OpenClawApp } from "./app-root.ts";
 import { ShellChromeOwner, type ShellChromeHost } from "./app-shell-chrome.ts";
 import {
@@ -53,7 +62,6 @@ import { createGatewayControlUiReloadOptions } from "./gateway-control-ui-reload
 import {
   BROWSER_PANEL_ELEMENT,
   COMMAND_PALETTE_ELEMENT,
-  ASSISTANT_PANEL_ELEMENT,
   DESKTOP_PANEL_ELEMENT,
   EXEC_APPROVAL_ELEMENT,
   LazyCustomElementRequestController,
@@ -92,20 +100,6 @@ i18n.setLocaleLoadRecovery({
   },
 });
 
-function equalShellRouteState(previous: ShellRouteState, next: ShellRouteState): boolean {
-  return (
-    previous.routeId === next.routeId &&
-    previous.location?.pathname === next.location?.pathname &&
-    previous.location?.search === next.location?.search &&
-    previous.location?.hash === next.location?.hash &&
-    previous.committedRouteId === next.committedRouteId &&
-    previous.committedLocation?.pathname === next.committedLocation?.pathname &&
-    previous.committedLocation?.search === next.committedLocation?.search &&
-    previous.committedLocation?.hash === next.committedLocation?.hash &&
-    previous.committedSessionKey === next.committedSessionKey
-  );
-}
-
 class OpenClawShell
   extends OpenClawLightDomElement
   implements ShellChromeHost, ShellGatewayHost, ShellNavigationHost, ShellViewHost
@@ -123,7 +117,6 @@ class OpenClawShell
   readonly terminalPanelElement = TERMINAL_PANEL_ELEMENT;
   readonly browserPanelElement = BROWSER_PANEL_ELEMENT;
   readonly desktopPanelElement = DESKTOP_PANEL_ELEMENT;
-  readonly assistantPanelElement = ASSISTANT_PANEL_ELEMENT;
   readonly execApprovalElement = EXEC_APPROVAL_ELEMENT;
   readonly onboardingMemoryImportElement = {
     tagName: "openclaw-onboarding-memory-import",
@@ -332,7 +325,7 @@ class OpenClawShell
       .watch(
         () => this.context?.gateway,
         (gateway, notify) => gateway.subscribe(notify),
-        (gateway) => this.synchronizeGateway(gateway.snapshot),
+        (gateway) => this.shellGateway.synchronizeGateway(gateway.snapshot),
       )
       .effect(
         () => this.context?.gateway,
@@ -493,8 +486,15 @@ class OpenClawShell
     this.shellNavigation.selectChatSession(sessionKey, agentId);
   }
   private readonly handleGatewayEvent = (event: GatewayEventFrame) => {
+    const context = this.context;
+    const client = context?.gateway?.snapshot.client;
+    if (client && event.event === "sessions.changed") {
+      invalidateChatMetadataForSessionEvent(client, event.payload, {
+        hello: context?.gateway.snapshot.hello,
+        agentsList: context?.agents.state.agentsList,
+      });
+    }
     if (event.event === "config.changed" || event.event === "chat.metadata.changed") {
-      const client = this.context?.gateway?.snapshot.client;
       if (client) {
         invalidateModelAuthStatusRequests(client);
         invalidateChatMetadataStore(client);
@@ -677,18 +677,6 @@ class OpenClawShell
     this.lastNativeNavState = navState;
     // Shipped Mac app builds without web chrome still consume this bridge.
     postNativeNavState(navState);
-  }
-
-  private synchronizeGateway(snapshot: ApplicationContext["gateway"]["snapshot"]) {
-    if (this.previousGatewayPhase === "connected" && snapshot.phase !== "connected") {
-      // A disconnect can retain the browser client, so object identity alone
-      // cannot keep metadata alive across logical Gateway connections.
-      if (snapshot.client) {
-        invalidateModelAuthStatusRequests(snapshot.client);
-        invalidateChatMetadataStore(snapshot.client);
-      }
-    }
-    this.shellGateway.synchronizeGateway(snapshot);
   }
 
   private ensureRuntimeConfig(

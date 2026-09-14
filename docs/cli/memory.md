@@ -30,6 +30,10 @@ unavailable before any work runs:
 - Disabled memory returns `{"agentId":"main","status":"disabled"}` with a successful exit.
 - Backend acquisition failures return the standard `{"ok":false,"error":{"type":"cli_error","message":"..."}}` envelope, plus `agentId`, and exit with code 1.
 
+Invalid command input and errors during command execution also use the standard
+[CLI JSON failure envelope](/cli#json-failures) and exit with code 1. The failure
+message explains the command error; human-readable diagnostics stay on stderr.
+
 Handle these outcomes before reading the command's normal result fields. An
 enabled search with no matches still returns `{"results":[]}`. `status --json`
 keeps its aggregate array of available agents, including `[]` when all are
@@ -100,8 +104,20 @@ budget. Permanent quota errors without a cooldown hint stop that operation.
 The verbose output shows each retry wait.
 
 Interactive `memory_search` keeps three attempts and at most eight seconds of
-total retry sleep within the agent tool's 15-second deadline. A cancelled caller
+total retry sleep within the agent tool's 30-second deadline. A cancelled caller
 interrupts its retry wait.
+
+After an OpenClaw index-format upgrade, the first search rebuilds the index before
+returning results. Rebuilding can take longer, and the search result discloses
+possible costs from the configured embedding provider. An index written by a
+newer OpenClaw version remains paused; upgrade OpenClaw or reindex explicitly.
+Later searches reuse the repaired index;
+status inspection alone does not rebuild it.
+Concurrent searches wait for the active repair. A slow repair can exceed the
+interactive tool's deadline; the tool reports unavailability while admitted
+index work finishes. If a format repair fails before publication, search reports
+the recorded sync error and retains the prior index. Use `memory status --deep`
+to inspect that failure before retrying.
 
 If status reports an index identity warning after changing embedding settings,
 check the affected agent's provider, model, sources, and extra paths, then rebuild:
@@ -282,9 +298,16 @@ review what remains.
 The purge removes matching promotion-marker entries and session-reference
 sections from scanned memory files, selected session-corpus lines, and
 selected-session transcript index chunks. It clears associated full-text and
-vector rows, cached embeddings, matching short-term state, ingestion seen-hash
-scopes, and origin rows. Matching content is scrubbed from dreaming rewrite
-backups, rather than deleting every backup.
+vector rows, matching short-term state, ingestion seen-hash scopes, and origin
+rows. Matching content is scrubbed from dreaming rewrite backups, rather than
+deleting every backup.
+
+For a nonempty session selection, Forget also clears the selected agent's entire
+embedding cache, including results retained from unfinished index rebuilds. Those
+results may not yet be linked to published index chunks. Unrelated published
+index entries remain usable, but later indexing may need to regenerate their
+cached embeddings. The dry-run report includes the whole-cache removal count;
+a dry run or an empty session selection does not clear the cache.
 
 Consolidation preserves origins for replaced promotion markers while retained
 rewrite preimages reference them. Those origins are pruned only after live

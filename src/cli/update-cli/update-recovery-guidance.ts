@@ -1,6 +1,12 @@
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveStateDir } from "../../config/paths.js";
+import { isContainerEnvironment } from "../../infra/container-environment.js";
 import type { UpdateRunResult } from "../../infra/update-runner.js";
+import {
+  formatUpdateActivationTimeoutGuidance,
+  UPDATE_ACTIVATION_TIMEOUT_REASON,
+  UPDATE_INSTALL_SKIP_GUIDANCE,
+} from "../../shared/update-outcome.js";
 import { formatCliCommand } from "../command-format.js";
 
 type UnsafeUpdateRecovery = Extract<
@@ -29,7 +35,20 @@ export function resolveUpdateResultNextAction(params: {
   env: NodeJS.ProcessEnv;
 }): string | undefined {
   const { result, env } = params;
+  if (result.reason === "dirty") {
+    return `Local changes prevented this update before installation. Your checkout was preserved. Commit your changes and retry, or run \`${formatCliCommand("openclaw triage", env)}\` for help.`;
+  }
+  if (
+    result.status === "skipped" &&
+    result.reason &&
+    Object.hasOwn(UPDATE_INSTALL_SKIP_GUIDANCE, result.reason)
+  ) {
+    return UPDATE_INSTALL_SKIP_GUIDANCE[result.reason];
+  }
   if (result.status === "error") {
+    if (result.reason === UPDATE_ACTIVATION_TIMEOUT_REASON) {
+      return formatUpdateActivationTimeoutGuidance((command) => formatCliCommand(command, env));
+    }
     if (result.reason === "rollback-project-changed") {
       return `Other global packages changed after staging; automatic rollback was refused to preserve them. Keep the candidate installed if its gateway is reachable; otherwise keep the gateway stopped. ${resolveUnsafeUpdateRecoveryGuidance(undefined, env)}`;
     }
@@ -48,12 +67,22 @@ export function resolveUpdateResultNextAction(params: {
     const configRefusal = result.steps.findLast(
       (step) => step.name === "config rollback",
     )?.stderrTail;
-    return `${configRefusal ? `${configRefusal} ` : ""}${state}${resolveUnsafeUpdateRecoveryGuidance(reason, env)}`;
+    const failedStep = result.steps.findLast((step) => step.exitCode !== 0 && !step.advisory);
+    const containerPermissionFailure =
+      (result.mode === "npm" || result.mode === "pnpm" || result.mode === "bun") &&
+      failedStep !== undefined &&
+      (failedStep.name.startsWith("global update") ||
+        failedStep.name.startsWith("global install")) &&
+      /\beacces\b/i.test(failedStep.stderrTail ?? "") &&
+      isContainerEnvironment();
+    // Record deployment-specific advice here so CLI output and later reports agree.
+    // Keep the recovery constraints: an image change must not roll back migrated state.
+    const deployment = containerPermissionFailure
+      ? "Detected package update permission failure (EACCES) inside a container. Pull or build an OpenClaw image with the target version, then recreate or redeploy the container with the same state/config mounts. In-container package changes are not durable. "
+      : "";
+    return `${configRefusal ? `${configRefusal} ` : ""}${state}${deployment}${resolveUnsafeUpdateRecoveryGuidance(reason, env)}`;
   }
   const command = (value: string) => formatCliCommand(value, env);
-  if (result.reason === "dirty") {
-    return `Git-based updates need a clean working tree before they can switch commits, fetch, or rebase. Commit, stash, or discard the local changes, then rerun \`${command("openclaw update")}\`.`;
-  }
   if (result.reason === "not-git-install") {
     return `This OpenClaw install isn't a git checkout, and the package manager couldn't be detected. Update via your package manager, then run \`${command("openclaw doctor")}\` and \`${command("openclaw gateway restart")}\`. Examples: \`npm i -g openclaw@latest\` or \`pnpm add -g openclaw@latest\`.`;
   }
