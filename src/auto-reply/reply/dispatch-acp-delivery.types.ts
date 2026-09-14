@@ -1,7 +1,11 @@
+import type { ChatType } from "../../channels/chat-type.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { TtsAutoMode } from "../../config/types.tts.js";
 import type { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
+import type { FinalizedMsgContext } from "../templating.js";
 import type { BlockReplySource } from "./block-reply-source.types.js";
 import type { NormalizeReplySkipReason } from "./normalize-reply-skip-reason.js";
-import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
+import type { ReplyDispatchKind, ReplyDispatcher } from "./reply-dispatcher.types.js";
 
 export type AcpDispatchDeliveryMeta = {
   toolCallId?: string;
@@ -48,4 +52,27 @@ export type AcpDispatchDeliveryState = {
   routedCounts: Record<ReplyDispatchKind, number>;
   suppressionReason?: NormalizeReplySkipReason;
   toolMessageByCallId: Map<string, ToolMessageHandle>;
+};
+
+export type AcpDispatchDeliveryParams = {
+  cfg: OpenClawConfig;
+  agentId?: string;
+  ctx: FinalizedMsgContext;
+  dispatcher: ReplyDispatcher;
+  inboundAudio: boolean;
+  sessionKey?: string;
+  sessionTtsAuto?: TtsAutoMode;
+  ttsChannel?: string;
+  suppressUserDelivery?: boolean;
+  suppressBlockUserDelivery?: boolean;
+  suppressReplyLifecycle?: boolean;
+  shouldRouteToOriginating: boolean;
+  originatingChannel?: string;
+  originatingTo?: string;
+  originatingAccountId?: string;
+  originatingThreadId?: string | number;
+  originatingChatType?: ChatType;
+  onReplyStart?: () => Promise<void> | void;
+  abortSignal?: AbortSignal;
+  runId?: string;
 };

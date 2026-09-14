@@ -99,7 +99,7 @@ it.each([
   await dispatcher.waitForIdle();
 
   expect(delivered.map((payload) => payload.text ?? "").join("")).toBe(visible);
-  for (const payload of delivered.filter((payload) => payload.text)) {
+  for (const payload of delivered.filter((entry) => entry.text)) {
     expect(payload.replyToId).toBe("source-message");
   }
   if (mediaUrl) {

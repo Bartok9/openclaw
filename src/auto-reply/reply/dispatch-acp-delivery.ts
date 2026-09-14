@@ -4,9 +4,6 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
-import type { ChatType } from "../../channels/chat-type.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type { TtsAutoMode } from "../../config/types.tts.js";
 import { logVerbose } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
@@ -23,16 +20,24 @@ import {
   isReplyPayloadStatusNotice,
   isReplyPayloadTtsSupplement,
 } from "../reply-payload.js";
-import type { FinalizedMsgContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { createBlockReplySource, setBlockReplyDelivery } from "./block-reply-delivery.js";
 import type { BlockReplySource } from "./block-reply-source.types.js";
 import type {
   AcpBlockText,
   AcpDispatchDeliveryMeta,
+  AcpDispatchDeliveryParams,
   AcpDispatchDeliveryState,
 } from "./dispatch-acp-delivery.types.js";
-import { maybeApplyAcpTts, prepareAcpDeliveryPayload } from "./dispatch-acp-payload.js";
+import {
+  buildAcpTextContinuation,
+  getAcpBlockTextForFallback,
+  getAcpBlockTranscriptText,
+  joinAcpBlockText,
+  maybeApplyAcpTts,
+  prepareAcpDeliveryPayload,
+  shouldTreatDeliveredTextAsVisible,
+} from "./dispatch-acp-payload.js";
 import {
   resolveRoutedReplyDeliveryOutcome,
   shouldRetryReplyDispatch,
@@ -42,7 +47,7 @@ import {
   captureReplyDispatchDeliveryOutcome,
   waitForReplyDispatcherIdle,
 } from "./reply-dispatcher.js";
-import type { ReplyDispatchKind, ReplyDispatcher } from "./reply-dispatcher.types.js";
+import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
 import {
   createReplyDeliveryContext,
   resolveReplyDeliveryAccountId,
@@ -58,60 +63,11 @@ const messageActionRuntimeLoader = createLazyImportLoader(
   () => import("../../infra/outbound/message-action-runner.js"),
 );
 
-async function shouldTreatDeliveredTextAsVisible(params: {
-  channel: string | undefined;
-  kind: ReplyDispatchKind;
-  text: string | undefined;
-}): Promise<boolean> {
-  if (!normalizeOptionalString(params.text)) {
-    return false;
-  }
-  if (params.kind === "final") {
-    return true;
-  }
-  const channelId = normalizeOptionalLowercaseString(params.channel);
-  if (!channelId) {
-    return false;
-  }
-  const { getChannelPlugin } = await channelPluginRuntimeLoader.load();
-  const outbound = getChannelPlugin(channelId)?.outbound;
-  const visibilityOverride =
-    outbound?.shouldTreatDeliveredTextAsVisible ?? outbound?.shouldTreatRoutedTextAsVisible;
-  if (visibilityOverride) {
-    return visibilityOverride({
-      kind: params.kind,
-      text: params.text,
-    });
-  }
-  return false;
-}
-
 export type AcpDispatchDeliveryCoordinator = ReturnType<
   typeof createAcpDispatchDeliveryCoordinator
 >;
 
-export function createAcpDispatchDeliveryCoordinator(params: {
-  cfg: OpenClawConfig;
-  agentId?: string;
-  ctx: FinalizedMsgContext;
-  dispatcher: ReplyDispatcher;
-  inboundAudio: boolean;
-  sessionKey?: string;
-  sessionTtsAuto?: TtsAutoMode;
-  ttsChannel?: string;
-  suppressUserDelivery?: boolean;
-  suppressBlockUserDelivery?: boolean;
-  suppressReplyLifecycle?: boolean;
-  shouldRouteToOriginating: boolean;
-  originatingChannel?: string;
-  originatingTo?: string;
-  originatingAccountId?: string;
-  originatingThreadId?: string | number;
-  originatingChatType?: ChatType;
-  onReplyStart?: () => Promise<void> | void;
-  abortSignal?: AbortSignal;
-  runId?: string;
-}) {
+export function createAcpDispatchDeliveryCoordinator(params: AcpDispatchDeliveryParams) {
   const directChannel = normalizeOptionalLowercaseString(params.ctx.Provider ?? params.ctx.Surface);
   const routedChannel = normalizeOptionalLowercaseString(params.originatingChannel);
   const deliverySessionKey = normalizeOptionalString(params.sessionKey) ?? params.ctx.SessionKey;
@@ -687,14 +643,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     if (state.cleanBlockTtsDirectiveText && rawBlockText) {
       drainBlockText = state.cleanBlockTtsDirectiveText.hasBufferedDirectiveText()
         ? async (text) => {
-            const tailPayload = copyReplyPayloadMetadata(visiblePayload, {
-              text,
-              replyToId: visiblePayload.replyToId,
-              replyToTag: visiblePayload.replyToTag,
-              replyToCurrent: visiblePayload.replyToCurrent,
-              isCommentary: visiblePayload.isCommentary,
-              isReasoning: visiblePayload.isReasoning,
-            });
+            const tailPayload = buildAcpTextContinuation(visiblePayload, text);
             const tailBlock: AcpBlockText = { text, source: blockSource, needsFinalDelivery: true };
             state.blockTexts.push(tailBlock);
             const sendTail = async () => {
@@ -709,52 +658,6 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     }
     const send = () => sendPrepared(visiblePayload, blockText);
     return blockSource ? ((await blockSource.run(send)) ?? false) : await send();
-  };
-
-  const getBlockTranscriptText = (confirmedOnly = false) => {
-    const deliveredSources = new Set(
-      state.blockTexts.filter((block) => block.delivered).map((block) => block.source),
-    );
-    const recoveredSources = new Set(
-      state.blockTexts.filter((block) => block.delivered === "final").map((block) => block.source),
-    );
-    // Final recovery confirms a source only after its buffered and visible parts are covered.
-    recoveredSources.delete(pendingBlockSource);
-    for (const block of state.blockTexts) {
-      if (block.text && !block.delivered) {
-        recoveredSources.delete(block.source);
-      }
-    }
-    return state.blockTexts
-      .flatMap((block) => {
-        const sourceConfirmed = block.source
-          ? (block.source.complete && deliveredSources.has(block.source)) ||
-            recoveredSources.has(block.source)
-          : block.delivered;
-        const text =
-          !confirmedOnly || sourceConfirmed
-            ? block.transcriptText
-            : block.delivered
-              ? block.text
-              : undefined;
-        return text ? [text] : [];
-      })
-      .join("\n");
-  };
-
-  const joinBlockText = (blocks: AcpBlockText[]) => {
-    let text = "";
-    let previousSource: BlockReplySource | undefined;
-    for (const block of blocks) {
-      if (block.text) {
-        if (text && (!block.source || block.source !== previousSource)) {
-          text += "\n";
-        }
-        text += block.text;
-        previousSource = block.source;
-      }
-    }
-    return text;
   };
 
   return {
@@ -773,32 +676,21 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         await drain(text);
       }
     },
-    getAccumulatedVisibleBlockText: () => joinBlockText(state.blockTexts),
-    getBlockTextForFallback: () => {
-      if (
-        state.deliveredAnswerFinalToUser ||
-        (!params.shouldRouteToOriginating &&
-          state.queuedUntrackedVisibleTextDeliveries > 0 &&
-          !params.suppressBlockUserDelivery &&
-          state.deliveredVisibleText &&
-          !state.failedVisibleTextDelivery)
-      ) {
-        return "";
-      }
-      const blocks = state.blockTexts.filter((block) => block.needsFinalDelivery);
-      return params.suppressBlockUserDelivery && blocks.length > 0
-        ? cleanDeferredFinalText(state.accumulatedBlockTtsText)
-        : joinBlockText(blocks);
-    },
+    getAccumulatedVisibleBlockText: () => joinAcpBlockText(state.blockTexts),
+    getBlockTextForFallback: () => getAcpBlockTextForFallback(state, params),
     getAccumulatedBlockTtsText: () => state.accumulatedBlockTtsText,
-    getAccumulatedTranscriptText: () => state.accumulatedFinalText || getBlockTranscriptText(),
+    getAccumulatedTranscriptText: () =>
+      state.accumulatedFinalText || getAcpBlockTranscriptText(state.blockTexts, pendingBlockSource),
     resolveAccumulatedDeliveredTranscriptText: async () => {
       // Transcript and fallback observers must await the same delivery settlements.
       await Promise.all(state.pendingTranscriptOutcomes);
       await Promise.all(
         state.blockTexts.flatMap((block) => (block.source ? [block.source.settle()] : [])),
       );
-      return state.accumulatedDeliveredFinalText || getBlockTranscriptText(true);
+      return (
+        state.accumulatedDeliveredFinalText ||
+        getAcpBlockTranscriptText(state.blockTexts, pendingBlockSource, true)
+      );
     },
     settleVisibleText: settleDirectVisibleText,
     hasDeliveredFinalReply: () => state.deliveredFinalReply,
