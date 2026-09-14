@@ -402,19 +402,13 @@ describe("createTtsDirectiveTextStreamCleaner", () => {
     expect(cleaner.flush()).toBe("[[note");
   });
 
-  it("hides markup when a chunk split lands between the two opening brackets", () => {
+  it.each([
+    ["opening tag", "Intro [", "[tts:text]]hidden speech[[/tts:text]] visible"],
+    ["closing tag", "Intro [[tts:text]]hidden speech[", "[/tts:text]] visible"],
+  ])("hides speech when the %s opening bracket pair is split", (_name, first, second) => {
     const cleaner = createTtsDirectiveTextStreamCleaner();
-
-    expect(cleaner.push("Intro [")).toBe("Intro ");
-    expect(cleaner.push("[tts:text]]hidden speech[[/tts:text]] visible")).toBe(" visible");
-    expect(cleaner.flush()).toBe("");
-  });
-
-  it("hides markup when a chunk split lands between the two closing brackets", () => {
-    const cleaner = createTtsDirectiveTextStreamCleaner();
-
-    expect(cleaner.push("Intro [[tts:text]]hidden speech[")).toBe("Intro ");
-    expect(cleaner.push("[/tts:text]] visible")).toBe(" visible");
+    expect(cleaner.push(first)).toBe("Intro ");
+    expect(cleaner.push(second)).toBe(" visible");
     expect(cleaner.flush()).toBe("");
   });
 });

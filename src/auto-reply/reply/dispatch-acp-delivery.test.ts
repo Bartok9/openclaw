@@ -541,7 +541,7 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
 
     expect(dispatcher.sendBlockReply).toHaveBeenNthCalledWith(1, { text: "Intro " });
     expect(dispatcher.sendBlockReply).toHaveBeenNthCalledWith(2, { text: " visible" });
-    expect(coordinator.getAccumulatedVisibleBlockText()).toBe("Intro \n visible");
+    expect(coordinator.getAccumulatedVisibleBlockText()).toBe("Intro  visible");
     expect(coordinator.getAccumulatedBlockTtsText()).toBe(
       "Intro [[tts:text]]hidden[[/tts:text]] visible",
     );

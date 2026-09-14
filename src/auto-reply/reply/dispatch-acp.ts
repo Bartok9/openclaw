@@ -316,6 +316,7 @@ async function finalizeAcpTurnOutput(params: {
   ttsAccountId?: string;
   shouldDeferVisibleTextForTts: boolean;
   shouldEmitResolvedIdentityNotice: boolean;
+  abortSignal?: AbortSignal;
 }): Promise<boolean> {
   const ttsMode = resolveConfiguredTtsMode(params.cfg, {
     agentId: params.agentId,
@@ -344,6 +345,9 @@ async function finalizeAcpTurnOutput(params: {
   if (!shouldDeferVisibleTextForTts) {
     await params.delivery.settleVisibleText();
   }
+  if (params.abortSignal?.aborted) {
+    return false;
+  }
   let queuedFinal =
     params.delivery.hasPendingAnswerDelivery() ||
     params.delivery.hasPendingFinalTtsMedia() ||
@@ -358,6 +362,9 @@ async function finalizeAcpTurnOutput(params: {
   ) {
     try {
       const { maybeApplyTtsToPayload } = await loadDispatchAcpTtsRuntime();
+      if (params.abortSignal?.aborted) {
+        return queuedFinal;
+      }
       const ttsSyntheticReply = await maybeApplyTtsToPayload({
         payload: { text: accumulatedBlockTtsText },
         cfg: params.cfg,
@@ -1042,6 +1049,7 @@ export async function tryDispatchAcpReplyCore(params: {
     });
 
     await projector.flush(true);
+    await delivery.flushBlockText();
     if (!runtimeTurnWasCancelled && !params.abortSignal?.aborted) {
       queuedFinal =
         (await finalizeAcpTurnOutput({
@@ -1055,6 +1063,7 @@ export async function tryDispatchAcpReplyCore(params: {
           ttsAccountId: effectiveDispatchAccountId,
           shouldDeferVisibleTextForTts,
           shouldEmitResolvedIdentityNotice,
+          abortSignal: params.abortSignal,
         })) || queuedFinal;
     }
     // Recheck cancellation after final delivery settles so a late abort keeps
@@ -1091,6 +1100,7 @@ export async function tryDispatchAcpReplyCore(params: {
     });
     emitAuditError(acpError);
     await projector.flush(true);
+    await delivery.flushBlockText();
     queuedFinal = (await deliverDeferredTextFallback()) || queuedFinal;
     await maybeUnbindStaleBoundConversations({
       targetSessionKey: canonicalSessionKey,

@@ -169,6 +169,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
   };
   let hasPendingDirectBlockReplyDelivery = false;
   let pendingBlockSource: BlockReplySource | undefined;
+  let drainBlockText: ((text: string) => Promise<boolean>) | undefined;
 
   const settleDirectVisibleText = async () => {
     // Exact payload settlements own custody and coverage before final fallback reads them.
@@ -346,6 +347,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         blockText = {
           text: visiblePayload.text ?? "",
           transcriptText: rawBlockText,
+          source: blockSource,
           needsFinalDelivery: Boolean(visiblePayload.text),
         };
         state.blockTexts.push(blockText);
@@ -367,7 +369,11 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         ? transcriptSource.text
         : undefined;
 
-    const sendPrepared = async (): Promise<boolean> => {
+    const sendPrepared = async (
+      visiblePayload: ReplyPayload,
+      blockText: AcpBlockText | undefined,
+      skipTts = meta?.skipTts,
+    ): Promise<boolean> => {
       if (!hasOutboundReplyContent(visiblePayload, { trimText: true })) {
         return false;
       }
@@ -408,7 +414,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         kind,
         inboundAudio: params.inboundAudio,
         ttsAuto: params.sessionTtsAuto,
-        skipTts: meta?.skipTts,
+        skipTts,
       });
       const finalVisibleTextSource =
         kind === "final" && params.suppressBlockUserDelivery && state.cleanBlockTtsDirectiveText
@@ -457,7 +463,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       };
       const recordDeliveredReply = (tracksVisibleText: boolean) => {
         if (blockText) {
-          blockText.delivered = true;
+          blockText.delivered = "block";
         }
         if (
           (rawFinalText || hasFinalTtsMedia) &&
@@ -465,7 +471,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
           transcriptSource.kind !== "final"
         ) {
           for (const block of coveredBlocks) {
-            block.delivered = true;
+            block.delivered = "final";
           }
         } else if (transcriptFinalText) {
           state.accumulatedDeliveredFinalText = state.accumulatedDeliveredFinalText
@@ -677,21 +683,96 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       }
       return delivered;
     };
-    return blockSource ? ((await blockSource.run(sendPrepared)) ?? false) : await sendPrepared();
+    if (state.cleanBlockTtsDirectiveText && rawBlockText) {
+      drainBlockText = state.cleanBlockTtsDirectiveText.hasBufferedDirectiveText()
+        ? async (text) => {
+            const tailPayload = copyReplyPayloadMetadata(visiblePayload, {
+              text,
+              replyToId: visiblePayload.replyToId,
+              replyToTag: visiblePayload.replyToTag,
+              replyToCurrent: visiblePayload.replyToCurrent,
+              isCommentary: visiblePayload.isCommentary,
+              isReasoning: visiblePayload.isReasoning,
+            });
+            const tailBlock: AcpBlockText = { text, source: blockSource, needsFinalDelivery: true };
+            state.blockTexts.push(tailBlock);
+            const sendTail = async () => {
+              setBlockReplyDelivery(Promise.resolve({ outcome: "cancelled" }), tailPayload);
+              return params.abortSignal?.aborted
+                ? false
+                : await sendPrepared(tailPayload, tailBlock, true);
+            };
+            return blockSource ? ((await blockSource.run(sendTail)) ?? false) : await sendTail();
+          }
+        : undefined;
+    }
+    const send = () => sendPrepared(visiblePayload, blockText);
+    return blockSource ? ((await blockSource.run(send)) ?? false) : await send();
   };
 
-  const getBlockTranscriptText = (confirmedOnly = false) =>
-    state.blockTexts
-      .flatMap((block) =>
-        block.transcriptText && (!confirmedOnly || block.delivered) ? [block.transcriptText] : [],
-      )
+  const getBlockTranscriptText = (confirmedOnly = false) => {
+    const deliveredSources = new Set(
+      state.blockTexts.filter((block) => block.delivered).map((block) => block.source),
+    );
+    const recoveredSources = new Set(
+      state.blockTexts.filter((block) => block.delivered === "final").map((block) => block.source),
+    );
+    // Final recovery confirms a source only after its buffered and visible parts are covered.
+    recoveredSources.delete(pendingBlockSource);
+    for (const block of state.blockTexts) {
+      if (block.text && !block.delivered) {
+        recoveredSources.delete(block.source);
+      }
+    }
+    return state.blockTexts
+      .flatMap((block) => {
+        const sourceConfirmed = block.source
+          ? (block.source.complete && deliveredSources.has(block.source)) ||
+            recoveredSources.has(block.source)
+          : block.delivered;
+        const text =
+          !confirmedOnly || sourceConfirmed
+            ? block.transcriptText
+            : block.delivered
+              ? block.text
+              : undefined;
+        return text ? [text] : [];
+      })
       .join("\n");
+  };
+
+  const joinBlockText = (blocks: AcpBlockText[]) => {
+    let text = "";
+    let previousSource: BlockReplySource | undefined;
+    for (const block of blocks) {
+      if (block.text) {
+        if (text && (!block.source || block.source !== previousSource)) {
+          text += "\n";
+        }
+        text += block.text;
+        previousSource = block.source;
+      }
+    }
+    return text;
+  };
 
   return {
     startReplyLifecycle: startReplyLifecycleOnce,
     deliver,
-    getAccumulatedVisibleBlockText: () =>
-      state.blockTexts.flatMap((block) => (block.text ? [block.text] : [])).join("\n"),
+    flushBlockText: async () => {
+      if (params.abortSignal?.aborted) {
+        return;
+      }
+      const text = state.cleanBlockTtsDirectiveText?.flush();
+      const drain = drainBlockText;
+      drainBlockText = undefined;
+      pendingBlockSource?.setComplete(true);
+      pendingBlockSource = undefined;
+      if (text?.trim() && drain) {
+        await drain(text);
+      }
+    },
+    getAccumulatedVisibleBlockText: () => joinBlockText(state.blockTexts),
     getBlockTextForFallback: () => {
       if (
         state.deliveredAnswerFinalToUser ||
@@ -706,13 +787,14 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       const blocks = state.blockTexts.filter((block) => block.needsFinalDelivery);
       return params.suppressBlockUserDelivery && blocks.length > 0
         ? cleanDeferredFinalText(state.accumulatedBlockTtsText)
-        : blocks.map((block) => block.text).join("\n");
+        : joinBlockText(blocks);
     },
     getAccumulatedBlockTtsText: () => state.accumulatedBlockTtsText,
     getAccumulatedTranscriptText: () => state.accumulatedFinalText || getBlockTranscriptText(),
     resolveAccumulatedDeliveredTranscriptText: async () => {
       // Transcript and fallback observers must await the same delivery settlements.
       await Promise.all(state.pendingTranscriptOutcomes);
+      await Promise.all(state.blockTexts.map((block) => block.source?.settle()));
       return state.accumulatedDeliveredFinalText || getBlockTranscriptText(true);
     },
     settleVisibleText: settleDirectVisibleText,

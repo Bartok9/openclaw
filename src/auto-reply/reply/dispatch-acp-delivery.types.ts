@@ -1,4 +1,5 @@
 import type { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
+import type { BlockReplySource } from "./block-reply-source.types.js";
 import type { NormalizeReplySkipReason } from "./normalize-reply-skip-reason.js";
 import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
 
@@ -21,9 +22,10 @@ type ToolMessageHandle = {
 export type AcpBlockText = {
   text: string;
   transcriptText?: string;
+  source?: BlockReplySource;
   needsFinalDelivery: boolean;
   // A terminal-only surface can confirm a block yet still need final delivery.
-  delivered?: true;
+  delivered?: "block" | "final";
 };
 
 export type AcpDispatchDeliveryState = {

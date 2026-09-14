@@ -182,9 +182,10 @@ export function createTtsDirectiveTextStreamCleaner(): TtsDirectiveTextStreamCle
       return output;
     },
     flush(): string {
-      const tail = pending;
+      const tail = insideHiddenTextBlock ? "" : pending;
       pending = "";
-      return insideHiddenTextBlock ? "" : tail;
+      insideHiddenTextBlock = false;
+      return tail;
     },
     hasBufferedDirectiveText(): boolean {
       return pending.length > 0 || insideHiddenTextBlock;
