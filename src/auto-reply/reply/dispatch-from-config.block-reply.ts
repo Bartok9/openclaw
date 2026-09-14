@@ -106,7 +106,7 @@ export function createDispatchBlockReplyHandler(state: PrepareDispatchExecutionR
         state.progressState.blockCount++;
       }
       let source: BlockReplySource | undefined;
-      let visiblePayload =
+      const cleanedPayload =
         payload.text && cleanBlockTtsDirectiveText && contributesToFinalReply
           ? (() => {
               if (!deferFinalTtsText) {
@@ -122,7 +122,8 @@ export function createDispatchBlockReplyHandler(state: PrepareDispatchExecutionR
               });
             })()
           : payload;
-      const sendPrepared = async (visiblePayload: ReplyPayload, terminal = false) => {
+      const sendPrepared = async (preparedPayload: ReplyPayload, terminal = false) => {
+        let visiblePayload = preparedPayload;
         if (terminal) {
           setBlockReplyDelivery(Promise.resolve({ outcome: "cancelled" }), visiblePayload);
         }
@@ -241,7 +242,7 @@ export function createDispatchBlockReplyHandler(state: PrepareDispatchExecutionR
           }
         };
       }
-      const send = () => sendPrepared(visiblePayload);
+      const send = () => sendPrepared(cleanedPayload);
       if (source) {
         await source.run(send);
       } else {

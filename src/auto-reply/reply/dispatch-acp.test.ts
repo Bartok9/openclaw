@@ -4064,7 +4064,7 @@ describe("tryDispatchAcpReplyCore", () => {
         },
         { name: "hidden end", chunks: ["[[tts:text]]Private ["], visible: "", deferred: false },
         { name: "deferred literal end", chunks: ["See ["], visible: "See [", deferred: true },
-      ].map((testCase) => ({ ...testCase, routed })),
+      ].map((testCase) => Object.assign(testCase, { routed })),
     ),
   )("drains ACP $name through registered dispatch (routed=$routed)", async (testCase) => {
     setReadyAcpResolution();

@@ -62,7 +62,7 @@ it.each([
     dispatcher,
     replyResolver: async (_ctx, opts) => {
       const pipeline = createBlockReplyPipeline({
-        onBlockReply: (payload, context) => opts?.onBlockReply?.(payload, context),
+        onBlockReply: (block, context) => opts?.onBlockReply?.(block, context),
         timeoutMs: 0,
       });
       try {
@@ -77,7 +77,9 @@ it.each([
             expect(delivered).toContainEqual(expect.objectContaining({ text: "See ", mediaUrl }));
           }
         }
-        if (!final) return undefined;
+        if (!final) {
+          return undefined;
+        }
         return (
           await buildReplyPayloads({
             payloads: [{ text: chunks.join(""), ...(mediaUrl ? { mediaUrl } : {}) }],
@@ -142,7 +144,9 @@ it("preserves a failed terminal bracket after the real producer filters its fina
           cause: undefined,
         });
       }
-      if (payload.text) delivered.push(payload.text);
+      if (payload.text) {
+        delivered.push(payload.text);
+      }
     },
   });
   await dispatchReplyFromConfig({
@@ -181,7 +185,9 @@ it.each([false, true])(
     const settled: string[] = [];
     const dispatcher = createReplyDispatcher({
       deliver: async (payload) => {
-        if (payload.text) delivered.push(payload.text);
+        if (payload.text) {
+          delivered.push(payload.text);
+        }
       },
     });
     await dispatchReplyFromConfig({
