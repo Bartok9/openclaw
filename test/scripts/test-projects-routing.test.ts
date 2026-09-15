@@ -425,14 +425,19 @@ describe("test-projects args", () => {
         watchMode: false,
       },
     ]);
-    expect(buildVitestRunPlans(["src/auto-reply/reply/dispatch-from-config.test.ts"])).toEqual([
-      {
-        config: "test/vitest/vitest.auto-reply.config.ts",
-        forwardedArgs: [],
-        includePatterns: ["src/auto-reply/reply/dispatch-from-config.test.ts"],
-        watchMode: false,
-      },
-    ]);
+    for (const target of [
+      "src/auto-reply/reply/dispatch-from-config.test.ts",
+      "src/auto-reply/reply/dispatch-from-config.tts-stream.test.ts",
+    ]) {
+      expect(buildVitestRunPlans([target])).toEqual([
+        {
+          config: "test/vitest/vitest.auto-reply.config.ts",
+          forwardedArgs: [],
+          includePatterns: [target],
+          watchMode: false,
+        },
+      ]);
+    }
   });
 
   it("expands a test filename prefix into standalone sibling suites", () => {
