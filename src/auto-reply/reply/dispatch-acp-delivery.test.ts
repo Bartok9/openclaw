@@ -338,8 +338,8 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
       releaseDelivery?.();
       await expect(transcriptPromise).resolves.toBe(noSend ? "" : "hello");
       await fallback;
-      expect(delivered.map((payload) => payload.text)).toEqual(
-        noSend ? ["hello", "hello"] : ["hello"],
+      expect(delivered).toEqual(
+        noSend ? [{ text: "hello" }, { text: "hello" }] : [{ text: "hello" }],
       );
       await dispatcher.waitForIdle();
     },
