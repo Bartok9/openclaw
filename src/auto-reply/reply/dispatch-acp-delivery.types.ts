@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import type { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
 import type { FinalizedMsgContext } from "../templating.js";
+import type { ReplyPayload } from "../types.js";
 import type { BlockReplySource } from "./block-reply-source.types.js";
 import type { NormalizeReplySkipReason } from "./normalize-reply-skip-reason.js";
 import type { ReplyDispatchKind, ReplyDispatcher } from "./reply-dispatcher.types.js";
@@ -24,7 +25,8 @@ type ToolMessageHandle = {
 };
 
 export type AcpBlockText = {
-  text: string;
+  payload: ReplyPayload;
+  deliver: (kind: "block" | "final", skipTts?: boolean) => Promise<boolean>;
   transcriptText?: string;
   source?: BlockReplySource;
   needsFinalDelivery: boolean;

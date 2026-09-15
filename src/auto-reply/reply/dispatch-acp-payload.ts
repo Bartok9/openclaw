@@ -8,11 +8,11 @@ import type { ChannelMessagingAdapter } from "../../channels/plugins/types.publi
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
-import { cleanDeferredFinalText } from "../../tts/captioned-final.js";
 import { resolveStatusTtsSnapshot } from "../../tts/status-config.js";
 import { resolveConfiguredTtsMode } from "../../tts/tts-config.js";
 import { copyReplyPayloadMetadata, isReplyPayloadStatusNotice } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
+import { hasBlockReplyDeliveryCustody } from "./block-reply-delivery.js";
 import type { BlockReplySource } from "./block-reply-source.types.js";
 import type { AcpBlockText, AcpDispatchDeliveryState } from "./dispatch-acp-delivery.types.js";
 import { normalizeReplyPayloadOutcome } from "./normalize-reply.js";
@@ -144,7 +144,7 @@ export function getAcpBlockTranscriptText(
   // Final recovery confirms a source only after its buffered and visible parts are covered.
   recoveredSources.delete(pendingBlockSource);
   for (const block of blocks) {
-    if (block.text && !block.delivered) {
+    if (block.payload.text && !block.delivered) {
       recoveredSources.delete(block.source);
     }
   }
@@ -158,7 +158,7 @@ export function getAcpBlockTranscriptText(
         !confirmedOnly || sourceConfirmed
           ? block.transcriptText
           : block.delivered
-            ? block.text
+            ? block.payload.text
             : undefined;
       return text ? [text] : [];
     })
@@ -169,20 +169,26 @@ export function joinAcpBlockText(blocks: AcpBlockText[]) {
   let text = "";
   let previousSource: BlockReplySource | undefined;
   for (const block of blocks) {
-    if (block.text) {
+    if (block.payload.text) {
       if (text && (!block.source || block.source !== previousSource)) {
         text += "\n";
       }
-      text += block.text;
+      text += block.payload.text;
       previousSource = block.source;
     }
   }
   return text;
 }
 
-export function getAcpBlockTextForFallback(
+export async function recoverAcpBlockText(
   state: AcpDispatchDeliveryState,
-  params: { shouldRouteToOriginating: boolean; suppressBlockUserDelivery?: boolean },
+  params: {
+    shouldRouteToOriginating: boolean;
+    suppressBlockUserDelivery?: boolean;
+    abortSignal?: AbortSignal;
+    channel?: string;
+    onlyUndelivered?: boolean;
+  },
 ) {
   if (
     state.deliveredAnswerFinalToUser ||
@@ -192,15 +198,43 @@ export function getAcpBlockTextForFallback(
       state.deliveredVisibleText &&
       !state.failedVisibleTextDelivery)
   ) {
-    return "";
+    return false;
   }
-  const blocks = state.blockTexts.filter((block) => block.needsFinalDelivery);
-  return params.suppressBlockUserDelivery && blocks.length > 0
-    ? cleanDeferredFinalText(state.accumulatedBlockTtsText)
-    : joinAcpBlockText(blocks);
+  const blocks = state.blockTexts.filter(
+    (block) => block.needsFinalDelivery && (!params.onlyUndelivered || !block.delivered),
+  );
+  let queued = false;
+  for (const block of blocks) {
+    if (params.abortSignal?.aborted) {
+      break;
+    }
+    if (
+      block.source &&
+      !params.suppressBlockUserDelivery &&
+      (await shouldTreatDeliveredTextAsVisible({
+        channel: params.channel,
+        kind: "block",
+        text: block.payload.text,
+      })) &&
+      hasBlockReplyDeliveryCustody(await block.source.settle())
+    ) {
+      continue;
+    }
+    if (params.abortSignal?.aborted) {
+      break;
+    }
+    queued = (await block.deliver("final", true)) || queued;
+    if (block.delivered !== "final") {
+      break;
+    }
+  }
+  return queued;
 }
 
-export function buildAcpTextContinuation(payload: ReplyPayload, text: string): ReplyPayload {
+export function buildAcpTextContinuation(
+  payload: ReplyPayload,
+  text: string | undefined,
+): ReplyPayload {
   return copyReplyPayloadMetadata(payload, {
     text,
     replyToId: payload.replyToId,

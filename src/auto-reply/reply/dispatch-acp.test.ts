@@ -4183,17 +4183,21 @@ describe("tryDispatchAcpReplyCore", () => {
   );
 
   it.each(
-    [false, true].flatMap((abortAfterFinal) =>
-      (["tail-failed", "prefix-failed", "terminal-only"] as const).map((outcome) => ({
-        outcome,
-        abortAfterFinal,
-      })),
+    (["all", "final"] as const).flatMap((mode) =>
+      [false, true].flatMap((abortAfterFinal) =>
+        (["tail-failed", "prefix-failed", "terminal-only"] as const)
+          .filter((outcome) => mode === "final" || outcome !== "terminal-only")
+          .map((outcome) => ({ outcome, abortAfterFinal, mode })),
+      ),
     ),
   )(
-    "recovers exactly the unsent ACP text after $outcome (abortAfterFinal=$abortAfterFinal)",
-    async ({ outcome, abortAfterFinal }) => {
+    "recovers exactly the unsent ACP text after $outcome (abortAfterFinal=$abortAfterFinal, mode=$mode)",
+    async ({ outcome, abortAfterFinal, mode }) => {
       setReadyAcpResolution();
-      ttsMocks.maybeApplyTtsToPayload.mockResolvedValue({});
+      ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (input) => {
+        const request = requireRecord(input, "TTS request");
+        return request.kind === "block" ? request.payload : {};
+      });
       mockVisibleTextTurn("See [");
       const controller = new AbortController();
       const attempts: Array<{ kind: string; text?: string }> = [];
@@ -4210,7 +4214,7 @@ describe("tryDispatchAcpReplyCore", () => {
           if (payload.text && (outcome !== "terminal-only" || kind === "final")) {
             delivered.push(payload.text);
           }
-          if (kind === "final" && abortAfterFinal) {
+          if (kind === "final" && abortAfterFinal && delivered.join("") === "See [") {
             controller.abort();
           }
           return { visibleReplySent: true };
@@ -4225,7 +4229,7 @@ describe("tryDispatchAcpReplyCore", () => {
         abortSignal: controller.signal,
         cfg: createAcpTestConfig({
           acp: { enabled: true, stream: { deliveryMode: "live" } },
-          tts: { auto: "always", mode: "final" },
+          tts: { auto: "always", mode },
         }),
         ...(outcome === "terminal-only"
           ? { ctxOverrides: { Provider: "webchat", Surface: "webchat" } }
@@ -4234,11 +4238,16 @@ describe("tryDispatchAcpReplyCore", () => {
       dispatcher.markComplete();
       await dispatcher.waitForIdle();
 
-      expect(attempts).toEqual([
+      expect(attempts.filter((attempt) => attempt.kind === "block")).toEqual([
         { kind: "block", text: "See " },
         ...(outcome === "prefix-failed" ? [] : [{ kind: "block", text: "[" }]),
-        { kind: "final", text: outcome === "tail-failed" ? "[" : "See [" },
       ]);
+      expect(
+        attempts
+          .filter((attempt) => attempt.kind === "final")
+          .map((attempt) => attempt.text)
+          .join(""),
+      ).toBe(outcome === "tail-failed" ? "[" : "See [");
       expect(delivered.join("")).toBe("See [");
       expect(transcriptMocks.persistAcpDispatchTranscript).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ finalText: "See [" }),
@@ -4291,12 +4300,24 @@ describe("tryDispatchAcpReplyCore", () => {
     }
   });
 
-  it("sends prepared ACP text and media before draining its literal tail", async () => {
+  it.each(
+    (["all", "final"] as const).flatMap((mode) =>
+      (["delivered", "tail-failed", "custody", "caller-abort"] as const).map((outcome) => ({
+        mode,
+        outcome,
+      })),
+    ),
+  )("settles prepared ACP text and media once ($mode, $outcome)", async ({ mode, outcome }) => {
     setReadyAcpResolution();
-    ttsMocks.maybeApplyTtsToPayload.mockResolvedValue({});
+    ttsMocks.maybeApplyTtsToPayload.mockImplementation(async (input) => {
+      const request = requireRecord(input, "TTS request");
+      return request.kind === "block" ? request.payload : {};
+    });
     const text = "a".repeat(479) + "[";
     const prefixDelivered = createDeferred();
     const delivered: ReplyPayload[] = [];
+    const attempts: ReplyPayload[] = [];
+    const controller = new AbortController();
     const mediaUrl = "https://example.test/source.png";
     const transformReplyPayload = vi.fn((payload: ReplyPayload) =>
       setReplyPayloadMetadata(
@@ -4307,7 +4328,22 @@ describe("tryDispatchAcpReplyCore", () => {
     const dispatcher = createReplyDispatcher({
       responsePrefix: "[bot]",
       transformReplyPayload,
-      deliver: async (payload) => {
+      deliver: async (payload, { kind }) => {
+        attempts.push(payload);
+        if (kind === "block" && payload.text === "[" && outcome !== "delivered") {
+          if (outcome === "caller-abort") {
+            controller.abort();
+          }
+          const cause = new PlatformMessageNotDispatchedError("terminal send failed", {
+            cause: undefined,
+          });
+          if (outcome === "custody") {
+            const failure = new OutboundDeliveryError("queue retained tail", { cause });
+            failure.queueCustody = "held";
+            throw failure;
+          }
+          throw cause;
+        }
         delivered.push(payload);
         prefixDelivered.resolve();
         return { visibleReplySent: true };
@@ -4328,24 +4364,37 @@ describe("tryDispatchAcpReplyCore", () => {
 
     await runDispatch({
       bodyForAgent: "reply",
-      dispatcher,
+      dispatcher: createAbortAwareDispatcher({
+        dispatcher,
+        isAborted: () => controller.signal.aborted,
+      }),
+      abortSignal: controller.signal,
       cfg: createAcpTestConfig({
         acp: { enabled: true, stream: { deliveryMode: "live" } },
-        tts: { auto: "always", mode: "final" },
+        tts: { auto: "always", mode },
       }),
     });
     dispatcher.markComplete();
     await dispatcher.waitForIdle();
 
-    expect(delivered.map((payload) => payload.text).join("")).toBe(`[bot] [channel] ${text}`);
-    expect(delivered.map((payload) => payload.mediaUrl)).toEqual([mediaUrl, undefined]);
-    expect(delivered.map((payload) => payload.replyToId)).toEqual([
-      "source-message",
-      "source-message",
+    const recovered = outcome === "delivered" || outcome === "tail-failed";
+    expect(delivered.map((payload) => payload.text).join("")).toBe(
+      `[bot] [channel] ${recovered ? text : text.slice(0, -1)}`,
+    );
+    expect(attempts.map((payload) => payload.text)).toEqual([
+      `[bot] [channel] ${text.slice(0, -1)}`,
+      "[",
+      ...(outcome === "tail-failed" ? ["["] : []),
     ]);
+    expect(delivered.map((payload) => payload.mediaUrl)).toEqual(
+      recovered ? [mediaUrl, undefined] : [mediaUrl],
+    );
+    expect(delivered.map((payload) => payload.replyToId)).toEqual(
+      recovered ? ["source-message", "source-message"] : ["source-message"],
+    );
     expect(
       delivered.map((payload) => getReplyPayloadMetadata(payload)?.assistantMessageIndex),
-    ).toEqual([7, 7]);
+    ).toEqual(recovered ? [7, 7] : [7]);
     expect(transformReplyPayload).toHaveBeenCalledOnce();
   });
 

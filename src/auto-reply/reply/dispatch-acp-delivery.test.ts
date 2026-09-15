@@ -333,13 +333,14 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
       await Promise.resolve();
       expect(transcriptSettled).toBe(false);
 
-      const fallback = coordinator
-        .settleVisibleText()
-        .then(() => coordinator.getBlockTextForFallback());
+      const fallback = coordinator.settleVisibleText().then(() => coordinator.recoverBlockText());
       await Promise.resolve();
       releaseDelivery?.();
       await expect(transcriptPromise).resolves.toBe(noSend ? "" : "hello");
-      await expect(fallback).resolves.toBe(noSend ? "hello" : "");
+      await fallback;
+      expect(delivered.map((payload) => payload.text)).toEqual(
+        noSend ? ["hello", "hello"] : ["hello"],
+      );
       await dispatcher.waitForIdle();
     },
   );

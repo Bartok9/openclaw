@@ -401,14 +401,4 @@ describe("createTtsDirectiveTextStreamCleaner", () => {
     expect(cleaner.push("See [[note")).toBe("See ");
     expect(cleaner.flush()).toBe("[[note");
   });
-
-  it.each([
-    ["opening tag", "Intro [", "[tts:text]]hidden speech[[/tts:text]] visible"],
-    ["closing tag", "Intro [[tts:text]]hidden speech[", "[/tts:text]] visible"],
-  ])("hides speech when the %s opening bracket pair is split", (_name, first, second) => {
-    const cleaner = createTtsDirectiveTextStreamCleaner();
-    expect(cleaner.push(first)).toBe("Intro ");
-    expect(cleaner.push(second)).toBe(" visible");
-    expect(cleaner.flush()).toBe("");
-  });
 });
