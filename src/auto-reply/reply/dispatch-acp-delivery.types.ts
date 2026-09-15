@@ -13,7 +13,7 @@ export type AcpDispatchDeliveryMeta = {
   allowEdit?: boolean;
   skipTts?: boolean;
   /** Transport-only finals retain their runtime source instead of adding final text. */
-  transcriptSource?: { kind: "blocks" | "fallback" } | { kind: "final"; text: string };
+  transcriptSource?: { kind: "blocks" } | { kind: "final"; text: string };
 };
 
 type ToolMessageHandle = {
