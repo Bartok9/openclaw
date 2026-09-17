@@ -85,6 +85,26 @@ describe("task-executor-policy", () => {
     );
   });
 
+  it("bounds ACP terminal notification details while leaving stored error intact", () => {
+    const diagnostic =
+      "The login link expired. Sign in again. " + "Provider diagnostic detail. ".repeat(60);
+    const failedTask = createTask({
+      status: "failed",
+      error: diagnostic,
+      runId: "run-bounded-terminal",
+      label: "Sign in",
+    });
+    const parentReview = formatTaskTerminalMessage(failedTask, { surface: "parent_session" });
+    const direct = formatTaskTerminalMessage(failedTask);
+
+    expect(failedTask.error).toBe(diagnostic);
+    expect(direct.length).toBeLessThan(200);
+    expect(parentReview.length).toBeLessThan(200);
+    expect(direct).toContain("Background task failed: Sign in (run run-boun).");
+    expect(direct).toContain("The login link expired. Sign in again.");
+    expect(direct).not.toContain("Provider diagnostic detail. ".repeat(10));
+  });
+
   it("sanitizes leaked internal runtime context from terminal and progress copy", () => {
     const leaked = [
       "OpenClaw runtime context (internal):",

@@ -5,7 +5,18 @@ import {
   type TaskEventRecord,
   type TaskRecord,
 } from "./task-registry.types.js";
-import { formatTaskStatusTitleText, sanitizeTaskStatusText } from "./task-status.js";
+import {
+  formatTaskStatusTitleText,
+  sanitizeTaskStatusText,
+  TASK_STATUS_DETAIL_MAX_CHARS,
+} from "./task-status.js";
+
+function sanitizeTerminalDetail(value: unknown, errorContext = false): string {
+  return sanitizeTaskStatusText(value, {
+    errorContext,
+    maxChars: TASK_STATUS_DETAIL_MAX_CHARS,
+  });
+}
 
 function resolveTaskDisplayTitle(task: TaskRecord): string {
   return formatTaskStatusTitleText(
@@ -29,9 +40,10 @@ export function formatTaskTerminalMessage(
   const title = resolveTaskDisplayTitle(task);
   const runLabel = resolveTaskRunLabel(task);
   if (task.status === "succeeded") {
-    const summary = sanitizeTaskStatusText(task.terminalSummary, {
-      errorContext: task.terminalOutcome === "blocked",
-    });
+    const summary = sanitizeTerminalDetail(
+      task.terminalSummary,
+      task.terminalOutcome === "blocked",
+    );
     if (task.terminalOutcome === "blocked") {
       return summary
         ? `Background task blocked: ${title}${runLabel}. ${summary}`
@@ -59,8 +71,7 @@ export function formatTaskTerminalMessage(
     return `Background task cancelled: ${title}${runLabel}.`;
   }
   const detail =
-    sanitizeTaskStatusText(task.error, { errorContext: true }) ||
-    sanitizeTaskStatusText(task.terminalSummary, { errorContext: true });
+    sanitizeTerminalDetail(task.error, true) || sanitizeTerminalDetail(task.terminalSummary, true);
   if (task.status === "lost") {
     return `Background task lost: ${title}${runLabel}. ${detail || "Backing session disappeared."}`;
   }
@@ -85,8 +96,7 @@ export function formatTaskBlockedFollowupMessage(task: TaskRecord): string | nul
   const title = resolveTaskDisplayTitle(task);
   const runLabel = resolveTaskRunLabel(task);
   const summary =
-    sanitizeTaskStatusText(task.terminalSummary, { errorContext: true }) ||
-    "Task is blocked and needs follow-up.";
+    sanitizeTerminalDetail(task.terminalSummary, true) || "Task is blocked and needs follow-up.";
   return `Task needs follow-up: ${title}${runLabel}. ${summary}`;
 }
 
