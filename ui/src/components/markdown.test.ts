@@ -1,37 +1,6 @@
-// Control UI tests cover markdown behavior.
-import { describe, expect, it, vi } from "vitest";
-import { i18n } from "../i18n/index.ts";
-import { handleMarkdownCodeBlockCopy } from "./markdown-code-blocks.ts";
-import { toSanitizedMarkdownHtml, toStreamingMarkdownHtml } from "./markdown.ts";
-
-function htmlFragment(html: string): HTMLElement {
-  const container = document.createElement("div");
-  container.innerHTML = html;
-  return container;
-}
-
-function escapedCodeBlockCopyAttribute(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function withControlUiBasePath<T>(basePath: string, fn: () => T): T {
-  const testWindow = window as Window & typeof globalThis & { [key: string]: unknown };
-  Object.defineProperty(window, "__OPENCLAW_CONTROL_UI_BASE_PATH__", {
-    value: basePath,
-    writable: true,
-    configurable: true,
-  });
-  try {
-    return fn();
-  } finally {
-    delete testWindow["__OPENCLAW_CONTROL_UI_BASE_PATH__"];
-  }
-}
+import { describe, expect, it } from "vitest";
+import { htmlFragment, withControlUiBasePath } from "./markdown.test-support.ts";
+import { toSanitizedMarkdownHtml } from "./markdown.ts";
 
 describe("toSanitizedMarkdownHtml", () => {
   // ── Original tests from before markdown-it migration ──
@@ -84,24 +53,6 @@ describe("toSanitizedMarkdownHtml", () => {
       "gamma",
       "delta",
     ]);
-  });
-
-  // ── Additional tests for markdown-it migration ──
-  describe("HTML escaping", () => {
-    it("escapes HTML tags as text", () => {
-      const html = toSanitizedMarkdownHtml("<div>**bold**</div>");
-      expect(html).toBe("&lt;div&gt;**bold**&lt;/div&gt;\n");
-    });
-
-    it("strips script tags", () => {
-      const html = toSanitizedMarkdownHtml("<script>alert(1)</script>");
-      expect(html).toBe("&lt;script&gt;alert(1)&lt;/script&gt;\n");
-    });
-
-    it("escapes inline HTML tags", () => {
-      const html = toSanitizedMarkdownHtml("Check <b>this</b> out");
-      expect(html).toBe("<p>Check &lt;b&gt;this&lt;/b&gt; out</p>\n");
-    });
   });
 
   describe("task lists", () => {
@@ -288,178 +239,6 @@ describe("toSanitizedMarkdownHtml", () => {
     });
   });
 
-  describe("code blocks", () => {
-    const blockArt = "  ▀▀▀▀  \n  ▄▄▄▄  \n  ████  ";
-    const jsonBlock = (lineCount: number) => {
-      const values = Array.from({ length: lineCount - 2 }, (_, index) => `  ${index},`);
-      values[values.length - 1] = values.at(-1)?.slice(0, -1) ?? "";
-      return `\`\`\`json\n[\n${values.join("\n")}\n]\n\`\`\``;
-    };
-
-    it("renders raw block art as a whitespace-preserving code block", () => {
-      const html = toSanitizedMarkdownHtml(blockArt);
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector("pre code.markdown-block-art");
-
-      expect(fragment.querySelector("p")).toBeNull();
-      expect(code?.textContent).toBe(blockArt);
-    });
-
-    it("recognizes block art separated by Unicode line boundaries", () => {
-      const html = toSanitizedMarkdownHtml("  ▀▀▀▀  \u2028  ▄▄▄▄  \u2029  ████  ");
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector("pre code.markdown-block-art");
-
-      expect(fragment.querySelector("p")).toBeNull();
-      expect(code?.textContent).toBe("  ▀▀▀▀  \n  ▄▄▄▄  \n  ████  ");
-    });
-
-    it("marks fenced block art without syntax highlighting", () => {
-      const html = toSanitizedMarkdownHtml(`\`\`\`\n${blockArt}\n\`\`\``);
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector("pre code.markdown-block-art");
-
-      expect(code?.classList.contains("hljs")).toBe(false);
-      expect(code?.textContent).toBe(`${blockArt}\n`);
-    });
-
-    it("copies fenced block art with its quiet-zone whitespace intact", async () => {
-      const writeText = vi.fn(async () => undefined);
-      const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
-      Object.defineProperty(navigator, "clipboard", {
-        configurable: true,
-        value: { writeText },
-      });
-      try {
-        const fragment = htmlFragment(toSanitizedMarkdownHtml(`\`\`\`\n${blockArt}\n\`\`\``));
-        const button = fragment.querySelector<HTMLButtonElement>(".code-block-copy");
-        if (!button) {
-          throw new Error("expected code copy button");
-        }
-
-        fragment.addEventListener("click", handleMarkdownCodeBlockCopy);
-        button.click();
-
-        await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(blockArt));
-      } finally {
-        if (originalClipboard) {
-          Object.defineProperty(navigator, "clipboard", originalClipboard);
-        } else {
-          Reflect.deleteProperty(navigator, "clipboard");
-        }
-      }
-    });
-
-    it("renders indented code blocks", () => {
-      // markdown-it requires a blank line before indented code
-      const html = toSanitizedMarkdownHtml("text\n\n    indented code");
-      expect(html).toBe(
-        `<p>text</p>\n<div class="code-block-wrapper"><div class="code-block-header"><button type="button" class="code-block-copy" data-code="${escapedCodeBlockCopyAttribute("indented code")}" aria-label="Copy code"><span class="code-block-copy__idle">Copy</span><span class="code-block-copy__done">Copied!</span></button></div><pre><code>indented code\n</code></pre></div>`,
-      );
-    });
-
-    it("includes copy button", () => {
-      const html = toSanitizedMarkdownHtml("```\ncode\n```");
-      expect(html).toBe(
-        `<div class="code-block-wrapper"><div class="code-block-header"><button type="button" class="code-block-copy" data-code="${escapedCodeBlockCopyAttribute("code")}" aria-label="Copy code"><span class="code-block-copy__idle">Copy</span><span class="code-block-copy__done">Copied!</span></button></div><pre><code>code\n</code></pre></div>`,
-      );
-    });
-
-    it("omits copy chrome when rendering user-preserved code blocks", () => {
-      const source = `python3 - <<'PY'
-import openpyxl
-
-for ws in wb.worksheets:
-    print(f"--- {ws.title} ---")
-    rows = 0
-
-    for row in ws.iter_rows(values_only=True):
-        print(row)
-PY
-`;
-      const html = toSanitizedMarkdownHtml(`\`\`\`bash\n${source}\`\`\``, {
-        codeBlockChrome: "none",
-      });
-      const fragment = htmlFragment(html);
-
-      expect(fragment.querySelector(".code-block-copy")).toBeNull();
-      expect(fragment.textContent).toBe(source);
-    });
-
-    it("keeps the no-chrome code-block cache separate from copy-enabled rendering", () => {
-      const markdown = "```\ncode\n```";
-      const plain = toSanitizedMarkdownHtml(markdown, { codeBlockChrome: "none" });
-      const copyable = toSanitizedMarkdownHtml(markdown);
-
-      expect(htmlFragment(plain).querySelector(".code-block-copy")).toBeNull();
-      expect(htmlFragment(copyable).querySelector(".code-block-copy")).toBeInstanceOf(
-        HTMLButtonElement,
-      );
-    });
-
-    it("keeps short JSON code blocks visible and highlighted", () => {
-      const html = toSanitizedMarkdownHtml(jsonBlock(6));
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector(".code-block-wrapper pre code");
-
-      expect(fragment.querySelector("details.json-collapse")).toBeNull();
-      expect(code?.textContent?.split("\n")).toHaveLength(7);
-      expect(code?.innerHTML).toContain("hljs-");
-    });
-
-    it("collapses JSON only above 40 lines and uses one copyable header", () => {
-      const atLimit = htmlFragment(toSanitizedMarkdownHtml(jsonBlock(40)));
-      const overLimit = htmlFragment(toSanitizedMarkdownHtml(jsonBlock(41)));
-      const details = overLimit.querySelector("details.json-collapse");
-      const summary = details?.querySelector("summary");
-
-      expect(atLimit.querySelector("details.json-collapse")).toBeNull();
-      expect(summary?.textContent).toContain("JSON · 41 lines");
-      expect(summary?.querySelector(".code-block-copy")).toBeInstanceOf(HTMLButtonElement);
-      expect(details?.querySelectorAll(".code-block-header")).toHaveLength(1);
-      expect(summary?.classList.contains("code-block-header")).toBe(true);
-      expect(details?.querySelector("pre code")?.innerHTML).toContain("hljs-");
-    });
-
-    it("localizes collapsed JSON line counts", async () => {
-      i18n.registerTranslation("pt-BR", {
-        chat: {
-          codeBlock: {
-            jsonLines: "JSON · {count} linhas",
-          },
-        },
-      });
-      await i18n.setLocale("pt-BR");
-      try {
-        const fragment = htmlFragment(toSanitizedMarkdownHtml(jsonBlock(41)));
-        expect(fragment.querySelector("summary")?.textContent).toContain("JSON · 41 linhas");
-      } finally {
-        await i18n.setLocale("en");
-      }
-    });
-
-    it("auto-highlights unlabeled code blocks only when detection is confident", () => {
-      const html = toSanitizedMarkdownHtml("```\n#include <vector>\nstd::vector<int> nums;\n```");
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector("pre code");
-
-      expect(code?.classList.contains("hljs")).toBe(true);
-      expect(code?.textContent).toBe("#include <vector>\nstd::vector<int> nums;\n");
-      expect(code?.innerHTML).toContain("hljs-meta");
-      expect(code?.innerHTML).toContain("hljs-keyword");
-    });
-
-    it("keeps highlighted HTML code escaped", () => {
-      const html = toSanitizedMarkdownHtml("```html\n<script>alert(1)</script>\n```");
-      const fragment = htmlFragment(html);
-      const code = fragment.querySelector("pre code");
-
-      expect(code?.querySelector("script")).toBeNull();
-      expect(code?.textContent).toBe("<script>alert(1)</script>\n");
-      expect(code?.innerHTML).not.toContain("<script>");
-    });
-  });
-
   describe("GFM features", () => {
     it("renders strikethrough", () => {
       const html = toSanitizedMarkdownHtml("This is ~~deleted~~ text");
@@ -482,9 +261,19 @@ PY
       );
     });
 
-    it("renders basic markdown", () => {
-      const html = toSanitizedMarkdownHtml("**bold** and *italic*");
-      expect(html).toBe("<p><strong>bold</strong> and <em>italic</em></p>\n");
+    it.each([
+      {
+        name: "basic markdown",
+        markdown: "**bold** and *italic*",
+        expected: "<p><strong>bold</strong> and <em>italic</em></p>\n",
+      },
+      {
+        name: "three-space inline code",
+        markdown: "`   `",
+        expected: "<p><code>   </code></p>\n",
+      },
+    ])("renders $name", ({ markdown, expected }) => {
+      expect(toSanitizedMarkdownHtml(markdown)).toBe(expected);
     });
 
     it("renders headings", () => {
@@ -705,193 +494,5 @@ PY
       expect(elapsed).toBeLessThan(500);
       expect(html.length).toBeGreaterThan(0);
     });
-  });
-
-  describe("large text handling", () => {
-    it("uses plain text fallback for oversized content", () => {
-      // MARKDOWN_PARSE_LIMIT is 40_000 chars
-      const input = Array.from(
-        { length: 220 },
-        (_, i) =>
-          `Paragraph ${i + 1}: ${Array.from({ length: 8 }, () => "Long plain-text reply.").join(
-            " ",
-          )}`,
-      ).join("\n\n");
-      const html = toSanitizedMarkdownHtml(input);
-      const fallback = htmlFragment(html).firstElementChild;
-      expect(fallback?.tagName).toBe("DIV");
-      expect(fallback?.className).toBe("markdown-plain-text-fallback");
-      expect(fallback?.textContent).toBe(input);
-    });
-
-    it("preserves indentation in plain text fallback", () => {
-      const input = `${"Header line\n".repeat(3400)}\n    indented log line\n        deeper indent`;
-      const html = toSanitizedMarkdownHtml(input);
-      const fallback = htmlFragment(html).firstElementChild;
-      expect(fallback?.className).toBe("markdown-plain-text-fallback");
-      expect(fallback?.textContent).toBe(input);
-    });
-
-    it("caches oversized fallback results", () => {
-      const input =
-        Array.from({ length: 240 }, (_, i) => `P${i}`).join("\n\n") + "x".repeat(45_000);
-      const first = toSanitizedMarkdownHtml(input);
-      const second = toSanitizedMarkdownHtml(input);
-      expect(input.length).toBeGreaterThan(40_000);
-      expect(htmlFragment(first).firstElementChild?.className).toBe("markdown-plain-text-fallback");
-      expect(second).toBe(first);
-    });
-  });
-});
-
-describe("toStreamingMarkdownHtml", () => {
-  it("marks a completed transcript-role header in the streaming tail", () => {
-    const html = toStreamingMarkdownHtml("user[Thu 2026-07-02] question", {
-      assistantTranscriptRoleHeaders: true,
-    });
-
-    expect(html).toContain('class="assistant-transcript-role"');
-  });
-
-  it("renders streaming raw block art without collapsing quiet-zone spaces", () => {
-    const blockArt = "  ▀▀▀▀  \n  ▄▄▄▄  \n  ████  ";
-    const html = toStreamingMarkdownHtml(blockArt);
-    const fragment = htmlFragment(html);
-    const code = fragment.querySelector("pre code.markdown-block-art");
-
-    expect(fragment.querySelector("p")).toBeNull();
-    expect(code?.textContent).toBe(blockArt);
-  });
-
-  it("truncates oversized streaming raw block art before rendering", () => {
-    const line = "  ▀▀▀▀  ";
-    const blockArt = Array.from({ length: 20_000 }, () => line).join("\n");
-    const html = toStreamingMarkdownHtml(blockArt);
-    const fragment = htmlFragment(html);
-    const code = fragment.querySelector("pre code.markdown-block-art");
-
-    expect(code?.textContent).toContain("… truncated");
-    expect(code?.textContent).toContain(`showing first 140000`);
-    expect(code?.textContent?.length).toBeLessThan(blockArt.length);
-  });
-
-  it("localizes the oversized markdown truncation notice", async () => {
-    i18n.registerTranslation("pt-BR", {
-      chat: {
-        markdown: {
-          truncated: "… truncado ({total} caracteres, exibindo os primeiros {shown}).",
-        },
-      },
-    });
-    await i18n.setLocale("pt-BR");
-    try {
-      const blockArt = Array.from({ length: 20_000 }, () => "  ▀▀▀▀  ").join("\n");
-      const fragment = htmlFragment(toStreamingMarkdownHtml(blockArt));
-      expect(fragment.textContent).toContain("… truncado");
-      expect(fragment.textContent).toContain("exibindo os primeiros 140000");
-    } finally {
-      await i18n.setLocale("en");
-    }
-  });
-
-  it("renders completed block prefixes as markdown and closes the streaming tail", () => {
-    const html = toStreamingMarkdownHtml("## Done\n\nworking **tail");
-
-    expect(html).toBe("<h2>Done</h2>\n<p>working <strong>tail</strong></p>\n");
-  });
-
-  it.each([
-    ["loose sibling list items", "- one\n\n- two"],
-    ["list-item paragraph continuation", "- one\n\n  continuation"],
-    ["nested loose list items", "- one\n\n  - nested"],
-    ["a reference link and its later definition", "[Docs][doc]\n\n[doc]: https://example.com"],
-    ["escaped bracket labels", "[Docs][ref\\]]\n\n[ref\\]]: https://example.com"],
-    ["multiline reference labels", "[Docs][foo bar]\n\n[foo\n bar]: https://example.com"],
-    ["list-nested reference definitions", "See [x]\n\n- item\n\n    [x]: /url"],
-    ["tab-indented list continuation", "Intro\n\n  - one\n\n\tcontinuation"],
-    ["list continuation before a root heading", "- one\n\n  continuation\n# Heading"],
-  ])("preserves whole-document Markdown semantics for %s", (_kind, input) => {
-    expect(toStreamingMarkdownHtml(input)).toBe(toSanitizedMarkdownHtml(input));
-  });
-
-  it("uses Unicode separators as stable markdown boundaries", () => {
-    const html = toStreamingMarkdownHtml("## Done\u2028\u2028working **tail");
-
-    expect(html).toBe("<h2>Done</h2>\n<p>working <strong>tail</strong></p>\n");
-  });
-
-  it("renders a single open paragraph as markdown with closed formatting", () => {
-    const html = toStreamingMarkdownHtml("**still streaming");
-
-    expect(html).toBe("<p><strong>still streaming</strong></p>\n");
-  });
-
-  it("renders half-written links as text only while streaming", () => {
-    const html = toStreamingMarkdownHtml("see [Streamdown](https://strea");
-
-    expect(html).toBe("<p>see Streamdown</p>\n");
-  });
-
-  it("streams tables as markdown before the closing row arrives", () => {
-    const html = toStreamingMarkdownHtml("| left | right |\n| --- | --- |\n| 1 | 2");
-    const fragment = htmlFragment(html);
-
-    expect(fragment.querySelector("table")).not.toBeNull();
-    expect(fragment.querySelector("th")?.textContent).toBe("left");
-    expect(html).not.toContain("markdown-plain-text-fallback");
-  });
-
-  it("leaves dollar amounts alone while streaming", () => {
-    const html = toStreamingMarkdownHtml("prices are $$50 and");
-
-    expect(html).toBe("<p>prices are $$50 and</p>\n");
-  });
-
-  it("streams an open code fence as a live-highlighted code block", () => {
-    const html = toStreamingMarkdownHtml("Intro\n\n```ts\nconst x = 1 < 2");
-    const fragment = htmlFragment(html);
-
-    expect(fragment.querySelector("p")?.textContent).toBe("Intro");
-    expect(fragment.querySelector("code.language-ts")?.textContent).toContain("const x = 1 < 2");
-    expect(html).not.toContain("markdown-plain-text-fallback");
-  });
-
-  it("streams an open list code fence through blank lines", () => {
-    const html = toStreamingMarkdownHtml("- ```ts\n  const x = 1;\n\n  const y = 2;");
-    const fragment = htmlFragment(html);
-    const code = fragment.querySelector("li code");
-
-    expect(code?.textContent).toContain("const x = 1;");
-    expect(code?.textContent).toContain("const y = 2;");
-    expect(html).not.toContain("markdown-plain-text-fallback");
-  });
-
-  it("keeps completed tilde-fence code out of the remend tail", () => {
-    // remend only understands ``` fences; a closed ~~~ block must land in the
-    // stable prefix so its raw markers are never "completed" as inline markdown.
-    const html = toStreamingMarkdownHtml('~~~ts\nconst s = "**open";\n~~~\ncontinuing **bold');
-    const fragment = htmlFragment(html);
-
-    expect(fragment.querySelector("code")?.textContent).toContain('const s = "**open";');
-    expect(fragment.querySelector("code strong")).toBeNull();
-    expect(fragment.querySelector("p strong")?.textContent).toBe("bold");
-  });
-
-  it("streams an open blockquote code fence through blank lines", () => {
-    const html = toStreamingMarkdownHtml("> ```ts\n> const x = 1;\n>\n> const y = 2;");
-    const fragment = htmlFragment(html);
-    const code = fragment.querySelector("blockquote code");
-
-    expect(code?.textContent).toContain("const x = 1;");
-    expect(code?.textContent).toContain("const y = 2;");
-    expect(html).not.toContain("markdown-plain-text-fallback");
-  });
-
-  it("renders a completed code fence once the closing fence arrives", () => {
-    const html = toStreamingMarkdownHtml("```ts\nconst x = 1;\n```");
-
-    expect(html).toContain('<code class="hljs language-ts"');
-    expect(html).toContain("const x = 1;");
-    expect(html).not.toContain("markdown-plain-text-fallback");
   });
 });

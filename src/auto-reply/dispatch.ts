@@ -21,9 +21,13 @@ import {
   resolveCommandTurnTargetSessionKey,
 } from "./command-turn-context.js";
 import { withReplyDispatcher } from "./dispatch-dispatcher.js";
+import { dispatchGroupThread } from "./group-thread-dispatch.js";
 import type { CommandSessionMetadataChange } from "./reply/command-session-metadata.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
-import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.types.js";
+import type {
+  DispatchFromConfigResult,
+  DispatchReplyFromConfig,
+} from "./reply/dispatch-from-config.types.js";
 import type {
   InternalGetReplyFromConfig,
   InternalGetReplyOptions,
@@ -39,6 +43,11 @@ import {
   type ReplyDispatcherWithTypingOptions,
 } from "./reply/reply-dispatcher.js";
 import type { ReplyDispatcher } from "./reply/reply-dispatcher.types.js";
+import {
+  REPLY_OPERATION_RUN_STATE,
+  resolveReplyOperationRunState,
+  type ReplyOperationRunState,
+} from "./reply/reply-operation-run-state.js";
 import type { FinalizedMsgContext, MsgContext } from "./templating.js";
 
 type InternalDispatchReplyOptions = Omit<InternalGetReplyOptions, "onBlockReply">;
@@ -142,9 +151,9 @@ function bindReplyPayloadRunState(
   const onAgentRunStart = replyOptions?.onAgentRunStart;
   return {
     ...replyOptions,
-    onAgentRunStart: (runId, executionIdentityToken) => {
-      runState.runId = runId;
-      onAgentRunStart?.(runId, executionIdentityToken);
+    onAgentRunStart: (...args) => {
+      runState.runId = args[0];
+      return onAgentRunStart?.(...args);
     },
   };
 }
@@ -190,7 +199,7 @@ function buildDispatchTimelineAttributes(ctx: MsgContext | FinalizedMsgContext) 
 }
 
 type DispatchInboundResult = DispatchFromConfigResult;
-export { settleReplyDispatcher, withReplyDispatcher } from "./dispatch-dispatcher.js";
+export { settleReplyDispatcher } from "./dispatch-dispatcher.js";
 
 /** Dispatches one finalized inbound message through reply resolution and queued delivery. */
 export async function dispatchInboundMessage(params: {
@@ -200,6 +209,7 @@ export async function dispatchInboundMessage(params: {
   toolsAllow?: string[];
   replyOptions?: InternalDispatchReplyOptions;
   replyResolver?: InternalGetReplyFromConfig;
+  dispatchReplyFromConfig?: DispatchReplyFromConfig;
   onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
   replyPayloadRunState?: ReplyPayloadRunState;
   /** Observe-only turns run the agent without entering outbound hook stages. */
@@ -239,16 +249,18 @@ export async function dispatchInboundMessage(params: {
     run: () =>
       measureDiagnosticsTimelineSpan(
         "auto_reply.dispatch_reply_from_config",
-        () =>
-          dispatchReplyFromConfig({
+        async () => {
+          const dispatch = params.dispatchReplyFromConfig ?? dispatchReplyFromConfig;
+          const request = {
             ctx: finalized,
             cfg: params.cfg,
             dispatcher: params.dispatcher,
             replyOptions: replyOptionsWithRunState,
             replyResolver: params.replyResolver,
             onSessionMetadataChanges: params.onSessionMetadataChanges,
-            usePublishedModelRuntime: true,
-          }),
+          };
+          return (await dispatchGroupThread(request, dispatch)) ?? (await dispatch(request));
+        },
         {
           phase: "agent-turn",
           config: params.cfg,
@@ -269,6 +281,7 @@ type BufferedInboundDispatcherParams = {
   toolsAllow?: string[];
   replyOptions?: InternalDispatchReplyOptions;
   replyResolver?: InternalGetReplyFromConfig;
+  dispatchReplyFromConfig?: DispatchReplyFromConfig;
   onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
 };
 
@@ -282,6 +295,8 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
 ): Promise<DispatchInboundResult> {
   const finalized = finalizeInboundContext(params.ctx);
   const foregroundReplyLease = reserveForegroundReplyLease(finalized);
+  const replyOperationRunState: ReplyOperationRunState =
+    resolveReplyOperationRunState(params.replyOptions) ?? {};
   const silentReplyContext = resolveDispatcherSilentReplyContext(finalized, params.cfg);
   const replyPayloadRunState = {
     runId: params.replyOptions?.runId,
@@ -290,7 +305,7 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
   const settleDeliveries = () =>
     (settledDeliveries = settledDeliveries.then(() =>
       runOrderedForegroundReplySettledDeliveries(
-        foregroundReplyLease,
+        replyOperationRunState.questionInputHandled ? undefined : foregroundReplyLease,
         params.dispatcherOptions.onSettled,
         params.dispatcherOptions.onFreshSettledDelivery,
       ),
@@ -322,7 +337,10 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
   const beforeDeliver: ReplyDispatchBeforeDeliver | undefined =
     foregroundReplyLease || configuredBeforeDeliver
       ? markReplyDispatchBeforeDeliverDeadlineOwned(async (payload, info) => {
-          await foregroundReplyLease?.wait();
+          // A question response must not wait behind the turn waiting for that response.
+          if (!replyOperationRunState.questionInputHandled) {
+            await foregroundReplyLease?.wait();
+          }
           return configuredBeforeDeliver ? await configuredBeforeDeliver(payload, info) : payload;
         })
       : undefined;
@@ -348,10 +366,12 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
       dispatcher,
       toolsAllow: params.toolsAllow,
       replyResolver: params.replyResolver,
+      dispatchReplyFromConfig: params.dispatchReplyFromConfig,
       replyOptions: {
         ...params.replyOptions,
         ...replyOptions,
         onTypingController,
+        [REPLY_OPERATION_RUN_STATE]: replyOperationRunState,
       },
       replyPayloadRunState,
       outboundHooks: ownership.outboundHooks,

@@ -103,7 +103,10 @@ enum CLIInstaller {
     enum LocalGatewayActivation: Equatable {
         case ready
         case deferred
-        case failed
+        /// Binds the concrete failure to this activation attempt: GatewayProcessManager's
+        /// lastFailureReason is mutable shared state that a later attempt can overwrite before
+        /// a caller gets around to rereading it, misattributing a stale or newer reason.
+        case failed(reason: String?)
     }
 
     enum Status: Equatable {
@@ -372,6 +375,12 @@ enum CLIInstaller {
                         "or retry after the channel is updated.")
                 return false
             }
+            do {
+                try self.installBundledMacCLI(prefix: prefix)
+            } catch {
+                await statusHandler("Install failed: \(error.localizedDescription)")
+                return false
+            }
             let parsed = self.parseInstallEvents(response.stdout)
             let installedVersion = parsed.last { $0.event == "done" }?.version
             let summary = installedVersion.map { "Installed openclaw \($0)." } ?? "Installed openclaw."
@@ -390,6 +399,21 @@ enum CLIInstaller {
         let fallback = response.errorMessage ?? "install failed"
         await statusHandler("Install failed: \(detail.isEmpty ? fallback : detail)")
         return false
+    }
+
+    private static func installBundledMacCLI(prefix: String) throws {
+        let fileManager = FileManager.default
+        let source = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/openclaw-mac")
+        guard fileManager.isExecutableFile(atPath: source.path) else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: source.path])
+        }
+        let destination = URL(fileURLWithPath: prefix).appendingPathComponent("bin/openclaw-mac")
+        if let existing = try? fileManager.destinationOfSymbolicLink(atPath: destination.path) {
+            if existing == source.path { return }
+            try fileManager.removeItem(at: destination)
+        }
+        // Creation fails on an existing non-link so installation preserves operator-owned files.
+        try fileManager.createSymbolicLink(at: destination, withDestinationURL: source)
     }
 
     static func channelInstallIsCompatible(
@@ -503,7 +527,7 @@ enum CLIInstaller {
         let executable = self.managedExecutableLocation()
         await statusHandler(repair
             ? String(localized: "Repairing the OpenClaw Gateway update…")
-            : String(localized: "Updating the OpenClaw Gateway to \(targetVersion)…"))
+            : String(format: String(localized: "Updating the OpenClaw Gateway to %@…"), targetVersion))
         let command = self.managedUpdateCommand(
             executable: executable,
             targetVersion: targetVersion,
@@ -548,7 +572,8 @@ enum CLIInstaller {
 
         self.rememberInstallPolicy(.exact(targetVersion))
         NotificationCenter.default.post(name: .openclawCLIInstalled, object: nil)
-        await statusHandler(String(localized: "OpenClaw Gateway \(installedVersion) is installed."))
+        await statusHandler(String(
+            format: String(localized: "OpenClaw Gateway %@ is installed."), installedVersion))
         return .success(
             fromVersion: summary?.before?.version,
             toVersion: installedVersion)
@@ -587,11 +612,14 @@ enum CLIInstaller {
         waitUntilReady: @MainActor () async -> Bool = {
             await GatewayProcessManager.shared.waitForGatewayReady(
                 timeout: GatewayLaunchAgentManager.startupMigrationTolerance)
-        }) async -> LocalGatewayActivation
+        },
+        failureReason: @MainActor () -> String? = { GatewayProcessManager.shared.lastFailureReason }) async
+        -> LocalGatewayActivation
     {
         guard mode == .local, !paused else { return .deferred }
         start()
-        return await waitUntilReady() ? .ready : .failed
+        guard await waitUntilReady() else { return .failed(reason: failureReason()) }
+        return .ready
     }
 
     private static func parseInstallEvents(_ output: String) -> [InstallEvent] {

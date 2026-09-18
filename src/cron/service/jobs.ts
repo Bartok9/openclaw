@@ -16,20 +16,16 @@ import type {
   CronJobState,
   CronSchedule,
   CronStoredJob,
+  CronToolsAllowExecTarget,
   CronToolsAllowProvenance,
 } from "../types.js";
 import { resolveInitialCronDelivery } from "./initial-delivery.js";
-import { mergeCronDelivery, mergeCronFailureAlert } from "./jobs-merge.js";
-import {
+import { mergeCronDelivery, mergeCronFailureAlert } from "./jobs-merge.js";import {
   computeJobNextRunAtMs,
   normalizeStreamScheduleBounds,
   resolveEveryAnchorMs,
 } from "./jobs-scheduling.js";
-import {
-  reconcileScheduledToolPolicy,
-  reconcileToolsAllowProvenance,
-  stampScheduledToolPolicy,
-} from "./jobs-tool-policy.js";
+import { reconcileToolsAllowAuthority } from "./jobs-tool-policy.js";
 import {
   assertAnnounceDeliveryChannelSupport,
   assertTimeScheduleSatisfiable,
@@ -42,14 +38,23 @@ import {
   assertSupportedJobSpec,
   assertTriggerSupport,
   assertPrecheckSupport,
-  hasConcreteFailureDestination,
-} from "./jobs-validation.js";
+  hasConcreteFailureDestination,} from "./jobs-validation.js";
 import { normalizeOptionalAgentId, normalizeRequiredName } from "./normalize.js";
 import { mergeCronPayload } from "./payload-merge.js";
 import type { CronServiceState } from "./state.js";
 
-const CRON_DECLARATIVE_LABEL_MAX_LENGTH = 200;
 type DeliveryValidationOptions = { configuredChannels?: readonly string[] };
+
+function resetJobFailureState(job: CronStoredJob): void {
+  delete job.state.autoDisabled;
+  job.state.consecutiveErrors = 0;
+  job.state.scheduleErrorCount = 0;
+  if (job.schedule.kind === "stream") {
+    job.state.streamRestartExhausted = undefined;
+    job.state.streamConsecutiveFailures = 0;
+    job.state.streamError = undefined;
+  }
+}
 
 type ScheduleNormalizationContext =
   | { kind: "create"; nowMs: number }
@@ -107,23 +112,6 @@ function normalizeJobSchedule(
   return normalizeStreamScheduleBounds(input);
 }
 
-function normalizeDeclarativeLabel(
-  value: unknown,
-  field: "declarationKey" | "displayName",
-  nullable = false,
-): string | undefined {
-  const normalized = normalizeOptionalString(value);
-  if (!(nullable && value == null) && value !== undefined && !normalized) {
-    throw new Error(`cron ${field} must not be blank`);
-  }
-  if (normalized && normalized.length > CRON_DECLARATIVE_LABEL_MAX_LENGTH) {
-    throw new Error(
-      `cron ${field} must be at most ${CRON_DECLARATIVE_LABEL_MAX_LENGTH} characters`,
-    );
-  }
-  return normalized;
-}
-
 type JobValidationContext =
   | { kind: "create"; cronConfig?: CronConfig; defaultAgentId?: string; nowMs: number }
   | {
@@ -171,8 +159,7 @@ function validateFullJob(
     context.patch.schedule?.kind === "stream";
   const validateCapabilities = () => {
     assertTriggerSupport(job, { cronConfig, requireEnabled: triggerTouched });
-    assertPrecheckSupport(job, { cronConfig, requireEnabled: precheckTouched });
-    assertScriptPayloadSupport(job, {
+    assertPrecheckSupport(job, { cronConfig, requireEnabled: precheckTouched });    assertScriptPayloadSupport(job, {
       cronConfig,
       requireEnabled: scriptTouched,
       ...(context.kind === "patch" ? { validateSyntax: context.patch.payload !== undefined } : {}),
@@ -187,7 +174,11 @@ function validateFullJob(
   if (context.kind !== "declarative") {
     validateCapabilities();
   }
-  assertMainSessionAgentId(job, context.defaultAgentId);
+  assertMainSessionAgentId(
+    job,
+    context.defaultAgentId,
+    context.kind === "patch" ? context.patch : undefined,
+  );
   assertDeliverySupport(job);
   assertAnnounceDeliveryChannelSupport(
     job,
@@ -210,6 +201,7 @@ export function createJob(
   opts?: DeliveryValidationOptions & {
     scheduledToolPolicy?: CronScheduledToolPolicy;
     toolsAllowProvenance?: CronToolsAllowProvenance;
+    toolsAllowExecTarget?: CronToolsAllowExecTarget;
   },
 ): CronStoredJob {
   const now = state.deps.nowMs();
@@ -231,6 +223,7 @@ export function createJob(
   // Schedule activation is stamped only by committed scheduling mutations.
   // Accepting caller state here would let imports spoof restart catch-up ownership.
   delete initialState.scheduleActivatedAtMs;
+  delete initialState.runningScheduleChangeId;
   delete initialState.autoDisabled;
   assertCronJobStateTimestamps(initialState);
   const job: CronStoredJob = {
@@ -276,11 +269,13 @@ export function createJob(
   // New trusted jobs are explicit by construction. Agent-runtime callers are
   // required to arrive with a creator cap before the service can apply this default.
   applyDefaultCronToolsAllow(job);
-  stampScheduledToolPolicy(job, opts?.scheduledToolPolicy);
-  reconcileToolsAllowProvenance({
+  reconcileToolsAllowAuthority({
     job,
+    previouslyUsedToolRuntime: false,
     explicitlyMutatesToolsAllow: true,
+    scheduledToolPolicy: opts?.scheduledToolPolicy,
     toolsAllowProvenance: opts?.toolsAllowProvenance,
+    toolsAllowExecTarget: opts?.toolsAllowExecTarget,
   });
   validateFullJob(
     job,
@@ -304,8 +299,9 @@ export function applyJobPatch(
     defaultAgentId?: string;
     scheduleValidationNowMs?: number;
     cronConfig?: CronConfig;
-    scheduledToolPolicy?: CronScheduledToolPolicy;
+    scheduledToolPolicy?: CronScheduledToolPolicy | null;
     toolsAllowProvenance?: CronToolsAllowProvenance;
+    toolsAllowExecTarget?: CronToolsAllowExecTarget;
   } & DeliveryValidationOptions,
 ) {
   const previouslyUsedToolRuntime = cronJobUsesToolRuntime(job);
@@ -400,18 +396,14 @@ export function applyJobPatch(
     // unless precheck is newly introduced (above).
     applyDefaultCronToolsAllow(job);
   }
-  reconcileScheduledToolPolicy({
+  reconcileToolsAllowAuthority({
     job,
     previouslyUsedToolRuntime,
     explicitlyMutatesToolsAllow:
       patch.payload !== undefined && Object.hasOwn(patch.payload, "toolsAllow"),
     scheduledToolPolicy: opts?.scheduledToolPolicy,
-  });
-  reconcileToolsAllowProvenance({
-    job,
-    explicitlyMutatesToolsAllow:
-      patch.payload !== undefined && Object.hasOwn(patch.payload, "toolsAllow"),
     toolsAllowProvenance: opts?.toolsAllowProvenance,
+    toolsAllowExecTarget: opts?.toolsAllowExecTarget,
   });
   if (patch.delivery) {
     const implicitMode = resolveCronDeliveryPlan(job).mode;
@@ -420,48 +412,45 @@ export function applyJobPatch(
   if ("failureAlert" in patch) {
     job.failureAlert = mergeCronFailureAlert(job.failureAlert, patch.failureAlert);
   }
-  if (
-    job.sessionTarget === "main" &&
-    job.delivery?.mode !== "webhook" &&
-    hasConcreteFailureDestination(job.delivery?.failureDestination)
-  ) {
-    throw new Error(
-      'cron delivery.failureDestination is only supported for sessionTarget="isolated" unless delivery.mode="webhook"',
-    );
-  }
   if (job.sessionTarget === "main" && job.delivery?.mode !== "webhook") {
-    // Main-session jobs cannot auto-announce; keep only an empty failure
-    // destination object when the patch is clearing nested fields.
+    assertFailureDestinationSupport(job);
+    // Retargeting may discard inherited announce routes, but must not silently
+    // accept a newly authored delivery request before cleanup.
+    const authoredDelivery =
+      patch.delivery && mergeCronDelivery(undefined, patch.delivery, "announce");
+    if (
+      authoredDelivery &&
+      (patch.delivery?.mode !== undefined ||
+        authoredDelivery.channel !== undefined ||
+        authoredDelivery.to !== undefined ||
+        authoredDelivery.threadId !== undefined ||
+        authoredDelivery.accountId !== undefined ||
+        authoredDelivery.completionDestination !== undefined)
+    ) {
+      assertDeliverySupport({ sessionTarget: job.sessionTarget, delivery: authoredDelivery });
+    }
+    // Clear-only failure destinations retain their global-default opt-outs.
     const failureDestination = job.delivery?.failureDestination;
-    job.delivery =
-      failureDestination && !hasConcreteFailureDestination(failureDestination)
-        ? { mode: "none", failureDestination }
-        : undefined;
+    job.delivery = failureDestination ? { mode: "none", failureDestination } : undefined;
   }
   if (patch.state) {
     const statePatch = { ...patch.state } as Partial<CronJobState>;
     // Runtime state patches may report execution progress, but the scheduler
     // alone owns the boundary that decides whether restart catch-up can run.
     delete statePatch.scheduleActivatedAtMs;
+    delete statePatch.runningScheduleChangeId;
     delete statePatch.autoDisabled;
     assertCronJobStateTimestamps(statePatch);
     job.state = { ...job.state, ...statePatch };
   }
   if (patch.enabled === true) {
-    delete job.state.autoDisabled;
-    job.state.consecutiveErrors = 0;
-    job.state.scheduleErrorCount = 0;
+    resetJobFailureState(job);
   }
   if ("agentId" in patch) {
     job.agentId = normalizeOptionalAgentId((patch as { agentId?: unknown }).agentId);
   }
   if ("sessionKey" in patch) {
     job.sessionKey = normalizeOptionalString((patch as { sessionKey?: unknown }).sessionKey);
-  }
-  if (job.schedule.kind === "stream" && patch.enabled === true) {
-    job.state.streamRestartExhausted = undefined;
-    job.state.streamConsecutiveFailures = 0;
-    job.state.streamError = undefined;
   }
   if (previousScheduleKind === "stream" && job.schedule.kind !== "stream") {
     job.state.streamStatus = undefined;
@@ -498,6 +487,7 @@ export function applyDeclarativeJobSpec(
     cronConfig?: CronConfig;
     scheduledToolPolicy?: CronScheduledToolPolicy;
     toolsAllowProvenance?: CronToolsAllowProvenance;
+    toolsAllowExecTarget?: CronToolsAllowExecTarget;
   } & DeliveryValidationOptions,
 ) {
   const previouslyUsedToolRuntime = cronJobUsesToolRuntime(job);
@@ -562,16 +552,13 @@ export function applyDeclarativeJobSpec(
       applyDefaultCronToolsAllow(job);
     }
   }
-  reconcileScheduledToolPolicy({
+  reconcileToolsAllowAuthority({
     job,
     previouslyUsedToolRuntime,
     explicitlyMutatesToolsAllow: explicitlyDeclaresToolsAllow,
     scheduledToolPolicy: opts.scheduledToolPolicy,
-  });
-  reconcileToolsAllowProvenance({
-    job,
-    explicitlyMutatesToolsAllow: explicitlyDeclaresToolsAllow,
     toolsAllowProvenance: opts.toolsAllowProvenance,
+    toolsAllowExecTarget: opts.toolsAllowExecTarget,
   });
   const delivery = resolveInitialCronDelivery(input);
   if (delivery) {
@@ -580,8 +567,17 @@ export function applyDeclarativeJobSpec(
     delete job.delivery;
   }
   if (opts.enabledExplicit) {
+    // Reconciliation preserves an enabled job's failure streak; explicit recovery
+    // of a stopped job uses the same reset as the enable command.
+    if (
+      input.enabled &&
+      (!job.enabled || job.state.autoDisabled || job.state.streamRestartExhausted)
+    ) {
+      resetJobFailureState(job);
+    }
     job.enabled = input.enabled;
   }
+  assertCronJobStateTimestamps(input.state ?? {});
   validateFullJob(
     job,
     {

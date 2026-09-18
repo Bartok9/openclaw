@@ -16,6 +16,10 @@ import { ensureOpenClawAgentProgressCardSchemaInTransaction } from "../state/ope
 type ProgressCardDatabase = Pick<OpenClawAgentKyselyDatabase, "session_progress_cards">;
 type ProgressCardDatabaseInput = string | DatabaseSync;
 type StoredProgressCardRow = Selectable<ProgressCardDatabase["session_progress_cards"]>;
+type StoredProgressCardMetadata = Pick<
+  StoredProgressCardRow,
+  "session_key" | "revision" | "created_at" | "updated_at"
+>;
 
 function withProgressCardDatabase<T>(
   input: ProgressCardDatabaseInput,
@@ -61,8 +65,28 @@ function selectProgressCard(db: DatabaseSync, sessionKey: string): StoredProgres
   );
 }
 
-function rowToProgressCard(row: StoredProgressCardRow): ProgressCard {
+function selectProgressCardMetadata(
+  db: DatabaseSync,
+  sessionKey: string,
+): StoredProgressCardMetadata | null {
+  const kysely = getNodeSqliteKysely<ProgressCardDatabase>(db);
+  return (
+    executeSqliteQuerySync(
+      db,
+      kysely
+        .selectFrom("session_progress_cards")
+        .select(["session_key", "revision", "created_at", "updated_at"])
+        .where("session_key", "=", sessionKey)
+        .limit(1),
+    ).rows[0] ?? null
+  );
+}
+
+function rowToProgressCard(row: StoredProgressCardRow): ProgressCard | null {
   const steps = row.steps_json ? readStoredSteps(row.steps_json) : undefined;
+  if (!row.markdown && !steps?.length) {
+    return null;
+  }
   return {
     sessionKey: row.session_key,
     revision: row.revision,
@@ -109,25 +133,60 @@ export function readSessionProgressCard(
   });
 }
 
+/** Retain revision tombstones, but keep never-used lazy storage dormant during reset. */
+export function clearSessionProgressCardForReset(db: DatabaseSync, sessionKey: string): boolean {
+  if (!progressCardTablePresent(db) || !selectProgressCardMetadata(db, sessionKey)) {
+    return false;
+  }
+  writeSessionProgressCard(db, sessionKey, {});
+  return true;
+}
+
 export function writeSessionProgressCard(
   dbPathOrDb: ProgressCardDatabaseInput,
   sessionKey: string,
-  input: { markdown?: string; steps?: ProgressCardStep[] },
-): { card: ProgressCard } | { cleared: true } {
+  input: { markdown?: string; steps?: ProgressCardStep[]; expectedRevision?: number },
+): { card: ProgressCard | null } | { cleared: true } {
   return withProgressCardDatabase(dbPathOrDb, false, (db, label) => {
-    const write = (): { card: ProgressCard } | { cleared: true } => {
+    const write = (): { card: ProgressCard | null } | { cleared: true } => {
       ensureOpenClawAgentProgressCardSchemaInTransaction(db);
       const kysely = getNodeSqliteKysely<ProgressCardDatabase>(db);
       const markdown = input.markdown?.trim() ? input.markdown : undefined;
       const steps = input.steps && input.steps.length > 0 ? input.steps : undefined;
       if (!markdown && !steps) {
-        executeSqliteQuerySync(
-          db,
-          kysely.deleteFrom("session_progress_cards").where("session_key", "=", sessionKey),
-        );
+        let previous: StoredProgressCardMetadata | null;
+        if (input.expectedRevision !== undefined) {
+          const currentRow = selectProgressCard(db, sessionKey);
+          const current = currentRow ? rowToProgressCard(currentRow) : null;
+          if (
+            !currentRow ||
+            currentRow.revision !== input.expectedRevision ||
+            !current?.steps?.length ||
+            current.steps.some((step) => step.status !== "completed")
+          ) {
+            return { card: current };
+          }
+          previous = currentRow;
+        } else {
+          previous = selectProgressCardMetadata(db, sessionKey);
+        }
+        if (previous) {
+          executeSqliteQuerySync(
+            db,
+            kysely
+              .updateTable("session_progress_cards")
+              .set({
+                markdown: null,
+                steps_json: null,
+                revision: previous.revision + 1,
+                updated_at: Date.now(),
+              })
+              .where("session_key", "=", sessionKey),
+          );
+        }
         return { cleared: true };
       }
-      const previous = selectProgressCard(db, sessionKey);
+      const previous = selectProgressCardMetadata(db, sessionKey);
       const now = Date.now();
       const revision = (previous?.revision ?? 0) + 1;
       const stepsJson = steps ? JSON.stringify(steps) : null;

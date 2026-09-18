@@ -23,9 +23,15 @@ const resolverMocks = vi.hoisted(() => ({
 vi.mock("openclaw/plugin-sdk/approval-gateway-runtime", () => ({
   resolveApprovalOverGateway: resolverMocks.resolveSignalApproval,
 }));
-vi.mock("openclaw/plugin-sdk/error-runtime", () => ({
-  isApprovalNotFoundError: resolverMocks.isApprovalNotFoundError,
-}));
+vi.mock("openclaw/plugin-sdk/error-runtime", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/error-runtime")>(
+    "openclaw/plugin-sdk/error-runtime",
+  );
+  return {
+    ...actual,
+    isApprovalNotFoundError: resolverMocks.isApprovalNotFoundError,
+  };
+});
 
 const approvalRoute = {
   deliveryMode: "session" as const,
@@ -78,7 +84,7 @@ describe("Signal approval reactions", () => {
     });
 
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg,
         target: {
           channel: "signal",
@@ -145,7 +151,7 @@ describe("Signal approval reactions", () => {
     });
 
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg,
         target: {
           channel: "signal",
@@ -243,7 +249,7 @@ describe("Signal approval reactions", () => {
     });
 
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg,
         target: {
           channel: "signal",
@@ -331,7 +337,7 @@ describe("Signal approval reactions", () => {
     });
 
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg,
         target: {
           channel: "signal",
@@ -409,7 +415,7 @@ describe("Signal approval reactions", () => {
 
     expect(deliveredPayload?.text).toContain("React with:\n\n👍 Allow Once\n👎 Deny");
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg,
         target: {
           channel: "signal",
@@ -456,7 +462,7 @@ describe("Signal approval reactions", () => {
     ).resolves.toBeNull();
   });
 
-  it("does not register delivered structured approval payloads without explicit approvers", () => {
+  it("does not register delivered structured approval payloads without explicit approvers", async () => {
     const payload = buildExecApprovalPendingReplyPayload({
       approvalId: "exec-no-approvers",
       approvalSlug: "exec-no",
@@ -473,7 +479,7 @@ describe("Signal approval reactions", () => {
     };
 
     expect(
-      registerSignalApprovalReactionTargetForDeliveredPayload({
+      await registerSignalApprovalReactionTargetForDeliveredPayload({
         cfg: {
           channels: {
             signal: {},
@@ -505,7 +511,7 @@ describe("Signal approval reactions", () => {
 
   it("registers reaction state when only allow-always is available", async () => {
     expect(
-      registerSignalApprovalReactionTarget({
+      await registerSignalApprovalReactionTarget({
         accountId: "default",
         conversationKey: "+15551230000",
         messageId: "1700000000000",
@@ -539,9 +545,9 @@ describe("Signal approval reactions", () => {
     });
   });
 
-  it("rejects reaction registration without a valid explicit approval kind", () => {
+  it("rejects reaction registration without a valid explicit approval kind", async () => {
     expect(
-      registerSignalApprovalReactionTarget({
+      await registerSignalApprovalReactionTarget({
         accountId: "default",
         conversationKey: "+15551230000",
         messageId: "1700000000099",
@@ -556,7 +562,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("resolves a registered reaction target", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000000",
@@ -585,7 +591,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("does not match timestamp-only bindings when the inbound conversation id differs", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "username:kevin",
       messageId: "1700000000001",
@@ -609,7 +615,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("normalizes UUID target-author casing before matching", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000001",
@@ -638,7 +644,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("ignores unsupported numeric approval reaction choices", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000002",
@@ -663,7 +669,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("requires the reaction target author to match the outbound bot identity", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000006",
@@ -702,7 +708,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("authorizes reactions using Signal approval approvers", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "group:g1",
       messageId: "1700000000003",
@@ -762,7 +768,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("authorizes reactions using Signal defaultTo approvers", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000008",
@@ -824,7 +830,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("consumes a losing surface and logs the canonical winning decision", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000019",
@@ -892,7 +898,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("requires explicit approvers for approval reactions", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000004",
@@ -929,7 +935,7 @@ describe("Signal approval reactions", () => {
   });
 
   it("re-checks the top-level approval route before resolving reactions", async () => {
-    registerSignalApprovalReactionTarget({
+    await registerSignalApprovalReactionTarget({
       accountId: "default",
       conversationKey: "+15551230000",
       messageId: "1700000000007",

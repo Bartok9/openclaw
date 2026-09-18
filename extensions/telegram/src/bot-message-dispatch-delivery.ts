@@ -1,4 +1,5 @@
 import type { Message } from "grammy/types";
+import { getGroupThreadDeliverySession } from "openclaw/plugin-sdk/channel-inbound";
 import {
   createOutboundPayloadPlan,
   deriveDurableFinalDeliveryRequirements,
@@ -6,6 +7,7 @@ import {
   resolveTranscriptBackedChannelFinalText,
 } from "openclaw/plugin-sdk/channel-outbound";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 import { isSingleUseReplyToMode } from "openclaw/plugin-sdk/reply-reference";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -36,13 +38,13 @@ import { resolveTelegramReplyId } from "./bot/helpers.js";
 import type { TelegramInlineButtons } from "./button-types.js";
 import { mergeTelegramPartialDeliveryError } from "./chunk-delivery.js";
 import { canonicalizeTelegramPresentationPayload } from "./interactive-fallback.js";
+import { createLaneDeliveryStateTracker } from "./lane-delivery-state.js";
 import {
-  createLaneDeliveryStateTracker,
   createLaneTextDeliverer,
   type DraftLaneState,
   type LaneDeliveryResult,
   type LaneName,
-} from "./lane-delivery.js";
+} from "./lane-delivery-text-deliverer.js";
 import { recordOutboundMessageForPromptContext } from "./outbound-message-context.js";
 import {
   createTelegramPromptContextProjectionSequence,
@@ -52,7 +54,8 @@ import {
   type TelegramPromptContextProjectionSequence,
   type TelegramPromptContextSource,
 } from "./prompt-context-projection.js";
-import { editMessageTelegram } from "./send.js";
+import { registerTelegramQuestionDelivery } from "./question-finalization.js";
+import { editMessageReplyMarkupTelegram, editMessageTelegram } from "./send.js";
 import { resolveTelegramTargetChatType } from "./targets.js";
 
 type TelegramDeliveryConfig = TurnConfig & {
@@ -67,6 +70,7 @@ type TelegramSendPayloadOptions = {
   promptContextSequence?: TelegramPromptContextProjectionSequence;
   textMode?: "html";
   onPlatformSendDispatch?: () => Promise<void>;
+  assertPlatformSendAuthorized?: () => void;
   bindPendingFinalDelivery?: <T extends ReplyPayload>(payload: T) => T;
 };
 
@@ -144,11 +148,11 @@ const createPromptContextSequence = (
     record: async (record) => await recordPromptContextMessage(turn, record),
   });
 
-function createTranscriptMirror(turn: Turn) {
+function createTranscriptMirror(turn: Turn, sequenceOwner: Turn = turn) {
   const sessionKey = turn.context.ctxPayload.SessionKey;
   return sessionKey
     ? async (payload: TelegramTranscriptMirrorPayload) => {
-        const idempotencyKey = `telegram-final:${sessionKey}:${turn.transcriptMirrorTurnId}:${turn.transcriptMirrorSequence++}`;
+        const idempotencyKey = `telegram-final:${sessionKey}:${turn.transcriptMirrorTurnId}:${sequenceOwner.transcriptMirrorSequence++}`;
         await mirrorTelegramAssistantReplyToTranscript({
           cfg: turn.cfg,
           idempotencyKey,
@@ -213,14 +217,32 @@ const usesNativeTelegramQuote = (turn: Turn, payload: ReplyPayload): boolean =>
   (payload.replyToId != null && turn.replyQuoteByMessageId[payload.replyToId] != null);
 
 export async function sendPayload(
-  turn: Turn,
+  sourceTurn: Turn,
   payload: ReplyPayload,
   options?: TelegramSendPayloadOptions,
 ): Promise<boolean> {
-  if (turn.isSuperseded()) {
+  if (sourceTurn.isSuperseded()) {
     await options?.promptContextSequence?.fail();
     return false;
   }
+  const deliverySession = getGroupThreadDeliverySession();
+  // Keep parallel participants' media policy and transcript identity off the shared turn.
+  const turn = deliverySession
+    ? {
+        ...sourceTurn,
+        context: {
+          ...sourceTurn.context,
+          route: { ...sourceTurn.context.route, ...deliverySession },
+          ctxPayload: {
+            ...sourceTurn.context.ctxPayload,
+            AgentId: deliverySession.agentId,
+            SessionKey: deliverySession.sessionKey,
+            RuntimePolicySessionKey: deliverySession.sessionKey,
+          },
+        },
+        mediaLocalRoots: getAgentScopedMediaLocalRoots(sourceTurn.cfg, deliverySession.agentId),
+      }
+    : sourceTurn;
   const targetedPayload = applyQuoteReplyTarget(turn, payload);
   const finalReplyTargetId = resolveTelegramReplyId(targetedPayload.replyToId);
   const targetsDifferentMessage =
@@ -230,7 +252,7 @@ export async function sendPayload(
     isSingleUseReplyToMode(turn.replyToMode) &&
     !targetsDifferentMessage;
   const deliverablePayload = consumedSingleUseReply
-    ? (({ replyToId: _, replyToTag: _tag, replyToCurrent: _current, ...rest }) => rest)(
+    ? (({ replyToId: _replyToId, replyToTag: _tag, replyToCurrent: _current, ...rest }) => rest)(
         targetedPayload,
       )
     : targetedPayload;
@@ -304,7 +326,7 @@ export async function sendPayload(
     }
   }
   try {
-    const transcriptMirror = createTranscriptMirror(turn);
+    const transcriptMirror = createTranscriptMirror(turn, sourceTurn);
     const result = await (turn.telegramDeps.deliverReplies ?? deliverReplies)({
       ...createDeliveryBaseOptions(turn),
       replyToMode: effectiveReplyToMode,
@@ -316,6 +338,7 @@ export async function sendPayload(
       mediaLoader: turn.telegramDeps.loadWebMedia,
       promptContextSequence: projectionSequence,
       onPlatformSendDispatch: options?.onPlatformSendDispatch,
+      assertPlatformSendAuthorized: options?.assertPlatformSendAuthorized,
       ...(options?.textMode ? { textMode: options.textMode } : {}),
     });
     if (!result.delivered) {
@@ -331,10 +354,7 @@ export async function sendPayload(
   }
 }
 
-export async function emitPreviewFinalizedHook(
-  turn: Turn,
-  result: LaneDeliveryResult,
-): Promise<void> {
+async function emitPreviewFinalizedHook(turn: Turn, result: LaneDeliveryResult): Promise<void> {
   if (
     turn.isSuperseded() ||
     (result.kind !== "preview-finalized" && result.kind !== "preview-finalized-partial")
@@ -348,7 +368,7 @@ export async function emitPreviewFinalizedHook(
     chatId: String(turn.context.chatId),
     accountId: turn.context.route.accountId,
     content: result.delivery.content,
-    success: true,
+    success: result.kind === "preview-finalized",
     messageId: result.delivery.messageId,
     isGroup: turn.context.isGroup,
     groupId: turn.context.isGroup ? String(turn.context.chatId) : undefined,
@@ -359,6 +379,55 @@ export async function emitPreviewFinalizedHook(
       logVerbose(`telegram preview-finalized transcriptMirror failed: ${formatErrorMessage(err)}`);
     });
   }
+}
+
+export async function handlePreviewFinalizedResult(
+  turn: Turn,
+  result: LaneDeliveryResult,
+): Promise<void> {
+  if (result.kind !== "preview-finalized" && result.kind !== "preview-finalized-partial") {
+    return;
+  }
+  await emitPreviewFinalizedHook(turn, result);
+  if (result.kind === "preview-finalized-partial") {
+    // The preview is already visible, so this failure is terminal: preserve its
+    // receipt and prevent outer fallback delivery from duplicating the message.
+    markFinalDelivered(turn);
+    throw mergeTelegramPartialDeliveryError(result.error, {
+      receipt: result.delivery.receipt,
+      content: result.delivery.content,
+      messageIds: result.delivery.receipt.platformMessageIds,
+      visibleReplySent: true,
+    });
+  }
+}
+
+export function registerTelegramQuestionDeliveryForMessage(
+  turn: Turn,
+  payload: ReplyPayload,
+  delivery: { messageId: number; text: string },
+): void {
+  const { chatId } = turn.context;
+  const accountId = turn.context.route.accountId;
+  const api = turn.bot.api;
+  const cfg = turn.cfg;
+  const linkPreview = turn.telegramCfg.linkPreview;
+  const editText = turn.telegramDeps.editMessageTelegram ?? editMessageTelegram;
+  const { messageId, text } = delivery;
+  registerTelegramQuestionDelivery({
+    accountId,
+    chatId: String(chatId),
+    messageId,
+    payload,
+    text,
+    textLimit: turn.textLimit,
+    clearButtons: async () => {
+      await editMessageReplyMarkupTelegram(chatId, messageId, [], { api, cfg, accountId });
+    },
+    annotate: async (finalText) => {
+      await editText(chatId, messageId, finalText, { api, cfg, accountId, linkPreview });
+    },
+  });
 }
 
 async function materializeAnswerLaneBeforeRotation(turn: Turn): Promise<void> {
@@ -387,7 +456,22 @@ async function materializeAnswerLaneBeforeRotation(turn: Turn): Promise<void> {
     durable: false,
   });
   turn.activeAnswerBlockDelivery = undefined;
-  await emitPreviewFinalizedHook(turn, result);
+  await handlePreviewFinalizedResult(turn, result);
+}
+
+async function cleanupProgressWithoutBlockingFinal(
+  phase: "discard" | "teardown",
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch (err) {
+    // Preview cleanup is best-effort; dropping the durable final is worse than
+    // leaving stale progress visible for Telegram to expire or replace later.
+    logVerbose(
+      `telegram progress ${phase} failed before final delivery: ${formatErrorMessage(err)}`,
+    );
+  }
 }
 
 async function deliverTelegramProgressModeFinalAnswer(
@@ -396,16 +480,25 @@ async function deliverTelegramProgressModeFinalAnswer(
   text: string,
   promptContextSequence: TelegramPromptContextProjectionSequence,
   onPlatformSendDispatch?: () => Promise<void>,
+  assertPlatformSendAuthorized?: () => void,
   bindPendingFinalDelivery?: <T extends ReplyPayload>(payload: T) => T,
 ): Promise<LaneDeliveryResult> {
-  const afterAcceptedDraft = turn.answerLane.stream?.hasConsumedReplyTarget?.() === true;
+  const afterAcceptedDraft = turn.answerLane.stream?.hasConsumedReplyTarget() === true;
+  // Seal pending preview updates before the durable final send. This bounds
+  // final latency to one in-flight edit and prevents stale progress overtaking it.
+  await cleanupProgressWithoutBlockingFinal("discard", async () => {
+    await turn.answerLane.stream?.discard();
+  });
   if (payload.isError === true) {
-    await teardownProgressWindow(turn);
+    await cleanupProgressWithoutBlockingFinal("teardown", async () => {
+      await teardownProgressWindow(turn);
+    });
     const delivered = await sendPayload(turn, applyTextToPayload(payload, text), {
       afterAcceptedDraft,
       durable: true,
       promptContextSequence,
       onPlatformSendDispatch,
+      assertPlatformSendAuthorized,
       bindPendingFinalDelivery,
     });
     if (!delivered) {
@@ -420,11 +513,14 @@ async function deliverTelegramProgressModeFinalAnswer(
     durable: true,
     promptContextSequence,
     onPlatformSendDispatch,
+    assertPlatformSendAuthorized,
     bindPendingFinalDelivery,
   });
   // The final must dispatch before the activity window retires, so the answer
   // lane cannot accept follow-ups against a stale preview message.
-  await teardownProgressWindow(turn);
+  await cleanupProgressWithoutBlockingFinal("teardown", async () => {
+    await teardownProgressWindow(turn);
+  });
   if (!delivered) {
     return { kind: "skipped" };
   }
@@ -439,10 +535,12 @@ export async function deliverFinalAnswerText(
   text: string,
   buttons?: TelegramInlineButtons,
   onPlatformSendDispatch?: () => Promise<void>,
+  assertPlatformSendAuthorized?: () => void,
   bindPendingFinalDelivery?: <T extends ReplyPayload>(payload: T) => T,
 ): Promise<LaneDeliveryResult> {
   const transcriptFinal = await turn.resolveCurrentTurnTranscriptFinal();
   const finalText = await resolveTranscriptBackedChannelFinalText({
+    payload: answerPayload,
     finalText: text,
     resolveCandidateText: async () => transcriptFinal?.text,
   });
@@ -462,6 +560,7 @@ export async function deliverFinalAnswerText(
       finalText,
       promptContextSequence,
       onPlatformSendDispatch,
+      assertPlatformSendAuthorized,
       bindPendingFinalDelivery,
     );
   } else {
@@ -479,21 +578,18 @@ export async function deliverFinalAnswerText(
       allowStream: !usesNativeTelegramQuote(turn, answerPayload),
       promptContextSequence,
       onPlatformSendDispatch,
+      assertPlatformSendAuthorized,
       bindPendingFinalDelivery,
     });
     if (!isFollowUp && result.kind !== "skipped") {
       markFinalDelivered(turn);
     }
   }
-  if (result.kind === "preview-finalized" || result.kind === "preview-finalized-partial") {
-    await emitPreviewFinalizedHook(turn, result);
-  }
-  if (result.kind === "preview-finalized-partial") {
-    throw mergeTelegramPartialDeliveryError(result.error, {
-      receipt: result.delivery.receipt,
-      content: result.delivery.content,
-      messageIds: result.delivery.receipt.platformMessageIds,
-      visibleReplySent: true,
+  await handlePreviewFinalizedResult(turn, result);
+  if (result.kind === "preview-finalized") {
+    registerTelegramQuestionDeliveryForMessage(turn, answerPayload, {
+      messageId: result.delivery.messageId,
+      text: result.delivery.content,
     });
   }
   return result;
@@ -610,12 +706,14 @@ export function createDeliveryState(
     // from draft.ts would recreate the draft<->delivery runtime import cycle.
     materializeAnswerLaneBeforeRotation: async () =>
       await materializeAnswerLaneBeforeRotation(getTurn()),
-    resolveCurrentTurnTranscriptFinal: createCurrentTurnTranscriptFinalResolver({
-      agentId: context.route.agentId,
-      dispatchStartedAt: config.dispatchStartedAt,
-      loadFreshSessionEntry: config.loadFreshSessionEntry,
-      sessionKey,
-    }),
+    resolveCurrentTurnTranscriptFinal: context.ctxPayload.GroupThread
+      ? async () => undefined
+      : createCurrentTurnTranscriptFinalResolver({
+          agentId: context.route.agentId,
+          dispatchStartedAt: config.dispatchStartedAt,
+          loadFreshSessionEntry: config.loadFreshSessionEntry,
+          sessionKey,
+        }),
     transcriptMirrorSequence: 0,
     transcriptMirrorTurnId: `${context.chatId}:${context.ctxPayload.MessageSid ?? context.msg.message_id ?? config.dispatchStartedAt}`,
     implicitQuoteReplyTargetId,

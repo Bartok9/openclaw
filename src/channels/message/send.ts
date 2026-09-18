@@ -3,8 +3,9 @@
  *
  * Sends rendered reply payloads, records live preview state, and classifies delivery outcomes.
  */
-import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import { getReplyPayloadMetadata, type ReplyPayload } from "../../auto-reply/reply-payload.js";
 import { resolvePendingFinalDeliveryCompletion } from "../../auto-reply/reply/pending-final-delivery.js";
+import { assertSessionWriterDeliveryAuthorized } from "../../auto-reply/reply/session-writer-delivery-authority.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import {
   type OutboundDeliveryResult,
@@ -17,6 +18,8 @@ import {
   type DeliverOutboundPayloadsParams,
   type OutboundDeliveryIntent,
 } from "../../infra/outbound/deliver.js";
+import type { ConversationDeliveryTarget } from "../../infra/outbound/delivery-completion.js";
+import { normalizeOutboundReplyFacts } from "../../infra/outbound/reply-policy.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { createLiveMessageState, markLiveMessagePreviewUpdated } from "./live.js";
 import { createMessageReceiptFromOutboundResults } from "./receipt.js";
@@ -51,27 +54,10 @@ type DurableMessageSuppressionReason =
 type DurableMessageFailureStage = "platform_send" | "queue" | "unknown";
 
 type DurableMessagePayloadDeliveryOutcome =
-  | {
-      index: number;
-      status: "sent";
-      results: OutboundDeliveryResult[];
-    }
-  | {
-      index: number;
-      status: "suppressed";
+  | Exclude<OutboundPayloadDeliveryOutcome, { status: "suppressed" }>
+  | (Omit<Extract<OutboundPayloadDeliveryOutcome, { status: "suppressed" }>, "reason"> & {
       reason: DurableMessageSuppressionReason;
-      hookEffect?: {
-        cancelReason?: string;
-        metadata?: Record<string, unknown>;
-      };
-    }
-  | {
-      index: number;
-      status: "failed";
-      error: unknown;
-      sentBeforeError: boolean;
-      stage: DurableMessageFailureStage;
-    };
+    });
 
 export type DurableMessageBatchSendResult =
   | {
@@ -113,6 +99,13 @@ export function durableMessageBatchMayHaveReachedRecipient(
     return true;
   }
   if (result.status === "suppressed" && result.reason === "adapter_returned_no_identity") {
+    return true;
+  }
+  if (
+    result.status === "failed" &&
+    isOutboundDeliveryError(result.error) &&
+    result.error.sentBeforeError
+  ) {
     return true;
   }
   return (
@@ -193,18 +186,6 @@ function toDurableMessageIntent(
   };
 }
 
-function toDurablePayloadOutcome(
-  outcome: OutboundPayloadDeliveryOutcome,
-): DurableMessagePayloadDeliveryOutcome {
-  return outcome;
-}
-
-function toDurablePayloadOutcomes(
-  outcomes: readonly OutboundPayloadDeliveryOutcome[],
-): DurableMessagePayloadDeliveryOutcome[] {
-  return outcomes.map((outcome) => toDurablePayloadOutcome(outcome));
-}
-
 export type DurableMessageSendContextParams = DurableMessageBatchSendParams & {
   durability?: Exclude<MessageDurabilityPolicy, "disabled">;
   /** Runs after the durable queue intent exists and before platform delivery starts. */
@@ -231,6 +212,7 @@ export type DurableMessageSendContext = MessageSendContext<
 export async function withDurableMessageSendContextCore<T>(
   params: DurableMessageSendContextParams,
   run: (ctx: DurableMessageSendContext) => Promise<T>,
+  conversationDeliveryTarget?: ConversationDeliveryTarget,
 ): Promise<T> {
   let deliveryIntent: OutboundDeliveryIntent | undefined;
   const {
@@ -250,6 +232,7 @@ export async function withDurableMessageSendContextCore<T>(
     abortSignal,
     ...deliveryParams
   } = params;
+  const replyToId = normalizeOutboundReplyFacts(deliveryParams)?.replyToId;
   const effectiveSignal = signal ?? abortSignal;
   const queuePolicy = durability === "best_effort" ? "best_effort" : "required";
   let liveState = preview ?? createLiveMessageState<ReplyPayload>();
@@ -274,11 +257,11 @@ export async function withDurableMessageSendContextCore<T>(
     },
     send: async (rendered): Promise<DurableMessageBatchSendResult> => {
       const payloadOutcomes: OutboundPayloadDeliveryOutcome[] = [];
-      const durablePayloadOutcomes = (): DurableMessagePayloadDeliveryOutcome[] =>
-        toDurablePayloadOutcomes(payloadOutcomes);
       try {
         const results = await deliverOutboundPayloadsInternal({
           ...deliveryParams,
+          // Public SDK callers cannot select a private conversation storage target.
+          conversationDeliveryTarget,
           payloads: rendered.payloads,
           renderedBatchPlan: rendered.plan,
           queuePolicy,
@@ -297,7 +280,7 @@ export async function withDurableMessageSendContextCore<T>(
         const receipt = createMessageReceiptFromOutboundResults({
           results,
           threadId: params.threadId == null ? undefined : String(params.threadId),
-          replyToId: params.replyToId ?? undefined,
+          replyToId,
         });
         const failedOutcome = payloadOutcomes.find((outcome) => outcome.status === "failed");
         if (failedOutcome) {
@@ -309,14 +292,14 @@ export async function withDurableMessageSendContextCore<T>(
               error: failedOutcome.error,
               sentBeforeError: true,
               ...(deliveryIntent ? { deliveryIntent } : {}),
-              ...(payloadOutcomes.length > 0 ? { payloadOutcomes: durablePayloadOutcomes() } : {}),
+              ...(payloadOutcomes.length > 0 ? { payloadOutcomes: [...payloadOutcomes] } : {}),
             };
           }
           return {
             status: "failed",
             error: failedOutcome.error,
             stage: failedOutcome.stage,
-            ...(payloadOutcomes.length > 0 ? { payloadOutcomes: durablePayloadOutcomes() } : {}),
+            ...(payloadOutcomes.length > 0 ? { payloadOutcomes: [...payloadOutcomes] } : {}),
           };
         }
         if (results.length === 0) {
@@ -328,7 +311,7 @@ export async function withDurableMessageSendContextCore<T>(
             reason:
               payloadOutcomes.find((outcome) => outcome.status === "suppressed")?.reason ??
               "no_visible_result",
-            ...(payloadOutcomes.length > 0 ? { payloadOutcomes: durablePayloadOutcomes() } : {}),
+            ...(payloadOutcomes.length > 0 ? { payloadOutcomes: [...payloadOutcomes] } : {}),
           };
         }
         return {
@@ -336,7 +319,7 @@ export async function withDurableMessageSendContextCore<T>(
           results,
           receipt,
           ...(deliveryIntent ? { deliveryIntent } : {}),
-          ...(payloadOutcomes.length > 0 ? { payloadOutcomes: durablePayloadOutcomes() } : {}),
+          ...(payloadOutcomes.length > 0 ? { payloadOutcomes: [...payloadOutcomes] } : {}),
         };
       } catch (error: unknown) {
         if (isOutboundDeliveryError(error)) {
@@ -344,7 +327,7 @@ export async function withDurableMessageSendContextCore<T>(
             const receipt = createMessageReceiptFromOutboundResults({
               results: error.results,
               threadId: params.threadId == null ? undefined : String(params.threadId),
-              replyToId: params.replyToId ?? undefined,
+              replyToId,
             });
             return {
               status: "partial_failed",
@@ -354,7 +337,7 @@ export async function withDurableMessageSendContextCore<T>(
               sentBeforeError: true,
               ...(deliveryIntent ? { deliveryIntent } : {}),
               ...(error.payloadOutcomes.length > 0
-                ? { payloadOutcomes: toDurablePayloadOutcomes(error.payloadOutcomes) }
+                ? { payloadOutcomes: [...error.payloadOutcomes] }
                 : {}),
             };
           }
@@ -363,7 +346,7 @@ export async function withDurableMessageSendContextCore<T>(
             error,
             stage: error.stage,
             ...(error.payloadOutcomes.length > 0
-              ? { payloadOutcomes: toDurablePayloadOutcomes(error.payloadOutcomes) }
+              ? { payloadOutcomes: [...error.payloadOutcomes] }
               : {}),
           };
         }
@@ -414,6 +397,7 @@ export async function withDurableMessageSendContextCore<T>(
 
 export async function sendDurableMessageBatchCore(
   params: DurableMessageSendContextParams,
+  conversationDeliveryTarget?: ConversationDeliveryTarget,
 ): Promise<DurableMessageBatchSendResult> {
   const pendingFinalCompletion = params.deliveryCompletion
     ? undefined
@@ -425,8 +409,37 @@ export async function sendDurableMessageBatchCore(
         durability: "required" as const,
       }
     : {};
+  const ephemeralWriterAuthorities = pendingFinalCompletion
+    ? []
+    : params.payloads.flatMap((payload) => {
+        const authority = getReplyPayloadMetadata(payload)?.sessionWriterDeliveryAuthority;
+        return authority ? [authority] : [];
+      });
+  const onPlatformSendDispatch =
+    ephemeralWriterAuthorities.length > 0
+      ? async () => {
+          for (const authority of ephemeralWriterAuthorities) {
+            assertSessionWriterDeliveryAuthorized(authority);
+          }
+          await params.onPlatformSendDispatch?.();
+        }
+      : params.onPlatformSendDispatch;
+  const assertDirectAdapterHandoff =
+    ephemeralWriterAuthorities.length > 0
+      ? () => {
+          params.assertDirectAdapterHandoff?.();
+          for (const authority of ephemeralWriterAuthorities) {
+            assertSessionWriterDeliveryAuthorized(authority);
+          }
+        }
+      : params.assertDirectAdapterHandoff;
   return await withDurableMessageSendContextCore(
-    { ...params, ...pendingFinalDelivery },
+    {
+      ...params,
+      ...pendingFinalDelivery,
+      onPlatformSendDispatch,
+      assertDirectAdapterHandoff,
+    },
     async (ctx) => {
       const rendered = await ctx.render();
       const result = await ctx.send(rendered);
@@ -437,5 +450,6 @@ export async function sendDurableMessageBatchCore(
       }
       return result;
     },
+    conversationDeliveryTarget,
   );
 }

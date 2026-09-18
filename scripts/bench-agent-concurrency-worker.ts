@@ -86,15 +86,18 @@ async function waitForCondition(check: () => boolean): Promise<boolean> {
   return check();
 }
 
-async function drainSpawnSampleRootWork(
-  waitForRootWork?: (timeoutMs: number) => Promise<{ drained: boolean; active: number }>,
+async function drainSpawnSampleActiveWork(
+  waitForActiveWork?: (
+    timeoutMs: number,
+  ) => Promise<{ drained: boolean; snapshot: { counts: { totalActive: number } } }>,
 ): Promise<void> {
   const wait =
-    waitForRootWork ??
-    (await import("../src/process/gateway-work-admission.js")).waitForActiveGatewayRootWork;
+    waitForActiveWork ??
+    (await import("../src/infra/gateway-active-work.js")).waitForGatewayActiveWork;
   const result = await wait(30_000);
-  if (!result.drained || result.active !== 0) {
-    throw new Error(`spawn sample left ${result.active} active gateway root work items`);
+  const active = result.snapshot.counts.totalActive;
+  if (!result.drained || active !== 0) {
+    throw new Error(`spawn sample left ${active} active gateway work items`);
   }
 }
 
@@ -222,27 +225,22 @@ async function configureSpawnRuntime(
       persistSubagentRunsToDisk: () => {},
       persistSubagentRunsToDiskOrThrow: () => {},
     });
+    const { createInMemoryTaskRegistryStore, createInMemoryTaskFlowRegistryStore } =
+      await import("../src/test-utils/task-registry-store.js");
+    const inMemoryFlowStore = createInMemoryTaskFlowRegistryStore();
     taskStore.configureTaskRegistryRuntime({
       store: {
+        ...createInMemoryTaskRegistryStore(undefined, inMemoryFlowStore),
+        // Memory mode measures runtime projection with empty, no-op task persistence.
         loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
-        saveSnapshot: () => {},
         upsertTaskWithDeliveryState: () => {},
-        upsertTask: () => {},
         deleteTaskWithDeliveryState: () => {},
-        deleteTask: () => {},
         upsertDeliveryState: () => {},
-        deleteDeliveryState: () => {},
         close: () => {},
       },
     });
     flowStore.configureTaskFlowRegistryRuntime({
-      store: {
-        loadSnapshot: () => ({ flows: new Map() }),
-        saveSnapshot: () => {},
-        upsertFlow: () => {},
-        deleteFlow: () => {},
-        close: () => {},
-      },
+      store: inMemoryFlowStore,
     });
     return;
   }
@@ -262,7 +260,15 @@ async function readDurableRows() {
     path: database.path,
     subagentRows: executeSqliteQuerySync(
       database.db,
-      db.selectFrom("subagent_runs").select(["run_id", "ended_at"]).orderBy("run_id"),
+      db
+        .selectFrom("subagent_runs")
+        .select((eb) => [
+          "run_id",
+          eb
+            .fn<number | null>("json_extract", ["payload_json", eb.val("$.execution.endedAt")])
+            .as("ended_at"),
+        ])
+        .orderBy("run_id"),
     ).rows,
     taskRows: executeSqliteQuerySync(
       database.db,
@@ -443,7 +449,7 @@ async function runSpawnSample(
     }
     // Terminal rows can settle before detached cleanup and requester-wake roots.
     // Drain before reset so leaked work stays visible and cannot reach the next sample.
-    await drainSpawnSampleRootWork();
+    await drainSpawnSampleActiveWork();
     result = {
       durationMs,
       invariant: {
@@ -613,6 +619,7 @@ async function runSweepSample(childCount: number): Promise<Sample> {
     persist: () => {},
     clearPendingLifecycleError: () => {},
     clearPendingLifecycleTimeout: () => {},
+    clearPendingSubagentRecoveryNotice: () => true,
     sweepPendingLifecycle: () => {},
     completeSubagentRunWithRecovery: async () => {
       lostContextCompletions += 1;
@@ -816,7 +823,7 @@ async function main(): Promise<void> {
   process.stdout.write(`${WORKER_RESULT_SENTINEL}${JSON.stringify(result)}\n`);
 }
 
-export const testing = { drainSpawnSampleRootWork };
+export const testing = { drainSpawnSampleActiveWork };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   try {

@@ -1,11 +1,17 @@
 // Control UI chat module implements bounded visible-message caching.
-import { readSessionMessageSequence } from "@openclaw/gateway-client/browser";
+import {
+  createSessionProjection,
+  readSessionMessageSequence,
+  reduceSessionProjection,
+} from "@openclaw/gateway-client/browser";
 import type { UiSessionDefaultsHost } from "../../lib/sessions/session-key.ts";
 import type { ChatHistoryPagination } from "./chat-history-pagination.ts";
+import { readChatSessionProjectionScope, reduceChatSessionProjection } from "./history-merge.ts";
 import { getSessionCacheValue, setSessionCacheValue } from "./session-cache.ts";
-import { resolveChatSnapshotKey } from "./session-snapshot-invalidation.ts";
+import type { SessionSnapshotInvalidationReason } from "./session-snapshot-invalidation-events.ts";
+import { resolveChatSnapshotKey } from "./session-snapshot-key.ts";
 
-export { resolveChatSnapshotKey } from "./session-snapshot-invalidation.ts";
+export { resolveChatSnapshotKey } from "./session-snapshot-key.ts";
 
 // JSON code-unit weight bounds retained payloads without allocating another
 // UTF-8 buffer on the route-switch path.
@@ -17,6 +23,7 @@ const cachedMessageWeights = new WeakMap<object, number>();
 const appendedEventClaims = new WeakMap<ChatMessageCache, WeakSet<object>>();
 
 export type ChatSessionSnapshot = {
+  deltaCursor?: string;
   displayedLeafEntryId?: string | null;
   messages: unknown[];
   pagination: ChatHistoryPagination;
@@ -31,7 +38,7 @@ type CachedChatSessionSnapshot = {
 export type ChatMessageCache = Map<string, CachedChatSessionSnapshot>;
 
 export type ChatCacheObserver = {
-  delete: (sessionKey: string) => void | Promise<void>;
+  delete: (sessionKey: string, reason?: SessionSnapshotInvalidationReason) => void | Promise<void>;
   write: (sessionKey: string, snapshot: ChatSessionSnapshot) => void;
 };
 
@@ -51,13 +58,18 @@ export function observeChatCache(cache: ChatMessageCache, observer: ChatCacheObs
   chatCacheObservers.set(cache, observer);
 }
 
-function deleteChatSnapshot(cache: ChatMessageCache, cacheKey: string): void {
+function deleteChatSnapshot(
+  cache: ChatMessageCache,
+  cacheKey: string,
+  reason?: SessionSnapshotInvalidationReason,
+): void {
   cache.delete(cacheKey);
-  void chatCacheObservers.get(cache)?.delete(cacheKey);
+  void chatCacheObservers.get(cache)?.delete(cacheKey, reason);
 }
 
 export function applyChatCacheSnapshot(
   state: {
+    sessionKey: string;
     chatDisplayedLeafEntryId?: string | null;
     chatHistoryPagination: ChatHistoryPagination;
     chatMessages: unknown[];
@@ -65,7 +77,18 @@ export function applyChatCacheSnapshot(
   },
   snapshot: ChatSessionSnapshot,
 ): void {
-  state.chatMessages = snapshot.messages;
+  reduceChatSessionProjection(
+    state,
+    { type: "snapshotLoaded", messages: snapshot.messages },
+    {
+      scope: readChatSessionProjectionScope(state, {
+        sessionId: snapshot.sessionId,
+        ...(Object.hasOwn(snapshot, "displayedLeafEntryId")
+          ? { activeLeafEntryId: snapshot.displayedLeafEntryId }
+          : {}),
+      }),
+    },
+  );
   state.chatHistoryPagination = snapshot.pagination;
   state.currentSessionId = snapshot.sessionId;
   state.chatDisplayedLeafEntryId = snapshot.displayedLeafEntryId;
@@ -86,6 +109,11 @@ export function appendChatMessageToCache(
   message: unknown,
   eventClaim?: object,
 ): void {
+  const cacheKey = resolveChatSnapshotKey(host, target);
+  const existing = getSessionCacheValue(cache, cacheKey);
+  if (!existing) {
+    return;
+  }
   if (eventClaim) {
     let claims = appendedEventClaims.get(cache);
     if (!claims) {
@@ -97,29 +125,26 @@ export function appendChatMessageToCache(
     }
     claims.add(eventClaim);
   }
-  const cacheKey = resolveChatSnapshotKey(host, target);
-  const existing = getSessionCacheValue(cache, cacheKey);
-  if (!existing) {
-    cacheChatSessionSnapshot(cache, host, target, {
-      messages: [message],
-      pagination: { hasMore: false },
-      sessionId: null,
-    });
-    return;
-  }
   const messageWeight = serializedArrayItemWeight(message);
   if (messageWeight === null) {
-    deleteChatSnapshot(cache, cacheKey);
+    deleteChatSnapshot(cache, cacheKey, "cache-eviction");
     return;
   }
+  const messages = eventClaim
+    ? reduceSessionProjection(createSessionProjection({}, existing.snapshot.messages), {
+        type: "messagePersisted",
+        message,
+        envelope: eventClaim,
+      }).messages.slice()
+    : [...existing.snapshot.messages, message];
   const snapshot = {
-    ...(Object.hasOwn(existing.snapshot, "displayedLeafEntryId")
-      ? { displayedLeafEntryId: existing.snapshot.displayedLeafEntryId }
-      : {}),
-    messages: [...existing.snapshot.messages, message],
-    pagination: existing.snapshot.pagination,
-    sessionId: existing.snapshot.sessionId,
+    ...existing.snapshot,
+    messages,
   };
+  if (eventClaim) {
+    cacheChatSessionSnapshot(cache, host, target, snapshot);
+    return;
+  }
   const weight = existing.weight + messageWeight + (existing.snapshot.messages.length > 0 ? 1 : 0);
   if (weight > MAX_CACHED_CHAT_SNAPSHOT_WEIGHT) {
     cacheChatSessionSnapshot(cache, host, target, snapshot);
@@ -159,6 +184,7 @@ export function cacheChatSessionSnapshot(
   const existing = getSessionCacheValue(cache, cacheKey);
   if (
     existing?.snapshot.messages === snapshot.messages &&
+    existing.snapshot.deltaCursor === snapshot.deltaCursor &&
     existing.snapshot.sessionId === snapshot.sessionId &&
     existing.snapshot.displayedLeafEntryId === snapshot.displayedLeafEntryId &&
     samePagination(existing.snapshot.pagination, snapshot.pagination)
@@ -172,12 +198,12 @@ export function cacheChatSessionSnapshot(
     (snapshot.pagination.totalMessages ?? 0) === 0 &&
     snapshot.pagination.completeSnapshot !== true
   ) {
-    deleteChatSnapshot(cache, cacheKey);
+    deleteChatSnapshot(cache, cacheKey, "cache-eviction");
     return;
   }
   const bounded = boundChatSessionSnapshot(snapshot);
   if (!bounded) {
-    deleteChatSnapshot(cache, cacheKey);
+    deleteChatSnapshot(cache, cacheKey, "cache-eviction");
     return;
   }
   setSessionCacheValue(cache, cacheKey, bounded);
@@ -199,9 +225,8 @@ export function measureChatSnapshotWeight(snapshot: ChatSessionSnapshot): number
     return null;
   }
   return measuredSnapshotWeight(
+    snapshot,
     snapshot.pagination,
-    snapshot.sessionId,
-    snapshot.displayedLeafEntryId,
     messageWeights.reduce((sum, weight) => sum + weight, 0),
     messageWeights.length,
   );
@@ -223,9 +248,8 @@ function boundChatSessionSnapshot(snapshot: ChatSessionSnapshot): CachedChatSess
       return null;
     }
     const weight = measuredSnapshotWeight(
+      snapshot,
       pagination,
-      snapshot.sessionId,
-      snapshot.displayedLeafEntryId,
       retainedMessageWeight,
       messageWeights.length - start,
     );
@@ -235,12 +259,9 @@ function boundChatSessionSnapshot(snapshot: ChatSessionSnapshot): CachedChatSess
       }
       return {
         snapshot: {
-          ...(Object.hasOwn(snapshot, "displayedLeafEntryId")
-            ? { displayedLeafEntryId: snapshot.displayedLeafEntryId }
-            : {}),
+          ...snapshot,
           messages: snapshot.messages.slice(start),
           pagination: { ...pagination },
-          sessionId: snapshot.sessionId,
         },
         weight,
       };
@@ -277,17 +298,15 @@ function measureMessageWeights(messages: unknown[]): number[] | null {
 }
 
 function measuredSnapshotWeight(
+  snapshot: ChatSessionSnapshot,
   pagination: ChatHistoryPagination,
-  sessionId: string | null,
-  displayedLeafEntryId: string | null | undefined,
   messageWeight: number,
   messageCount: number,
 ): number | null {
   const envelopeWeight = serializedWeight({
-    ...(displayedLeafEntryId !== undefined ? { displayedLeafEntryId } : {}),
+    ...snapshot,
     messages: [],
     pagination,
-    sessionId,
   });
   return envelopeWeight === null
     ? null

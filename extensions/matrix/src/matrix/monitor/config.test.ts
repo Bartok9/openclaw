@@ -1,19 +1,11 @@
 // Matrix tests cover config plugin behavior.
 import { describe, expect, it, vi } from "vitest";
+import { createRuntimeSpies } from "../../../../test-support/runtime-spies.js";
 import type { RuntimeEnv } from "../../../runtime-api.js";
 import type { CoreConfig, MatrixRoomConfig } from "../../types.js";
 import { resolveMatrixMonitorConfig, resolveMatrixMonitorLiveUserAllowlist } from "./config.js";
 
 type MatrixRoomsConfig = Record<string, MatrixRoomConfig>;
-
-function createRuntime() {
-  const runtime: RuntimeEnv = {
-    log: vi.fn(),
-    error: vi.fn(),
-    exit: vi.fn(),
-  };
-  return runtime;
-}
 
 function createConfig(params?: { dangerouslyAllowNameMatching?: boolean }): CoreConfig {
   return {
@@ -49,7 +41,7 @@ function expectResolveTargetCall(
 
 describe("resolveMatrixMonitorConfig", () => {
   it("canonicalizes resolved user aliases and room keys without keeping stale aliases", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(
       async ({ inputs, kind }: { inputs: string[]; kind: "user" | "group" }) => {
         if (kind === "user") {
@@ -122,8 +114,37 @@ describe("resolveMatrixMonitorConfig", () => {
     });
   });
 
+  it("keeps a room version 12 room ID (no :server suffix) as already resolved", async () => {
+    // Room version 12 (MSC4291) dropped the trailing ":server" from room IDs — they're
+    // now a hash of the create event — so this must not be sent through name/alias
+    // resolution the way an unresolved query would be.
+    const runtime: RuntimeEnv = createRuntimeSpies();
+    const resolveTargets = vi.fn(async ({ inputs }: { inputs: string[] }) =>
+      inputs.map((input) => ({ input, resolved: false })),
+    );
+
+    const roomsConfig: MatrixRoomsConfig = {
+      "!UIZ0YzC99dC1AyEM6mGl0_XNP8u8xeCCt_Zk8Uhkp70": { enabled: true },
+    };
+
+    const result = await resolveMatrixMonitorConfig({
+      cfg: createConfig(),
+      accountId: "ops",
+      allowFrom: [],
+      groupAllowFrom: [],
+      roomsConfig,
+      runtime,
+      resolveTargets,
+    });
+
+    expect(result.roomsConfig).toEqual({
+      "!UIZ0YzC99dC1AyEM6mGl0_XNP8u8xeCCt_Zk8Uhkp70": { enabled: true },
+    });
+    expect(resolveTargets).not.toHaveBeenCalled();
+  });
+
   it("strips config prefixes before lookups and logs unresolved guidance once per section", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(
       async ({ kind, inputs }: { inputs: string[]; kind: "user" | "group" }) =>
         inputs.map((input) => ({
@@ -139,6 +160,7 @@ describe("resolveMatrixMonitorConfig", () => {
       allowFrom: ["user:Ghost"],
       groupAllowFrom: ["matrix:@known:example.org"],
       roomsConfig: {
+        "!": { enabled: true },
         "channel:Project X": {
           enabled: true,
           users: ["matrix:Ghost"],
@@ -159,21 +181,21 @@ describe("resolveMatrixMonitorConfig", () => {
     expectResolveTargetCall(resolveTargets, 1, {
       accountId: "ops",
       kind: "group",
-      inputs: ["Project X"],
+      inputs: ["!", "Project X"],
     });
     expect(resolveTargets).toHaveBeenCalledTimes(2);
     expect(runtime.log).toHaveBeenCalledWith("matrix dm allowlist unresolved: user:Ghost");
     expect(runtime.log).toHaveBeenCalledWith(
       "matrix dm allowlist entries must be full Matrix IDs (example: @user:server). Unresolved entries will not match any sender.",
     );
-    expect(runtime.log).toHaveBeenCalledWith("matrix rooms unresolved: channel:Project X");
+    expect(runtime.log).toHaveBeenCalledWith("matrix rooms unresolved: !, channel:Project X");
     expect(runtime.log).toHaveBeenCalledWith(
-      "matrix rooms must be room IDs or aliases (example: !room:server or #alias:server). Unresolved entries are ignored.",
+      "matrix rooms must be room IDs or aliases (example: !room:server, the suffixless !room form on room version 12+, or #alias:server). Unresolved entries are ignored.",
     );
   });
 
   it("resolves exact room aliases to canonical room ids instead of trusting alias keys directly", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(
       async ({ kind, inputs }: { inputs: string[]; kind: "user" | "group" }) => {
         if (kind === "group") {
@@ -212,7 +234,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("does not resolve mutable allowlist entries or room names by default", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(
       async ({ kind, inputs }: { inputs: string[]; kind: "user" | "group" }) => {
         if (kind === "group") {
@@ -277,7 +299,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("keeps case-distinct qualified user ids in startup allowlists", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(async () => []);
     const caseDistinctIds = ["@alice:Example.org", "@alice:example.org"];
 
@@ -308,7 +330,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("does not resolve mutable live allowlist entries by default", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(async () => [
       { input: "Alice", resolved: true, id: "@alice:example.org" },
     ]);
@@ -327,7 +349,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("keeps case-distinct qualified user ids in live allowlists", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(async () => []);
     const caseDistinctIds = ["@alice:Example.org", "@alice:example.org"];
 
@@ -344,7 +366,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("keeps unresolved live group allowlist entries configured for fail-closed matching", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(async () => [
       { input: "Alice", resolved: true, id: "@alice:example.org" },
     ]);
@@ -364,7 +386,7 @@ describe("resolveMatrixMonitorConfig", () => {
   });
 
   it("resolves mutable live allowlist entries when name matching is enabled", async () => {
-    const runtime = createRuntime();
+    const runtime: RuntimeEnv = createRuntimeSpies();
     const resolveTargets = vi.fn(async () => [
       { input: "Alice", resolved: true, id: "@alice:example.org" },
     ]);

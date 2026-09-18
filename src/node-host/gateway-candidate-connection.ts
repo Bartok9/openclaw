@@ -1,4 +1,7 @@
-import type { CloudflareAccessCredentials } from "../../packages/gateway-client/src/cloudflare-access.js";
+import {
+  buildCloudflareAccessHeaders,
+  type CloudflareAccessCredentials,
+} from "../../packages/gateway-client/src/cloudflare-access.js";
 import {
   GatewayClient,
   type GatewayClientCloseInfo,
@@ -16,7 +19,7 @@ type CandidateConnectionOptions = Omit<
   GatewayClientOptions,
   | "url"
   | "tlsFingerprint"
-  | "cloudflareAccess"
+  | "edgeAuthHeaders"
   | "onEvent"
   | "onHelloOk"
   | "onConnectError"
@@ -41,7 +44,7 @@ type GatewayCandidateConnectionParams = {
   onWinningCandidate: (candidate: NodeHostGatewayConfig) => void;
 };
 
-function formatGatewayCandidateUrl(gateway: NodeHostGatewayConfig): string {
+export function formatGatewayCandidateUrl(gateway: NodeHostGatewayConfig): string {
   const host = gateway.host ?? "127.0.0.1";
   const urlHost =
     host.includes(":") && !(host.startsWith("[") && host.endsWith("]")) ? `[${host}]` : host;
@@ -83,7 +86,9 @@ export function createNodeHostGatewayCandidateConnection(params: GatewayCandidat
       ...params.clientOptions,
       url,
       tlsFingerprint: candidate.tlsFingerprint,
-      ...(cloudflareAccess ? { cloudflareAccess } : {}),
+      ...(cloudflareAccess
+        ? { edgeAuthHeaders: buildCloudflareAccessHeaders(cloudflareAccess) }
+        : {}),
       onEvent: (event) => {
         if (currentCandidateIndex === candidateIndex) {
           params.onEvent(event);

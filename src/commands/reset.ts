@@ -99,7 +99,7 @@ export async function resetCommand(runtime: RuntimeEnv, opts: ResetOptions) {
       ],
       initialValue: "config+creds+sessions",
     });
-    if (isCancel(selection)) {
+    if (typeof selection === "symbol") {
       cancel(stylePromptTitle("Reset cancelled.") ?? "Reset cancelled.");
       runtime.exit(0);
       return;
@@ -143,6 +143,7 @@ export async function resetCommand(runtime: RuntimeEnv, opts: ResetOptions) {
     ? await resolveCleanupPlanForDryRun()
     : await resolveCleanupPlanForRemoval(runtime);
   if (!cleanupPlan) {
+    runtime.exit(1);
     return;
   }
   const { stateDir, configPath, oauthDir, configInsideState, oauthInsideState, workspaceDirs } =

@@ -1,6 +1,7 @@
 // Cleanup utility tests cover filesystem cleanup helpers, temp paths, and command runtime behavior.
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import * as fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,7 @@ import { resolveGatewayLockDir } from "../config/paths.js";
 import { acquireGatewayLock, GatewayLockError } from "../infra/gateway-lock.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -65,6 +67,23 @@ const workspaceStateMocks = vi.hoisted(() => ({
   prepareWorkspaceStateDeletion: vi.fn((workspaceDir: string) => ({ workspaceDir })),
 }));
 
+const fsSafeMocks = vi.hoisted(() => ({
+  movePathToTrash: vi.fn(async (targetPath: string) => `${targetPath}.trashed`),
+}));
+
+const processMocks = vi.hoisted(() => ({
+  runCommandWithTimeout: vi.fn(),
+}));
+
+vi.mock("../infra/fs-safe.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/fs-safe.js")>()),
+  movePathToTrash: fsSafeMocks.movePathToTrash,
+}));
+
+vi.mock("../process/exec.js", () => ({
+  runCommandWithTimeout: processMocks.runCommandWithTimeout,
+}));
+
 vi.mock("../agents/workspace-state-store.js", async () => ({
   ...(await vi.importActual<typeof import("../agents/workspace-state-store.js")>(
     "../agents/workspace-state-store.js",
@@ -76,10 +95,130 @@ vi.mock("../agents/workspace-state-store.js", async () => ({
 import {
   buildCleanupPlan,
   listAgentSessionDirs,
+  moveToTrash,
   removePath,
   removeStateAndLinkedPaths,
   removeWorkspaceDirs,
 } from "./cleanup-utils.js";
+
+afterEach(() => {
+  fsSafeMocks.movePathToTrash.mockReset();
+  fsSafeMocks.movePathToTrash.mockImplementation(
+    async (targetPath: string) => `${targetPath}.trashed`,
+  );
+  vi.restoreAllMocks();
+});
+
+function expectedTrashSourcePath(targetPath: string): string {
+  return path.join(fsSync.realpathSync(path.dirname(targetPath)), path.basename(targetPath));
+}
+
+describe("moveToTrash", () => {
+  it("retains the target when ownership expires during asynchronous preparation", async () => {
+    const targetPath = path.join(tempDirs.make("openclaw-trash-expired-"), "target");
+    await fs.writeFile(targetPath, "retain me");
+    let owned = true;
+    const removal = moveToTrash(targetPath, createTestRuntime(), () => {
+      if (!owned) {
+        throw new Error("cleanup ownership expired");
+      }
+    });
+    owned = false;
+
+    await expect(removal).resolves.toBe(false);
+    expect(fsSafeMocks.movePathToTrash).not.toHaveBeenCalled();
+    expect(await fs.readFile(targetPath, "utf8")).toBe("retain me");
+  });
+
+  it("uses fs-safe trash instead of resolving a PATH trash command", async () => {
+    const testRoot = fsSync.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-helper-"));
+    const targetPath = path.join(testRoot, "target");
+    fsSync.mkdirSync(targetPath, { recursive: true });
+    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+    const sourcePath = expectedTrashSourcePath(targetPath);
+
+    try {
+      await moveToTrash(targetPath, runtime);
+    } finally {
+      fsSync.rmSync(testRoot, { recursive: true, force: true });
+    }
+
+    expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
+      allowedRoots: [path.dirname(sourcePath)],
+    });
+    expect(processMocks.runCommandWithTimeout).not.toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(`Moved to Trash: ${targetPath}`);
+  });
+
+  it("allows fs-safe trash to move a symlink whose target resolves outside the parent", async () => {
+    const testRoot = fsSync.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-symlink-"));
+    const targetPath = path.join(testRoot, "target-link");
+    const outsideTarget = path.join(os.tmpdir(), "openclaw-trash-symlink-target");
+    fsSync.writeFileSync(targetPath, "link placeholder");
+    vi.spyOn(fs, "lstat").mockResolvedValue({
+      isSymbolicLink: () => true,
+    } as fsSync.Stats);
+    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) =>
+      String(candidate) === path.dirname(targetPath) ? path.dirname(targetPath) : outsideTarget,
+    );
+    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+
+    try {
+      await moveToTrash(targetPath, runtime);
+    } finally {
+      fsSync.rmSync(testRoot, { recursive: true, force: true });
+    }
+
+    expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(targetPath, {
+      allowedRoots: [path.dirname(targetPath), path.dirname(outsideTarget)],
+    });
+  });
+
+  it("moves a dangling symlink instead of treating it as already removed", async () => {
+    const testRoot = tempDirs.make("openclaw-trash-dangling-link-");
+    const targetPath = path.join(testRoot, "workspace-link");
+    fsSync.symlinkSync(path.join(testRoot, "missing-target"), targetPath, "dir");
+    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+    const sourcePath = expectedTrashSourcePath(targetPath);
+
+    try {
+      await expect(moveToTrash(targetPath, runtime)).resolves.toBe(true);
+    } finally {
+      fsSync.rmSync(testRoot, { recursive: true, force: true });
+    }
+
+    expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
+      allowedRoots: [path.dirname(sourcePath)],
+    });
+  });
+
+  it("canonicalizes a symlinked parent before calling fs-safe trash", async () => {
+    const testRoot = fsSync.mkdtempSync(path.join(os.tmpdir(), "openclaw-trash-parent-link-"));
+    const lexicalParent = path.join(testRoot, "state-link");
+    const realParent = path.join(testRoot, "state-real");
+    const targetPath = path.join(lexicalParent, "openclaw.json");
+    const sourcePath = path.join(realParent, "openclaw.json");
+    fsSync.mkdirSync(lexicalParent, { recursive: true });
+    fsSync.writeFileSync(targetPath, "{}\n");
+    vi.spyOn(fs, "realpath").mockImplementation(async (candidate) =>
+      String(candidate) === lexicalParent ? realParent : String(candidate),
+    );
+    vi.spyOn(fs, "lstat").mockResolvedValue({
+      isSymbolicLink: () => false,
+    } as fsSync.Stats);
+    const runtime = { log: vi.fn() } as unknown as RuntimeEnv;
+
+    try {
+      await moveToTrash(targetPath, runtime);
+    } finally {
+      fsSync.rmSync(testRoot, { recursive: true, force: true });
+    }
+
+    expect(fsSafeMocks.movePathToTrash).toHaveBeenCalledWith(sourcePath, {
+      allowedRoots: [realParent],
+    });
+  });
+});
 
 describe("buildCleanupPlan", () => {
   test("resolves inside-state flags and workspace dirs", () => {
@@ -173,6 +312,23 @@ describe("cleanup path removals", () => {
       "[dry-run] remove /tmp/openclaw-cleanup/oauth",
     ]);
     expect(stateRemoved).toBe(true);
+  });
+
+  it("returns failure when any linked dry-run target is unsafe", async () => {
+    const runtime = createRuntimeMock();
+    await expect(
+      removeStateAndLinkedPaths(
+        {
+          stateDir: "/tmp/openclaw-cleanup/state",
+          configPath: path.parse(process.cwd()).root,
+          oauthDir: "/tmp/openclaw-cleanup/oauth",
+          configInsideState: false,
+          oauthInsideState: false,
+        },
+        runtime,
+        { dryRun: true },
+      ),
+    ).resolves.toBe(false);
   });
 
   it("keeps the canonical state lock visible until state removal completes", async () => {
@@ -617,7 +773,6 @@ describe("cleanup path removals", () => {
     const result = await removePath(process.cwd(), runtime, { dryRun: true });
 
     expect(result.ok).toBe(false);
-    expect(result.skipped).toBeUndefined();
     expect(runtime.error.mock.calls.length).toBe(1);
     expect(
       expectDefined(runtime.error.mock.calls[0], "runtime.error.mock.calls[0] test invariant")[0],
@@ -638,7 +793,6 @@ describe("cleanup path removals", () => {
       const result = await removePath(tmpRoot, runtime, { dryRun: true });
 
       expect(result.ok).toBe(false);
-      expect(result.skipped).toBeUndefined();
       expect(runtime.error.mock.calls.length).toBe(1);
       expect(
         expectDefined(runtime.error.mock.calls[0], "runtime.error.mock.calls[0] test invariant")[0],

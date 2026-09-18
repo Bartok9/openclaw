@@ -1,10 +1,18 @@
 // QA Lab Slack live domain contracts and wire schemas.
-import type { WebClient } from "@slack/web-api";
 import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { z } from "zod";
-import type { startQaGatewayChild } from "../../gateway-child.js";
+import type { QaGatewayChild } from "../../gateway-child.js";
 import { splitQaModelRef } from "../../model-selection.js";
+
+type SlackQaRuntime = typeof import("@openclaw/slack/test-api.js");
+type CreateSlackWebClient = SlackQaRuntime["createSlackWebClient"];
+
+export type SlackQaWebClient = ReturnType<CreateSlackWebClient>;
+export type SlackQaFetchFunction = NonNullable<
+  NonNullable<Parameters<CreateSlackWebClient>[1]>["fetch"]
+>;
+type WebClient = SlackQaWebClient;
 
 export type SlackQaRuntimeEnv = {
   channelId: string;
@@ -110,11 +118,14 @@ export function assertSlackCodexApprovalModelSupported(modelRef: string) {
 
 export type SlackQaMessageScenarioRun = {
   afterNoReply?: (context: SlackQaScenarioContext) => Promise<string | void>;
+  captureBeforeReply?: (messages: readonly SlackObservedMessage[]) => boolean;
   cleanup?: (context: Omit<SlackQaScenarioContext, "sentTs">) => Promise<void>;
   kind?: "message";
   expectReply: boolean;
   input: string;
   matchText: string;
+  /** Observation window for negative scenarios; must stay below the enclosing flow deadline. */
+  noReplyObservationMs?: number;
   preserveGatewayDebug?: boolean;
   settleObservedMs?: number;
   verify?: (message: SlackMessage, context: { requestThreadTs: string; sentTs: string }) => void;
@@ -191,6 +202,7 @@ export type SlackQaConfigOverrides = {
   messageTool?: boolean;
   progress?: {
     commentary?: boolean;
+    style?: "compact";
     toolProgress: boolean;
     verboseDefault?: "off" | "on" | "full";
   };
@@ -202,7 +214,7 @@ export type SlackQaConfigOverrides = {
 export type SlackQaScenarioContext = {
   channelId: string;
   driverClient: WebClient;
-  gateway: Awaited<ReturnType<typeof startQaGatewayChild>>;
+  gateway: QaGatewayChild;
   postSlackMessage: (params: { text: string; threadTs?: string }) => Promise<{ ts: string }>;
   sentTs: string;
   sutIdentity: SlackAuthIdentity;

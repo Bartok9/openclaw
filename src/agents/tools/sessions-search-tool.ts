@@ -1,6 +1,5 @@
 /** Full-text search over visible session transcripts. */
 import { Type } from "typebox";
-import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
 import { redactToolPayloadText } from "../../logging/redact.js";
@@ -33,13 +32,12 @@ import {
   runWithScopedSessionAccess,
 } from "./scoped-session-access.js";
 import {
-  createAgentToAgentPolicy,
   createSessionVisibilityRowChecker,
+  formatSessionToolAccessDenial,
   resolveDisplaySessionKey,
-  resolveEffectiveSessionToolsVisibility,
-  resolveSandboxedSessionToolContext,
   resolveSessionReference,
   resolveSessionToolAccess,
+  resolveSessionToolContext,
   resolveVisibleSessionReference,
 } from "./sessions-helpers.js";
 
@@ -50,6 +48,8 @@ const SESSIONS_SEARCH_MAX_SESSION_KEYS = 200;
 const SESSIONS_SEARCH_MAX_QUERY_CHARS = 4096;
 const SESSIONS_SEARCH_MAX_BYTES = 32 * 1024;
 const SESSIONS_SEARCH_SNIPPET_MAX_CHARS = 300;
+const SESSIONS_SEARCH_INDEXING_WARNING =
+  "Transcript indexing is in progress; results may be incomplete. Retry sessions_search shortly.";
 
 const SessionsSearchToolSchema = Type.Object({
   query: Type.String({ maxLength: SESSIONS_SEARCH_MAX_QUERY_CHARS }),
@@ -80,6 +80,8 @@ const SessionsSearchOutputSchema = Type.Union([
         }),
       ),
       indexing: Type.Optional(Type.Literal(true)),
+      archivedTranscriptsExcluded: Type.Optional(Type.Integer({ minimum: 1 })),
+      warning: Type.Optional(Type.String()),
       truncated: Type.Optional(Type.Literal(true)),
     },
     { additionalProperties: false },
@@ -339,6 +341,7 @@ function matchSearchHitCandidate(params: {
 export function createSessionsSearchTool(opts?: {
   agentId?: string;
   agentSessionKey?: string;
+  sessionReadScopeKey?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
   callGateway?: GatewayCaller;
@@ -367,15 +370,20 @@ export function createSessionsSearchTool(opts?: {
         readPositiveIntegerParam(params, "limit", {
           max: SESSIONS_SEARCH_MAX_LIMIT,
         }) ?? SESSIONS_SEARCH_DEFAULT_LIMIT;
-      const requestedSessionKey = readToolStringParam(params, "sessionKey");
-      const cfg = opts?.config ?? getRuntimeConfig();
-      const { mainKey, alias, effectiveRequesterKey, mainSessionKey, restrictToSpawned } =
-        resolveSandboxedSessionToolContext({
-          cfg,
-          agentSessionKey: opts?.agentSessionKey,
-          requesterAgentId: opts?.agentId,
-          sandboxed: opts?.sandboxed,
-        });
+      // The host-bound scope is already the complete search universe. Reuse the
+      // targeted authorization path instead of listing every session to filter it back down.
+      const requestedSessionKey =
+        readToolStringParam(params, "sessionKey") || opts?.sessionReadScopeKey;
+      const {
+        cfg,
+        mainKey,
+        alias,
+        effectiveRequesterKey,
+        mainSessionKey,
+        restrictToSpawned,
+        sessionVisibility: visibility,
+        a2aPolicy,
+      } = resolveSessionToolContext(opts);
       const requesterAgentId = resolveSessionAgentId({
         sessionKey: effectiveRequesterKey,
         config: cfg,
@@ -443,11 +451,6 @@ export function createSessionsSearchTool(opts?: {
         };
       }
 
-      const visibility = resolveEffectiveSessionToolsVisibility({
-        cfg,
-        sandboxed: opts?.sandboxed === true,
-      });
-      const a2aPolicy = createAgentToAgentPolicy(cfg);
       const defaultAgentId = requesterAgentId;
       const rowGuard = createSessionVisibilityRowChecker({
         action: "history",
@@ -469,6 +472,7 @@ export function createSessionsSearchTool(opts?: {
           displayAction: "search",
           requesterAgentId,
           requesterSessionKey: effectiveRequesterKey,
+          sessionReadScopeKey: opts?.sessionReadScopeKey ? effectiveRequesterKey : undefined,
           mainSessionKey,
           authorizationTargetSessionKey,
           targetAgentId: agentId,
@@ -479,7 +483,13 @@ export function createSessionsSearchTool(opts?: {
           callGateway: gatewayCall,
         });
         if (!access.allowed) {
-          return jsonResult({ status: access.status, error: access.error });
+          return jsonResult({
+            status: access.status,
+            error: formatSessionToolAccessDenial(access, {
+              action: "search",
+              targetSessionKey: key,
+            }),
+          });
         }
         if (access.expectedSessionId) {
           sessionTarget.expectedSessionId = access.expectedSessionId;
@@ -513,6 +523,7 @@ export function createSessionsSearchTool(opts?: {
         .filter((candidate) => !isIncognitoSessionKey(candidate.key));
       const visibleHits: SanitizedSearchHit[] = [];
       let indexing = false;
+      let archivedTranscriptsExcluded = 0;
       let backendTruncated = false;
       const sessionsByAgent = new Map<string, SearchSessionCandidate[]>();
       for (const candidate of searchSessions) {
@@ -539,6 +550,7 @@ export function createSessionsSearchTool(opts?: {
             gatewayCall<{
               results?: GatewaySearchHit[];
               indexing?: boolean;
+              archivedTranscriptsExcluded?: number;
               truncated?: boolean;
             }>({
               method: "sessions.search",
@@ -560,6 +572,7 @@ export function createSessionsSearchTool(opts?: {
               })
             : await runSearch();
           indexing ||= result.indexing === true;
+          archivedTranscriptsExcluded += result.archivedTranscriptsExcluded ?? 0;
           backendTruncated ||= result.truncated === true;
           for (const hit of Array.isArray(result.results) ? result.results : []) {
             if (typeof hit.sessionKey !== "string") {
@@ -601,6 +614,19 @@ export function createSessionsSearchTool(opts?: {
           ? { sessionLinkRule: describeSessionLinkRule(opts.sessionLinkBase) }
           : {}),
         ...(indexing ? { indexing: true } : {}),
+        ...(archivedTranscriptsExcluded > 0 ? { archivedTranscriptsExcluded } : {}),
+        ...(indexing || archivedTranscriptsExcluded > 0
+          ? {
+              warning: [
+                ...(indexing ? [SESSIONS_SEARCH_INDEXING_WARNING] : []),
+                ...(archivedTranscriptsExcluded > 0
+                  ? [
+                      `Search excludes ${archivedTranscriptsExcluded} archived transcripts. Restore a transcript to include it in search.`,
+                    ]
+                  : []),
+              ].join(" "),
+            }
+          : {}),
         ...(backendTruncated || visibleHits.length > limit || capped.truncated
           ? { truncated: true }
           : {}),

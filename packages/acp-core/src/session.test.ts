@@ -23,25 +23,37 @@ describe("acp session manager", () => {
     const controller = new AbortController();
     store.setActiveRun(session.sessionId, "run-1", controller);
 
-    expect(store.getSessionByRunId("run-1")?.sessionId).toBe(session.sessionId);
+    expect(session.activeRunId).toBe("run-1");
+    expect(session.abortController).toBe(controller);
 
     const cancelled = store.cancelActiveRun(session.sessionId);
     expect(cancelled).toBe(true);
-    expect(store.getSessionByRunId("run-1")).toBeUndefined();
+    expect(controller.signal.aborted).toBe(true);
+    expect(session.activeRunId).toBeNull();
+    expect(session.abortController).toBeNull();
   });
 
-  it("removes stale run lookup entries when rebinding an active run", () => {
-    const session = store.createSession({
-      sessionKey: "acp:rebind",
-      cwd: "/tmp",
-    });
+  it.each(["clear", "cancel"] as const)(
+    "does not let stale %s ownership remove a replacement run",
+    (operation) => {
+      const session = store.createSession({
+        sessionKey: "acp:replacement",
+        cwd: "/tmp",
+      });
+      store.setActiveRun(session.sessionId, "run-old", new AbortController());
+      const replacementController = new AbortController();
+      store.setActiveRun(session.sessionId, "run-new", replacementController);
 
-    store.setActiveRun(session.sessionId, "run-old", new AbortController());
-    store.setActiveRun(session.sessionId, "run-new", new AbortController());
+      if (operation === "clear") {
+        store.clearActiveRun(session.sessionId, "run-old");
+      } else {
+        expect(store.cancelActiveRun(session.sessionId, "run-old")).toBe(false);
+      }
 
-    expect(store.getSessionByRunId("run-old")).toBeUndefined();
-    expect(store.getSessionByRunId("run-new")?.sessionId).toBe(session.sessionId);
-  });
+      expect(session.activeRunId).toBe("run-new");
+      expect(replacementController.signal.aborted).toBe(false);
+    },
+  );
 
   it("deletes sessions and aborts active runs on close", () => {
     const session = store.createSession({
@@ -56,7 +68,6 @@ describe("acp session manager", () => {
 
     expect(controller.signal.aborted).toBe(true);
     expect(store.hasSession(session.sessionId)).toBe(false);
-    expect(store.getSessionByRunId("run-close")).toBeUndefined();
   });
 
   it("reports false when deleting a missing session", () => {
@@ -207,5 +218,34 @@ describe("acp session manager", () => {
         cwd: "/tmp",
       }),
     ).toThrow(/session limit reached/i);
+  });
+
+  it("reports every removal path through onSessionRemoved", () => {
+    const removed: string[] = [];
+    const reportingStore = createInMemorySessionStore({
+      now,
+      maxSessions: 2,
+      idleTtlMs: 1_000,
+      onSessionRemoved: (sessionId) => removed.push(sessionId),
+    });
+
+    reportingStore.createSession({ sessionKey: "k", cwd: "/", sessionId: "deleted" });
+    expect(reportingStore.deleteSession("deleted")).toBe(true);
+    expect(removed).toEqual(["deleted"]);
+
+    // Idle reaping: the session ages past the TTL and is swept on the next create.
+    reportingStore.createSession({ sessionKey: "k", cwd: "/", sessionId: "stale" });
+    nowMs += 5_000;
+    reportingStore.createSession({ sessionKey: "k", cwd: "/", sessionId: "fresh" });
+    expect(removed).toEqual(["deleted", "stale"]);
+
+    // Capacity eviction: at maxSessions the oldest idle session makes room.
+    reportingStore.createSession({ sessionKey: "k", cwd: "/", sessionId: "second" });
+    reportingStore.createSession({ sessionKey: "k", cwd: "/", sessionId: "third" });
+    expect(removed).toEqual(["deleted", "stale", "fresh"]);
+
+    // Dispose reports whatever was still held.
+    reportingStore.dispose();
+    expect(removed).toEqual(["deleted", "stale", "fresh", "second", "third"]);
   });
 });

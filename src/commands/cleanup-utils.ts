@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { AgentsDeleteResult } from "../../packages/gateway-protocol/src/schema/agents-models-skills.js";
 import { listAgentIds, resolveAgentWorkspaceDir } from "../agents/agent-scope-config.js";
 import { resolveDefaultAgentWorkspaceDir } from "../agents/workspace-default.js";
 import {
@@ -13,17 +14,22 @@ import {
   prepareWorkspaceStateDeletion,
 } from "../agents/workspace-state-store.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { formatErrorMessage, isMissingPathError } from "../infra/errors.js";
+import { movePathToTrash } from "../infra/fs-safe.js";
 import { acquireGatewayLock, GatewayLockError } from "../infra/gateway-lock.js";
 import { hasNodeErrorCode, isPathInside } from "../infra/path-guards.js";
-import { acquireStateDatabaseCoordinator } from "../infra/state-database-coordinator.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { acquireOpenClawStateDatabaseFileExclusion } from "../state/openclaw-state-db-cache.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
-import { resolveHomeDir, shortenHomeInString } from "../utils.js";
+import { resolveHomeDir, shortenHomeInString, shortenHomePath } from "../utils.js";
 
 type RemovalResult = {
   ok: boolean;
-  skipped?: boolean;
 };
+
+type AgentDeleteRemovedPath = NonNullable<AgentsDeleteResult["removed"]>[number];
+type AgentDeleteFailedPath = NonNullable<AgentsDeleteResult["failed"]>[number];
+type MoveToTrashResult = { removed: AgentDeleteRemovedPath } | { failed: AgentDeleteFailedPath };
 
 type CleanupResolvedPaths = {
   stateDir: string;
@@ -45,6 +51,83 @@ type StateRemovalOptions = {
 
 const STATE_CLEANUP_LOCK_TIMEOUT_MS = 250;
 const STATE_CLEANUP_LOCK_POLL_INTERVAL_MS = 25;
+
+function trashFailure(pathname: string, error: unknown, runtime: RuntimeEnv): MoveToTrashResult {
+  runtime.log(`Failed to move to Trash (manual delete): ${shortenHomePath(pathname)}`);
+  return { failed: { path: pathname, reason: formatErrorMessage(error) } };
+}
+
+export async function moveToTrashResult(
+  pathname: string,
+  runtime: RuntimeEnv,
+  assertCurrent?: () => void,
+): Promise<MoveToTrashResult> {
+  if (!pathname) {
+    return { failed: { path: pathname, reason: "path is empty" } };
+  }
+  let isSymbolicLink: boolean;
+  try {
+    isSymbolicLink = (await fs.lstat(pathname)).isSymbolicLink();
+  } catch (error) {
+    return isMissingPathError(error)
+      ? { removed: { path: pathname, method: "missing" } }
+      : trashFailure(pathname, error, runtime);
+  }
+  try {
+    const targetPath = path.resolve(pathname);
+    const sourcePath = await resolveMoveToTrashSourcePath(targetPath);
+    const allowedRoots = trashAllowedRoots(
+      [sourcePath],
+      isSymbolicLink ? await resolveSymlinkTargetPath(sourcePath) : undefined,
+    );
+    // Preparation can outlive its owner; revalidate immediately before Trash dispatch.
+    assertCurrent?.();
+    await movePathToTrash(sourcePath, { allowedRoots });
+    runtime.log(`Moved to Trash: ${shortenHomePath(pathname)}`);
+    return { removed: { path: pathname, method: "trash" } };
+  } catch (error) {
+    return trashFailure(pathname, error, runtime);
+  }
+}
+
+/** Moves a path to Trash when it exists, logging a manual-delete fallback on failure. */
+export async function moveToTrash(
+  pathname: string,
+  runtime: RuntimeEnv,
+  assertCurrent?: () => void,
+): Promise<boolean> {
+  return "removed" in (await moveToTrashResult(pathname, runtime, assertCurrent));
+}
+
+/**
+ * Allowed Trash roots for OpenClaw-owned paths: each declared path's own parent, plus the
+ * resolved parent when the moved path is a symlink (fs-safe checks the link target, and
+ * moving a link never touches the directory behind it). fs-safe's default roots (home + tmp)
+ * alone refuse every path of a state dir on a volume such as `/data`.
+ */
+export function trashAllowedRoots(
+  declaredPaths: readonly string[],
+  resolvedLinkPath?: string,
+): string[] {
+  const roots = declaredPaths.map((declaredPath) => path.dirname(declaredPath));
+  if (resolvedLinkPath !== undefined) {
+    roots.push(path.dirname(resolvedLinkPath));
+  }
+  return [...new Set(roots)];
+}
+
+async function resolveMoveToTrashSourcePath(targetPath: string): Promise<string> {
+  return path.join(await fs.realpath(path.dirname(targetPath)), path.basename(targetPath));
+}
+
+// fs-safe resolves valid symlinks before allow-root checks; a broken link is handled lexically.
+async function resolveSymlinkTargetPath(linkPath: string): Promise<string | undefined> {
+  try {
+    return await fs.realpath(linkPath);
+  } catch {
+    return undefined;
+  }
+}
 
 function collectWorkspaceDirs(cfg: OpenClawConfig | undefined): string[] {
   const dirs = new Set<string>();
@@ -107,7 +190,7 @@ export async function removePath(
   opts?: RemovalOptions,
 ): Promise<RemovalResult> {
   if (!target?.trim()) {
-    return { ok: false, skipped: true };
+    return { ok: false };
   }
   const resolved = path.resolve(target);
   const label = opts?.label ?? resolved;
@@ -118,7 +201,7 @@ export async function removePath(
   }
   if (opts?.dryRun) {
     runtime.log(`[dry-run] remove ${displayLabel}`);
-    return { ok: true, skipped: true };
+    return { ok: true };
   }
   try {
     await fs.rm(resolved, { recursive: true, force: true });
@@ -207,7 +290,7 @@ async function removePathPreserving(
   opts?: RemovalOptions,
 ): Promise<RemovalResult> {
   if (!target?.trim()) {
-    return { ok: false, skipped: true };
+    return { ok: false };
   }
   const resolved = path.resolve(target);
   const label = opts?.label ?? resolved;
@@ -217,7 +300,7 @@ async function removePathPreserving(
     return { ok: false };
   }
   if (shouldPreservePath(resolved, preservePaths)) {
-    return { ok: true, skipped: true };
+    return { ok: true };
   }
   if (!pathContainsPreservedPath(resolved, preservePaths)) {
     return removePath(resolved, runtime, opts);
@@ -228,7 +311,7 @@ async function removePathPreserving(
       .map((preservePath) => shortenHomeInString(preservePath))
       .join(", ");
     runtime.log(`[dry-run] remove ${displayLabel} preserving ${preserved}`);
-    return { ok: true, skipped: true };
+    return { ok: true };
   }
   try {
     const stat = await fs.lstat(resolved);
@@ -346,13 +429,13 @@ export async function removeStateAndLinkedPaths(
             dryRun: true,
             label: cleanup.stateDir,
           });
-    if (!cleanup.configInsideState) {
-      await removePath(cleanup.configPath, runtime, { dryRun: true, label: cleanup.configPath });
-    }
-    if (!cleanup.oauthInsideState) {
-      await removePath(cleanup.oauthDir, runtime, { dryRun: true, label: cleanup.oauthDir });
-    }
-    return stateRemoval.ok;
+    const configRemoval = cleanup.configInsideState
+      ? { ok: true }
+      : await removePath(cleanup.configPath, runtime, { dryRun: true, label: cleanup.configPath });
+    const oauthRemoval = cleanup.oauthInsideState
+      ? { ok: true }
+      : await removePath(cleanup.oauthDir, runtime, { dryRun: true, label: cleanup.oauthDir });
+    return stateRemoval.ok && configRemoval.ok && oauthRemoval.ok;
   }
   if (isUnsafeRemovalTarget(requestedStateDir)) {
     runtime.error(`Refusing to remove unsafe path: ${shortenHomeInString(cleanup.stateDir)}`);
@@ -361,7 +444,9 @@ export async function removeStateAndLinkedPaths(
 
   const lock = await acquireStateCleanupOwnership(cleanup);
   let lockHeld = true;
-  let stateCoordinator: ReturnType<typeof acquireStateDatabaseCoordinator> | undefined;
+  let stateCoordinator:
+    | Awaited<ReturnType<typeof acquireOpenClawStateDatabaseFileExclusion>>
+    | undefined;
   const releaseLock = async () => {
     if (!lockHeld) {
       return;
@@ -387,10 +472,7 @@ export async function removeStateAndLinkedPaths(
       ...process.env,
       OPENCLAW_STATE_DIR: stateDir,
     });
-    stateCoordinator = acquireStateDatabaseCoordinator({
-      databasePath,
-      busyTimeoutMs: 0,
-    });
+    stateCoordinator = await acquireOpenClawStateDatabaseFileExclusion(databasePath);
     const preservePaths = requestedPreservePaths
       .map((target) =>
         isPathWithin(target, requestedStateDir)
@@ -452,6 +534,7 @@ export async function removeWorkspaceDirs(
   runtime: RuntimeEnv,
   opts?: {
     dryRun?: boolean;
+    preserveWorkspace?: boolean;
     removeStateRows?: boolean;
     removeWorkspace?: (workspace: string) => Promise<boolean>;
   },
@@ -475,9 +558,11 @@ export async function removeWorkspaceDirs(
     const statePlan = opts?.removeStateRows
       ? await attempt(stateLabel, () => prepareWorkspaceStateDeletion(workspace))
       : undefined;
-    const result = opts?.removeWorkspace
-      ? { ok: (await attempt(workspace, () => opts.removeWorkspace!(workspace))) === true }
-      : await removePath(workspace, runtime, { dryRun: opts?.dryRun, label: workspace });
+    const result = opts?.preserveWorkspace
+      ? { ok: true }
+      : opts?.removeWorkspace
+        ? { ok: (await attempt(workspace, () => opts.removeWorkspace!(workspace))) === true }
+        : await removePath(workspace, runtime, { dryRun: opts?.dryRun, label: workspace });
     if (!result.ok) {
       failures.add(workspace);
       continue;
@@ -499,9 +584,7 @@ export async function removeWorkspaceDirs(
       }
     }
     if (!opts?.dryRun && statePlan) {
-      await attempt(stateLabel, () => {
-        deleteWorkspaceState(statePlan);
-      });
+      await attempt(stateLabel, () => deleteWorkspaceState(statePlan));
     }
   }
   return [...failures];
@@ -514,7 +597,8 @@ export async function listAgentSessionDirs(stateDir: string): Promise<string[]> 
     const entries = await fs.readdir(root, { withFileTypes: true });
     return entries
       .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(root, entry.name, "sessions"));
+      .map((entry) => path.join(root, entry.name, "sessions"))
+      .toSorted();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return [];

@@ -2,6 +2,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { setEmbeddedMode } from "../infra/embedded-mode.js";
+import { createPluginBoardWidgetContentKindRegistrar } from "../plugins/board-widget-content-kinds.js";
+import { createPluginRecord } from "../plugins/loader-records.js";
+import type { WidgetPresenter } from "../plugins/plugin-registration.types.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { withEnv } from "../test-utils/env.js";
 import { isToolWrappedWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import { applyToolAvailabilityDescriptions } from "./agent-tools.deferred-followup.js";
@@ -16,9 +21,13 @@ import {
   collectPresentOpenClawTools,
   shouldIncludeAskUserToolForOpenClawTools,
   shouldIncludeProgressCardToolForOpenClawTools,
+  shouldIncludeSecretsToolForOpenClawTools,
 } from "./openclaw-tools.registration.js";
 import { textResult, type AnyAgentTool } from "./tools/common.js";
+import { getGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
+import * as inProcessGateway from "./tools/in-process-gateway.js";
 import { createPdfTool } from "./tools/pdf-tool.js";
+import * as sessionsSpawnTool from "./tools/sessions-spawn-tool.js";
 
 vi.mock("./openclaw-plugin-tools.js", () => ({
   resolveOpenClawPluginToolsForOptions: () => [],
@@ -94,6 +103,7 @@ describe("openclaw-tools progress_card gating", () => {
       taskSuggestionDeliveryMode: "gateway",
     });
 
+    expect(emittedNames).toContain("plugins");
     expect(
       emittedNames.filter((name) => resolveCoreToolFactoryFamily(name) !== "openclaw"),
     ).toEqual([]);
@@ -114,18 +124,21 @@ describe("openclaw-tools progress_card gating", () => {
     expect(defaultTools).not.toContain("ask_user");
   });
 
-  it("keeps ask_user on primary sessions and excludes spawned worker sessions", () => {
-    expect(shouldIncludeAskUserToolForOpenClawTools({})).toBe(false);
-    expect(shouldIncludeAskUserToolForOpenClawTools({ agentSessionKey: "agent:main:main" })).toBe(
-      true,
-    );
+  it("keeps human-question tools on permitted primary sessions", () => {
+    for (const includeTool of [
+      shouldIncludeAskUserToolForOpenClawTools,
+      shouldIncludeSecretsToolForOpenClawTools,
+    ]) {
+      expect(includeTool({})).toBe(false);
+      expect(includeTool({ agentSessionKey: "agent:main:main" })).toBe(true);
+      expect(includeTool({ agentSessionKey: "agent:main:subagent:worker" })).toBe(false);
+      expect(includeTool({ agentSessionKey: "agent:main:acp:worker" })).toBe(false);
+    }
     expect(
-      shouldIncludeAskUserToolForOpenClawTools({
-        agentSessionKey: "agent:main:subagent:worker",
+      shouldIncludeSecretsToolForOpenClawTools({
+        agentSessionKey: "agent:main:main",
+        pluginToolDenylist: ["secrets"],
       }),
-    ).toBe(false);
-    expect(
-      shouldIncludeAskUserToolForOpenClawTools({ agentSessionKey: "agent:main:acp:worker" }),
     ).toBe(false);
     // ask_user must not depend on the TUI embedded-host flag; normal gateway
     // runs are the primary consumer.
@@ -134,7 +147,7 @@ describe("openclaw-tools progress_card gating", () => {
         config: {} as OpenClawConfig,
         runSessionKey: "agent:main:non-embedded",
       }),
-    ).toContain("ask_user");
+    ).toEqual(expect.arrayContaining(["ask_user", "secrets"]));
     setEmbeddedMode(true);
 
     expect(
@@ -312,6 +325,41 @@ describe("openclaw-tools progress_card gating", () => {
     expect(gatewayBoundTools).not.toContain("sessions_send");
   });
 
+  it.each([
+    {
+      currentChannelId: "channel:111",
+      currentMessagingTarget: "user:222",
+      nativeChannelId: "111",
+      expectedTarget: "user:222",
+      expectedChannelId: "111",
+    },
+    {
+      currentChannelId: "telegram:-100:topic:77",
+      nativeChannelId: "-100",
+      expectedTarget: "telegram:-100:topic:77",
+      expectedChannelId: "-100",
+    },
+    {
+      currentChannelId: "channel:111",
+      expectedTarget: "channel:111",
+      expectedChannelId: "channel:111",
+    },
+  ])("keeps native spawn metadata separate from delivery ($expectedTarget)", (context) => {
+    const spawn = vi.spyOn(sessionsSpawnTool, "createSessionsSpawnTool");
+    try {
+      createTestOpenClawTools(context);
+
+      expect(spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          currentMessagingTarget: context.expectedTarget,
+          currentChannelId: context.expectedChannelId,
+        }),
+      );
+    } finally {
+      spawn.mockRestore();
+    }
+  });
+
   it("advertises sessions_spawn from agents_list only when spawn is available", () => {
     setEmbeddedMode(true);
     const createTools = (allowGatewaySubagentBinding: boolean) =>
@@ -358,6 +406,25 @@ describe("openclaw-tools progress_card gating", () => {
     });
 
     expect(includeProgressCard).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "a configured profile",
+      options: { config: { tools: { profile: "messaging" as const } } },
+    },
+    {
+      name: "the runtime allowlist",
+      options: { runtimeToolAllowlist: ["read"] },
+    },
+  ])("omits progress_card when $name excludes it", ({ options }) => {
+    expect(
+      createFastToolNames({
+        ...options,
+        modelProvider: "openai",
+        modelId: "gpt-5.6-sol",
+      }),
+    ).not.toContain("progress_card");
   });
 
   it("leaves normal deny policy enforcement to the assembled tool set", () => {
@@ -449,150 +516,6 @@ describe("PDF registration", () => {
   });
 });
 
-function createSwarmToolNames(options: NonNullable<Parameters<typeof createOpenClawTools>[0]>) {
-  const config = options.config ?? {};
-  return createOpenClawTools({
-    disableMessageTool: true,
-    disablePluginTools: true,
-    wrapBeforeToolCallHook: false,
-    ...options,
-    config: {
-      ...config,
-      agents: config.agents ?? { entries: { main: {} } },
-    },
-  }).map((tool) => tool.name);
-}
-
-describe("Swarm registration", () => {
-  it("registers agents_wait only when tools.swarm is enabled", () => {
-    const base = { agentSessionKey: "agent:main:main" };
-    expect(createSwarmToolNames(base)).not.toContain("agents_wait");
-    expect(createSwarmToolNames({ ...base, config: { tools: { swarm: true } } })).toContain(
-      "agents_wait",
-    );
-  });
-
-  it("uses the effective requester agent override for the agents_wait gate", () => {
-    const base = {
-      agentSessionKey: "agent:worker:main",
-      requesterAgentIdOverride: "worker",
-    };
-    expect(
-      createSwarmToolNames({
-        ...base,
-        config: {
-          tools: { swarm: false },
-          agents: {
-            list: [{ id: "main" }, { id: "worker", tools: { swarm: true } }],
-          },
-        },
-      }),
-    ).toContain("agents_wait");
-    expect(
-      createSwarmToolNames({
-        ...base,
-        config: {
-          tools: { swarm: true },
-          agents: {
-            list: [{ id: "main" }, { id: "worker", tools: { swarm: false } }],
-          },
-        },
-      }),
-    ).not.toContain("agents_wait");
-  });
-
-  it("advertises sessions_spawn from agents_wait only when spawn is available", () => {
-    setEmbeddedMode(true);
-    try {
-      const createTools = (allowGatewaySubagentBinding: boolean) =>
-        createTestOpenClawTools({
-          agentSessionKey: "agent:main:main",
-          allowGatewaySubagentBinding,
-          config: { tools: { swarm: true } } as OpenClawConfig,
-          disableMessageTool: true,
-          disablePluginTools: true,
-          wrapBeforeToolCallHook: false,
-        });
-      const withoutSpawn = applyToolAvailabilityDescriptions(createTools(false));
-      const withSpawn = applyToolAvailabilityDescriptions(createTools(true));
-
-      expect(toolNames(withoutSpawn)).not.toContain("sessions_spawn");
-      expect(expectToolNamed(withoutSpawn, "agents_wait").description).not.toContain(
-        "sessions_spawn",
-      );
-      expect(toolNames(withSpawn)).toContain("sessions_spawn");
-      expect(expectToolNamed(withSpawn, "agents_wait").description).toContain("sessions_spawn");
-    } finally {
-      setEmbeddedMode(false);
-    }
-  });
-
-  it("injects structured_output only for schema-backed collector runs", () => {
-    const base = {
-      agentSessionKey: "agent:worker:subagent:child",
-      runId: "collector-run",
-      config: { tools: { swarm: true } },
-    };
-    expect(createSwarmToolNames({ ...base, swarmCollector: true })).not.toContain(
-      "structured_output",
-    );
-    expect(
-      createSwarmToolNames({
-        ...base,
-        swarmCollector: true,
-        swarmOutputSchema: { type: "object", properties: { answer: { type: "string" } } },
-      }),
-    ).toContain("structured_output");
-  });
-
-  it("keeps structured_output through restrictive child tool policy", () => {
-    const names = createOpenClawCodingTools({
-      sessionKey: "agent:worker:subagent:child",
-      runId: "collector-run",
-      config: {
-        agents: { entries: { main: { default: true } } },
-        tools: { allow: ["read"], swarm: true },
-      },
-      swarmCollector: true,
-      swarmOutputSchema: { type: "object", properties: { answer: { type: "string" } } },
-    }).map((tool) => tool.name);
-
-    expect(names).toContain("read");
-    expect(names).toContain("structured_output");
-    expect(names).not.toContain("exec");
-  });
-
-  it("omits the message tool for collector runs by invariant", () => {
-    const names = createOpenClawCodingTools({
-      sessionKey: "agent:worker:subagent:child",
-      runId: "collector-run",
-      config: {
-        agents: { entries: { main: { default: true } } },
-        tools: { swarm: true },
-      },
-      swarmCollector: true,
-    }).map((tool) => tool.name);
-
-    expect(names).not.toContain("message");
-  });
-
-  it("omits interactive and pausing tools for non-interactive collector runs", () => {
-    const names = createOpenClawCodingTools({
-      sessionKey: "agent:worker:main",
-      runId: "collector-run",
-      config: {
-        agents: { entries: { main: { default: true } } },
-        tools: { swarm: true },
-      },
-      swarmCollector: true,
-    }).map((tool) => tool.name);
-
-    expect(names).not.toContain("ask_user");
-    expect(names).not.toContain("sessions_send");
-    expect(names).not.toContain("sessions_yield");
-  });
-});
-
 describe("sessions_yield completion ownership", () => {
   const controllerSessionKey = "agent:main:telegram:default:direct:1234";
 
@@ -639,6 +562,184 @@ describe("sessions_yield completion ownership", () => {
       markRequesterTurnYielded.mockRestore();
     }
   });
+
+  it("keeps the turn active when it owns no pending child completion", async () => {
+    const registry = await import("./subagents/registry/subagent-registry.js");
+    const markRequesterTurnYielded = vi
+      .spyOn(registry, "markRequesterTurnYielded")
+      .mockReturnValue(0);
+    const onYield = vi.fn(async () => undefined);
+
+    try {
+      const tool = expectToolNamed(
+        createTestOpenClawTools({
+          agentSessionKey: controllerSessionKey,
+          runSessionKey: "agent:main:main",
+          sessionId: "requester-session",
+          runId: "run-requester",
+          onYield,
+          disableMessageTool: true,
+          disablePluginTools: true,
+          wrapBeforeToolCallHook: false,
+        }),
+        "sessions_yield",
+      );
+
+      const result = await tool.execute("yield-requester", {});
+
+      expect(result.details).toMatchObject({
+        status: "error",
+        error:
+          'No pending child completion is owned by this turn. If the assigned work is complete, return its result normally. An unfinished subagent waiting for an incoming continuation must explicitly set waitFor: "message".',
+      });
+      expect(markRequesterTurnYielded).toHaveBeenCalledOnce();
+      expect(onYield).not.toHaveBeenCalled();
+    } finally {
+      markRequesterTurnYielded.mockRestore();
+    }
+  });
+
+  it("accepts an explicit incoming-message wait without a pending child completion", async () => {
+    const registry = await import("./subagents/registry/subagent-registry.js");
+    const markRequesterTurnYielded = vi
+      .spyOn(registry, "markRequesterTurnYielded")
+      .mockReturnValue(0);
+    const onYield = vi.fn(async () => undefined);
+
+    try {
+      const tool = expectToolNamed(
+        createTestOpenClawTools({
+          agentSessionKey: "agent:main:subagent:worker",
+          sessionId: "subagent-session",
+          runId: "run-subagent",
+          onYield,
+          disableMessageTool: true,
+          disablePluginTools: true,
+          wrapBeforeToolCallHook: false,
+        }),
+        "sessions_yield",
+      );
+
+      await expect(tool.execute("yield-subagent", { waitFor: "message" })).resolves.toMatchObject({
+        details: { status: "yielded" },
+      });
+      expect(markRequesterTurnYielded).toHaveBeenCalledExactlyOnceWith({
+        requesterAgentId: "main",
+        requesterSessionKey: "agent:main:subagent:worker",
+        requesterTurnRunId: "run-subagent",
+      });
+      expect(onYield).toHaveBeenCalledOnce();
+    } finally {
+      markRequesterTurnYielded.mockRestore();
+    }
+  });
+
+  it("rejects a collector yield before any claim source runs", async () => {
+    const registry = await import("./subagents/registry/subagent-registry.js");
+    const markRequesterTurnYielded = vi
+      .spyOn(registry, "markRequesterTurnYielded")
+      .mockReturnValue(1);
+    const claimYieldCompletion = vi.fn(() => true);
+    const onYield = vi.fn(async () => undefined);
+
+    try {
+      const tool = expectToolNamed(
+        createTestOpenClawTools({
+          agentSessionKey: "agent:main:subagent:collector",
+          sessionId: "collector-session",
+          runId: "run-collector",
+          swarmCollector: true,
+          claimYieldCompletion,
+          onYield,
+          disableMessageTool: true,
+          disablePluginTools: true,
+          wrapBeforeToolCallHook: false,
+        }),
+        "sessions_yield",
+      );
+
+      await expect(tool.execute("yield-collector", {})).resolves.toMatchObject({
+        details: { status: "error", error: expect.stringContaining("collected explicitly") },
+      });
+      expect(claimYieldCompletion).not.toHaveBeenCalled();
+      expect(markRequesterTurnYielded).not.toHaveBeenCalled();
+      expect(onYield).not.toHaveBeenCalled();
+    } finally {
+      markRequesterTurnYielded.mockRestore();
+    }
+  });
+
+  it("accepts a runtime completion owner while recording the registry claim", async () => {
+    const registry = await import("./subagents/registry/subagent-registry.js");
+    const markRequesterTurnYielded = vi
+      .spyOn(registry, "markRequesterTurnYielded")
+      .mockReturnValue(0);
+    const claimYieldCompletion = vi.fn(() => true);
+    const onYield = vi.fn(async () => undefined);
+
+    try {
+      const tool = expectToolNamed(
+        createTestOpenClawTools({
+          agentSessionKey: controllerSessionKey,
+          sessionId: "requester-session",
+          runId: "run-requester",
+          claimYieldCompletion,
+          onYield,
+          disableMessageTool: true,
+          disablePluginTools: true,
+          wrapBeforeToolCallHook: false,
+        }),
+        "sessions_yield",
+      );
+
+      await expect(tool.execute("yield-requester", {})).resolves.toMatchObject({
+        details: { status: "yielded" },
+      });
+      expect(markRequesterTurnYielded).toHaveBeenCalledOnce();
+      expect(claimYieldCompletion).toHaveBeenCalledOnce();
+      expect(onYield).toHaveBeenCalledOnce();
+      expect(claimYieldCompletion.mock.invocationCallOrder[0]).toBeLessThan(
+        markRequesterTurnYielded.mock.invocationCallOrder[0]!,
+      );
+    } finally {
+      markRequesterTurnYielded.mockRestore();
+    }
+  });
+
+  it("fails before registry side effects when the runtime completion claimant throws", async () => {
+    const registry = await import("./subagents/registry/subagent-registry.js");
+    const markRequesterTurnYielded = vi
+      .spyOn(registry, "markRequesterTurnYielded")
+      .mockReturnValue(1);
+    const failure = new Error("runtime completion owner failed");
+    const claimYieldCompletion = vi.fn(() => {
+      throw failure;
+    });
+    const onYield = vi.fn(async () => undefined);
+
+    try {
+      const tool = expectToolNamed(
+        createTestOpenClawTools({
+          agentSessionKey: controllerSessionKey,
+          sessionId: "requester-session",
+          runId: "run-requester",
+          claimYieldCompletion,
+          onYield,
+          disableMessageTool: true,
+          disablePluginTools: true,
+          wrapBeforeToolCallHook: false,
+        }),
+        "sessions_yield",
+      );
+
+      await expect(tool.execute("yield-requester", {})).rejects.toBe(failure);
+      expect(markRequesterTurnYielded).not.toHaveBeenCalled();
+      expect(claimYieldCompletion).toHaveBeenCalledOnce();
+      expect(onYield).not.toHaveBeenCalled();
+    } finally {
+      markRequesterTurnYielded.mockRestore();
+    }
+  });
 });
 
 function hasTool(tools: readonly { name: string }[], name: string): boolean {
@@ -662,13 +763,130 @@ describe("gateway client capability tool filtering", () => {
     ).toBe(true);
   });
 
-  it("keeps the core widget tool out of Discord sessions", () => {
+  it("keeps the core widget tool available to inline-capable Discord clients", () => {
     expect(
       hasTool(
         createOpenClawTools({ agentChannel: "discord", clientCaps: ["inline-widgets"] }),
         "show_widget",
       ),
-    ).toBe(false);
+    ).toBe(true);
+  });
+
+  it("exposes one core widget tool for a matching current-channel presenter", async () => {
+    const registry = createEmptyPluginRegistry();
+    const present = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        kind: "message" as const,
+        receipt: {
+          primaryPlatformMessageId: "discord-message-1",
+          platformMessageIds: ["discord-message-1"],
+          parts: [],
+          sentAt: 1,
+        },
+      },
+    }));
+    const presenter: WidgetPresenter = {
+      target: "current_channel",
+      description: "Post in the current Discord channel",
+      capabilities: { sourceKinds: ["html"] },
+      match: (context) =>
+        context.messageChannel === "discord" && context.accountId === "configured",
+      availability: async () => ({ ok: true, value: { available: true } }),
+      present,
+    };
+    registry.widgetPresenters.push({
+      pluginId: "discord",
+      pluginName: "Discord",
+      presenter,
+      source: "discord-fixture",
+    });
+    setActivePluginRegistry(registry);
+
+    try {
+      const tools = createOpenClawTools({
+        agentChannel: "discord",
+        agentAccountId: "configured",
+        nativeChannelId: "channel-1",
+        agentSessionKey: "agent:main:discord",
+      });
+      const widgetTools = tools.filter((tool) => tool.name === "show_widget");
+
+      expect(widgetTools).toHaveLength(1);
+      expect(widgetTools[0]?.requiredClientCaps).toBeUndefined();
+      const result = await widgetTools[0]?.execute("discord-widget", {
+        title: "Status",
+        widget_code: "<p>ready</p>",
+      });
+      expect(result?.details).toMatchObject({
+        kind: "widget",
+        presentation: {
+          target: "current_channel",
+          receipt: { primaryPlatformMessageId: "discord-message-1" },
+        },
+      });
+      expect(present).toHaveBeenCalledOnce();
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
+  });
+
+  it("hides current-channel widgets when no presenter matches the trusted run facts", () => {
+    const registry = createEmptyPluginRegistry();
+    const presenter: WidgetPresenter = {
+      target: "current_channel",
+      description: "Post in the current configured Discord channel",
+      capabilities: { sourceKinds: ["html"] },
+      match: (context) =>
+        context.messageChannel === "discord" && context.accountId === "configured",
+      availability: async () => ({ ok: true, value: { available: true } }),
+      present: async () => {
+        throw new Error("present must not run");
+      },
+    };
+    registry.widgetPresenters.push({
+      pluginId: "discord",
+      presenter,
+      source: "discord-fixture",
+    });
+    setActivePluginRegistry(registry);
+
+    try {
+      expect(
+        hasTool(
+          createOpenClawTools({ agentChannel: "discord", agentAccountId: "unconfigured" }),
+          "show_widget",
+        ),
+      ).toBe(false);
+      expect(hasTool(createOpenClawTools({ agentChannel: "slack" }), "show_widget")).toBe(false);
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
+  });
+
+  it("fails closed when current-channel presenter matching is ambiguous", () => {
+    const registry = createEmptyPluginRegistry();
+    const presenter = (pluginId: string): WidgetPresenter => ({
+      target: "current_channel",
+      description: `Present through ${pluginId}`,
+      capabilities: { sourceKinds: ["html"] },
+      match: (context) => context.messageChannel === "discord",
+      availability: async () => ({ ok: true, value: { available: true } }),
+      present: async () => {
+        throw new Error("present must not run");
+      },
+    });
+    registry.widgetPresenters.push(
+      { pluginId: "first", presenter: presenter("first"), source: "first-fixture" },
+      { pluginId: "second", presenter: presenter("second"), source: "second-fixture" },
+    );
+    setActivePluginRegistry(registry);
+
+    try {
+      expect(hasTool(createOpenClawTools({ agentChannel: "discord" }), "show_widget")).toBe(false);
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
   });
 
   it("keeps the core widget tool out when Canvas host config disables it", () => {
@@ -685,6 +903,44 @@ describe("gateway client capability tool filtering", () => {
     ).toBe(false);
   });
 
+  it("keeps registered board widgets available without promising inline delivery", () => {
+    const registry = createEmptyPluginRegistry();
+    const record = createPluginRecord({
+      id: "diagram",
+      source: "diagram-fixture",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    createPluginBoardWidgetContentKindRegistrar(registry)(record, {
+      kind: "diagram",
+      label: "Diagram",
+      resources: { surface: "diagram", paths: ["/__openclaw__/diagram/app.js"] },
+      validateSource() {},
+      composeDocument: ({ source }) => source,
+    });
+    setActivePluginRegistry(registry);
+
+    try {
+      const tool = expectToolNamed(
+        createOpenClawTools({
+          agentSessionKey: "agent:main:main",
+          clientCaps: ["inline-widgets"],
+          config: {
+            plugins: { entries: { canvas: { config: { host: { enabled: false } } } } },
+          },
+        }),
+        "show_widget",
+      );
+
+      expect(tool.description).toContain(
+        "Inline previews are unavailable this turn; set pin=true to save to the session dashboard",
+      );
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
+  });
+
   it("keeps the core widget tool out when OPENCLAW_SKIP_CANVAS_HOST is set", () => {
     withEnv({ OPENCLAW_SKIP_CANVAS_HOST: "1" }, () => {
       expect(hasTool(createOpenClawTools({ clientCaps: ["inline-widgets"] }), "show_widget")).toBe(
@@ -696,6 +952,46 @@ describe("gateway client capability tool filtering", () => {
   it("only exposes screen to UI-command clients", () => {
     expect(hasTool(createOpenClawTools(), "screen")).toBe(false);
     expect(hasTool(createOpenClawTools({ clientCaps: ["ui-commands"] }), "screen")).toBe(true);
+  });
+
+  it("retains the requesting browser through coding tool assembly", async () => {
+    const gatewayUiCommandTarget = { connId: "requester-tab", profileId: "requester" };
+    const targets: unknown[] = [];
+    const call = vi
+      .spyOn(inProcessGateway, "callInProcessGatewayTool")
+      .mockImplementation(async () => {
+        targets.push(getGatewayToolCallerIdentity()?.gatewayUiCommandTarget);
+        return { ok: true } as never;
+      });
+    try {
+      const tools = createOpenClawCodingTools({
+        config: withDefaultRoster(undefined),
+        sessionKey: "agent:main:main",
+        clientCaps: ["ui-commands"],
+        gatewayUiCommandTarget,
+      });
+      await expectToolNamed(tools, "screen").execute("select", {
+        action: "navigate",
+        sessionKey: "agent:main:other",
+      });
+      expect(targets).toEqual([gatewayUiCommandTarget]);
+    } finally {
+      call.mockRestore();
+    }
+  });
+
+  it("exposes GitHub publication only from a prepared session capability", () => {
+    expect(hasTool(createOpenClawTools(), "github_publish")).toBe(false);
+    expect(hasTool(createOpenClawTools(), "github_identity_status")).toBe(false);
+    expect(
+      hasTool(createOpenClawTools({ githubPublicationAvailable: false }), "github_publish"),
+    ).toBe(false);
+    expect(
+      hasTool(createOpenClawTools({ githubPublicationAvailable: false }), "github_identity_status"),
+    ).toBe(true);
+    expect(
+      hasTool(createOpenClawTools({ githubPublicationAvailable: true }), "github_publish"),
+    ).toBe(true);
   });
 
   it("omits host UI runtime tools for sandboxed agents", () => {

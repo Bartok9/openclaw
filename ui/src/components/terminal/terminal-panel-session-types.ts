@@ -4,6 +4,7 @@ import type {
   GhosttyTerminalController,
 } from "@openclaw/libterminal/browser";
 import type { ReactiveControllerHost } from "lit";
+import { parseCatalogSessionKey } from "../../lib/sessions/catalog-key.ts";
 import type { TerminalGatewayClient } from "./terminal-connection.ts";
 import type { TerminalPanelTab } from "./terminal-panel-tabs.ts";
 import type { TerminalPanelUploadController } from "./terminal-panel-upload.ts";
@@ -18,14 +19,23 @@ export type TerminalPanelSessionTab = TerminalPanelTab &
     controller: GhosttyTerminalController;
     shell: string;
     host: HTMLDivElement;
+    pendingOpen?: TerminalPanelOpenAction;
+    /** Retires only the queued intent that booted this placeholder. */
+    cancelPendingIntent?: () => void;
     /** Why an in-flight open/attach must not adopt this disposed terminal. */
     cancelled?: "close" | "lifecycle";
   };
+
+export type TerminalRouteTarget =
+  | { sessionId: string }
+  | { catalog: TerminalPanelCatalogReference }
+  | null;
 
 export type TerminalOperation = {
   generation: number;
   client: TerminalGatewayClient;
   signal: AbortSignal;
+  cancelIntent?: () => void;
 };
 
 export type TerminalPanelCatalogReference = {
@@ -34,6 +44,14 @@ export type TerminalPanelCatalogReference = {
   threadId: string;
 };
 
+export function resolveTerminalPanelOwnerSessionKey(
+  sessionKey: string | null,
+  catalog?: TerminalPanelCatalogReference,
+): string | undefined {
+  const key = sessionKey?.trim();
+  return !catalog && key && !parseCatalogSessionKey(key) ? key : undefined;
+}
+
 /** Explicit terminal work retained until it either runs or reports a visible failure. */
 export type TerminalPanelAction =
   | { kind: "restore"; agentId: string | null }
@@ -41,28 +59,34 @@ export type TerminalPanelAction =
   | { kind: "catalog"; agentId: string | null; catalog: TerminalPanelCatalogReference }
   | { kind: "attach"; sessionId: string; agentOwned: boolean };
 
+export type TerminalPanelOpenAction = Extract<TerminalPanelAction, { kind: "catalog" | "open" }>;
+
+export type TerminalPanelError = { text: string; retryAction?: TerminalPanelOpenAction };
+
 export type TerminalPanelSessionControllerState = {
   tabs: TerminalPanelSessionTab[];
   activeId: string | null;
   booting: boolean;
+  error: TerminalPanelError | null;
 };
 
 export interface TerminalPanelSessionControllerHost extends ReactiveControllerHost {
   readonly isConnected: boolean;
   readonly client: TerminalGatewayClient | null;
   readonly agentId: string | null;
+  readonly sessionKey: string | null;
   readonly available: boolean;
   readonly themeMode: "dark" | "light";
   readonly fullscreen: boolean;
+  readonly page: boolean;
+  readonly routeTarget: TerminalRouteTarget;
   readonly terminalPanelOpen: boolean;
   readonly catalogReadyTimeoutMs: number;
-  terminalPanelErrorText: string | null;
   readonly terminalPanelUploadController: TerminalPanelUploadController;
   createTerminalController(
     options: CreateGhosttyTerminalOptions,
   ): Promise<GhosttyTerminalController>;
   closeTerminalPanel(): void;
-  clearTerminalPanelResizeListeners(): void;
   findTerminalPanelViewport(): Element | null;
   hideTerminalPanelForUnavailableSurface(): void;
   resetTerminalSessionPicker(): void;

@@ -3,6 +3,7 @@
  * plugin-owned apps can be exposed to a native Codex thread.
  */
 import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { findCodexAppById } from "./app-identity.js";
 import type {
   CodexAppInventoryCache,
   CodexAppInventoryCacheRead,
@@ -66,6 +67,8 @@ export type CodexPluginOwnedApp = {
   accessible: boolean;
   enabled: boolean;
   needsAuth: boolean;
+  /** Current non-read-only tool keys; absent when Codex omits tool metadata. */
+  approvalOverrideToolConfigKeys?: readonly string[];
 };
 
 /** Inventory record for one configured Codex plugin policy. */
@@ -247,7 +250,7 @@ export async function readCodexPluginInventory(
         (unavailableByMarketplacePolicy || !summary.installed || !summary.enabled),
       authRequired: apps.some((app) => app.needsAuth || !app.accessible),
       appOwnership,
-      ownedAppIds,
+      ownedAppIds: Array.from(new Set([...ownedAppIds, ...apps.map((app) => app.id)])).toSorted(),
       apps,
     });
   }
@@ -506,12 +509,10 @@ function resolveOwnedApps(params: {
     });
     return [];
   }
-  const appInfoById = new Map(
-    (params.appInventory?.snapshot?.apps ?? []).map((app) => [app.id, app] as const),
-  );
+  const appInfos = params.appInventory?.snapshot?.apps ?? [];
   return detailApps
     .map((app) => {
-      const info = appInfoById.get(app.id);
+      const info = findCodexAppById(appInfos, app.id);
       if (!info) {
         return {
           id: app.id,
@@ -521,17 +522,56 @@ function resolveOwnedApps(params: {
           needsAuth: true,
         };
       }
-      return {
-        id: app.id,
-        name: app.name,
-        accessible: info.isAccessible,
-        enabled: info.isEnabled,
-        // Modern plugin summaries carry no auth bit; account-authorized
-        // app/read metadata is the canonical connector access proof.
-        needsAuth: !info.isAccessible,
-      };
+      return Object.assign(
+        {
+          id: info.id,
+          name: app.name,
+          accessible: info.isAccessible,
+          enabled: info.isEnabled,
+          // Modern plugin summaries carry no auth bit; account-authorized
+          // app/read metadata is the canonical connector access proof.
+          needsAuth: !info.isAccessible,
+        },
+        resolveOwnedAppApprovalOverrideKeys(info),
+      );
     })
     .toSorted((left, right) => left.id.localeCompare(right.id));
+}
+
+/** Returns current tool keys whose overrides could bypass the requested reviewer. */
+export function resolveOwnedAppApprovalOverrideKeys(
+  app: v2.AppInfo,
+): Pick<CodexPluginOwnedApp, "approvalOverrideToolConfigKeys"> {
+  if (!app.toolSummaries) {
+    return {};
+  }
+  const appName = app.name.trim();
+  const appNameLower = appName.toLowerCase();
+  // Agents: app/read includes disabled tools. Keep every non-read-only alias,
+  // including collisions with read-only titles; retired names cannot authorize
+  // a current tool and must not prevent the entire app from being admitted.
+  const keys = app.toolSummaries
+    .filter((tool) => !tool.isReadOnly)
+    .flatMap((tool) => resolveAppToolConfigKeys({ appName, appNameLower, tool }));
+  return { approvalOverrideToolConfigKeys: Array.from(new Set(keys)).toSorted() };
+}
+
+function resolveAppToolConfigKeys(params: {
+  appName: string;
+  appNameLower: string;
+  tool: { name: string; title?: string | null };
+}): string[] {
+  const keys = [params.tool.name];
+  if (params.tool.title) {
+    keys.push(params.tool.title);
+  }
+  if (params.appName) {
+    keys.push(`${params.appName}_${params.tool.name}`);
+  }
+  if (params.appNameLower && params.appNameLower !== params.appName) {
+    keys.push(`${params.appNameLower}_${params.tool.name}`);
+  }
+  return keys;
 }
 
 function findPluginSummary(

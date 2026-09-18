@@ -155,9 +155,14 @@ test("webchat session mutations follow operator scope policy", async () => {
       missingScope: "operator.admin",
     },
     {
+      method: "sessions.dispatch",
+      params: { key: "agent:main:main", deviceId: "device-1" },
+      missingScope: "operator.write",
+    },
+    {
       method: "sessions.reclaim",
       params: { key: "agent:main:main" },
-      missingScope: "operator.admin",
+      missingScope: "operator.write",
     },
     {
       method: "sessions.move",
@@ -166,7 +171,7 @@ test("webchat session mutations follow operator scope policy", async () => {
         expected: { generation: 1, environmentId: "environment-1", ownerEpoch: 1 },
         target: { kind: "gateway" },
       },
-      missingScope: "operator.admin",
+      missingScope: "operator.write",
     },
     {
       method: "sessions.pluginPatch",
@@ -378,7 +383,8 @@ test("session:patch hook mutations cannot change the response path", async () =>
   expect(patched.payload?.resolved).toEqual({
     modelProvider: "anthropic",
     model: "claude-opus-4-6",
-    agentRuntime: { id: "auto", source: "implicit" },
+    agentRuntime: { id: "openclaw", source: "implicit" },
+    runtimeSelectionLocked: false,
   });
   expect(patched.payload?.entry.label).toBe("cfg-isolation");
 

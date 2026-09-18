@@ -36,6 +36,7 @@ describe("Codex app inventory cache", () => {
     expect(request).toHaveBeenNthCalledWith(1, "app/installed", { forceRefresh: true });
     expect(request).toHaveBeenNthCalledWith(2, "app/read", {
       appIds: ["app-1", "app-2"],
+      includeTools: true,
     });
 
     const fresh = cache.read({ key, request, nowMs: 50 });
@@ -82,7 +83,30 @@ describe("Codex app inventory cache", () => {
     expect(request).toHaveBeenNthCalledWith(1, "app/installed", { forceRefresh: true });
     expect(request).toHaveBeenNthCalledWith(2, "app/read", {
       appIds: ["google-calendar-app"],
+      includeTools: true,
     });
+  });
+
+  it("refreshes and removes legacy runtime rows targeted by their Apps SDK identity", async () => {
+    const manifestId = "asdk_app_0123456789abcdef0123456789abcdef";
+    const runtimeId = "connector_0123456789abcdef0123456789abcdef";
+    const cache = new CodexAppInventoryCache();
+    let apps = [app(runtimeId), app("unrelated")];
+    const request = vi.fn(async (method, params) =>
+      codexAppInventoryResponse(method, apps, params),
+    );
+    await cache.refreshNow({ key: "runtime", request });
+    cache.invalidate("runtime", "connector changed", Date.now(), [runtimeId]);
+    await cache.refreshNow({ key: "runtime", request, targetAppIds: [manifestId] });
+    expect(cache.read({ key: "runtime", request, suppressRefresh: true })).toMatchObject({
+      state: "fresh",
+      snapshot: { apps },
+    });
+    apps = [app("unrelated")];
+    await cache.refreshNow({ key: "runtime", request, targetAppIds: [manifestId] });
+    expect(cache.read({ key: "runtime", request, suppressRefresh: true }).snapshot?.apps).toEqual(
+      apps,
+    );
   });
 
   it("upgrades an in-flight targeted refresh before returning the complete account inventory", async () => {
@@ -123,8 +147,8 @@ describe("Codex app inventory cache", () => {
       ["app/installed", { forceRefresh: false }],
     ]);
     expect(request.mock.calls.filter(([method]) => method === "app/read")).toEqual([
-      ["app/read", { appIds: ["google-calendar-app"] }],
-      ["app/read", { appIds: ["google-calendar-app", "unrelated-slack-app"] }],
+      ["app/read", { appIds: ["google-calendar-app"], includeTools: true }],
+      ["app/read", { appIds: ["google-calendar-app", "unrelated-slack-app"], includeTools: true }],
     ]);
   });
 
@@ -184,12 +208,15 @@ describe("Codex app inventory cache", () => {
     expect(request).toHaveBeenCalledTimes(4);
     expect(request).toHaveBeenNthCalledWith(2, "app/read", {
       appIds: apps.slice(0, 100).map((entry) => entry.id),
+      includeTools: true,
     });
     expect(request).toHaveBeenNthCalledWith(3, "app/read", {
       appIds: apps.slice(100, 200).map((entry) => entry.id),
+      includeTools: true,
     });
     expect(request).toHaveBeenNthCalledWith(4, "app/read", {
       appIds: apps.slice(200).map((entry) => entry.id),
+      includeTools: true,
     });
   });
 
@@ -221,6 +248,7 @@ describe("Codex app inventory cache", () => {
     expect(snapshot.apps).toEqual([]);
     expect(request).toHaveBeenNthCalledWith(2, "app/read", {
       appIds: ["policy-disabled-app"],
+      includeTools: true,
     });
   });
 
@@ -420,7 +448,10 @@ describe("Codex app inventory cache", () => {
 
     await expect(cache.refreshNow({ key: "runtime", request })).rejects.toThrow("Method not found");
     expect(request).toHaveBeenNthCalledWith(1, "app/installed", { forceRefresh: true });
-    expect(request).toHaveBeenNthCalledWith(2, "app/read", { appIds: ["current-app"] });
+    expect(request).toHaveBeenNthCalledWith(2, "app/read", {
+      appIds: ["current-app"],
+      includeTools: true,
+    });
     expect(cache.read({ key: "runtime", request, suppressRefresh: true }).snapshot).toBeUndefined();
   });
 

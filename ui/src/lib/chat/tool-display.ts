@@ -3,13 +3,12 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import SHARED_TOOL_DISPLAY_JSON from "../../../../apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json" with { type: "json" };
 import {
   defaultTitle,
-  formatToolDetailText,
   normalizeToolDisplayName,
   resolveToolVerbAndDetailForArgs,
   type ToolDisplaySpec as ToolDisplaySpecBase,
 } from "../../../../src/agents/tool-display-common.js";
 import type { ToolDetailMode } from "../../../../src/agents/tool-display-exec.js";
-import type { ControlUiEmbedSandboxMode } from "../../../../src/gateway/control-ui-contract.js";
+import type { ControlUiEmbedSandboxMode } from "../../../../src/gateway/control-ui-bootstrap-contract.js";
 
 const A2UI_PATH = "/__openclaw__/a2ui";
 const CANVAS_HOST_PATH = "/__openclaw__/canvas";
@@ -145,7 +144,7 @@ export function resolveToolDisplay(params: {
 }
 
 export function formatToolDetail(display: ToolDisplay): string | undefined {
-  return formatToolDetailText(display.detail, { prefixWithWith: true });
+  return display.detail ? `with ${display.detail}` : undefined;
 }
 
 function isCanvasHttpPath(pathname: string): boolean {

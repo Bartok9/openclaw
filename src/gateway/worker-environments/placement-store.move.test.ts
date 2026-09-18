@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { sessionChanges } from "../../sessions/session-row-changes.js";
+import { OPENCLAW_STATE_SCHEMA_VERSION } from "../../state/openclaw-state-db-contract.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -13,6 +15,7 @@ import {
   createWorkerSessionPlacementStore,
   type WorkerSessionPlacementStore,
 } from "./placement-store.js";
+import { seedAttachedPlacementEnvironment } from "./placement-test-fixtures.js";
 
 const SESSION: WorkerSessionPlacementIdentity = {
   sessionId: "session-move",
@@ -64,6 +67,11 @@ describe("worker session placement moves", () => {
         remoteWorkspaceDir: "/workspace/move",
       },
     });
+    seedAttachedPlacementEnvironment(database, {
+      environmentId: "environment-move",
+      sessionId: SESSION.sessionId,
+      ownerEpoch: 7,
+    });
     const active = store.transition({
       sessionId: SESSION.sessionId,
       from: "starting",
@@ -83,24 +91,7 @@ describe("worker session placement moves", () => {
     ownerEpoch: number;
     profileId?: string;
   }): void {
-    database.db
-      .prepare(
-        `INSERT INTO worker_environments (
-          environment_id, provider_id, profile_id, profile_snapshot_json,
-          provision_operation_id, lease_id, state, owner_epoch,
-          attached_session_ids_json, created_at_ms, updated_at_ms, state_changed_at_ms
-        ) VALUES (?, 'test', ?, '{}', ?, 'lease-test', 'attached', ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.environmentId,
-        input.profileId ?? "profile-source",
-        `provision:${input.environmentId}`,
-        input.ownerEpoch,
-        JSON.stringify([input.sessionId]),
-        nowMs,
-        nowMs,
-        nowMs,
-      );
+    seedAttachedPlacementEnvironment(database, input);
   }
 
   it("lazily begins one exact-source move in the drain transaction", () => {
@@ -146,6 +137,7 @@ describe("worker session placement moves", () => {
         sessionId: SESSION.sessionId,
         source,
         target: { kind: "gateway" },
+        abandonSource: false,
         lastError: null,
       },
       placement: {
@@ -155,7 +147,9 @@ describe("worker session placement moves", () => {
       },
     });
     expect(begun.intent.operationId).toMatch(/^move:v1:[A-Za-z0-9_-]{43}$/u);
-    expect(database.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: 9 });
+    expect(database.db.prepare("PRAGMA user_version").get()).toEqual({
+      user_version: OPENCLAW_STATE_SCHEMA_VERSION,
+    });
     expect(store.getPlacementMove(SESSION.sessionId)).toEqual(begun.intent);
     expect(store.getPlacementMoves([SESSION.sessionId, "missing"])).toEqual(
       new Map([[SESSION.sessionId, begun.intent]]),
@@ -175,74 +169,249 @@ describe("worker session placement moves", () => {
         target: { kind: "profile", profileId: "other-profile" },
       }),
     ).toThrow("already has a conflicting placement move");
-  });
-
-  it("persists a profile machine class and joins only the exact target", () => {
-    const active = advanceToActive();
-    seedAttachedEnvironment({
-      environmentId: active.environmentId,
-      sessionId: active.sessionId,
-      ownerEpoch: active.activeOwnerEpoch,
-    });
-    const source = {
-      generation: active.generation,
-      environmentId: active.environmentId,
-      ownerEpoch: active.activeOwnerEpoch,
-    };
-    const target = {
-      kind: "profile",
-      profileId: "profile-destination",
-      machineClass: "beast",
-    } as const;
-    const begun = store.beginPlacementMove({
-      sessionId: SESSION.sessionId,
-      source,
-      target: { ...target, machineClass: " beast " },
-    });
-
-    expect(store.getPlacementMove(SESSION.sessionId)).toMatchObject({ target });
-    expect(
-      store.beginPlacementMove({ sessionId: SESSION.sessionId, source, target }),
-    ).toMatchObject({ joined: true, intent: { operationId: begun.intent.operationId, target } });
     expect(() =>
       store.beginPlacementMove({
         sessionId: SESSION.sessionId,
         source,
-        target: { ...target, machineClass: "fast" },
+        target: { kind: "gateway" },
+        abandonSource: true,
       }),
     ).toThrow("already has a conflicting placement move");
   });
 
-  it("rejects a machine class stored for a non-profile target", () => {
+  it("persists explicit abandonment and atomically completes its exact failed source", () => {
     const active = advanceToActive();
     seedAttachedEnvironment({
       environmentId: active.environmentId,
       sessionId: active.sessionId,
       ownerEpoch: active.activeOwnerEpoch,
     });
-    store.beginPlacementMove({
-      sessionId: SESSION.sessionId,
+    const begun = store.beginPlacementMove({
+      sessionId: active.sessionId,
       source: {
         generation: active.generation,
         environmentId: active.environmentId,
         ownerEpoch: active.activeOwnerEpoch,
       },
       target: { kind: "gateway" },
+      abandonSource: true,
     });
-    database.db
-      .prepare(
-        "UPDATE worker_session_placement_moves SET target_machine_class = 'beast' WHERE session_id = ?",
-      )
-      .run(SESSION.sessionId);
+    expect(store.getPlacementMove(active.sessionId)).toMatchObject({ abandonSource: true });
+    const reconciling = store.startReconcile({
+      sessionId: active.sessionId,
+      environmentId: active.environmentId,
+      ownerEpoch: active.activeOwnerEpoch,
+      expectedGeneration: begun.placement.generation,
+    });
+    const recoveryError = "Worker result abandoned by forced operator teardown";
+    const failed = store.fail({
+      sessionId: active.sessionId,
+      expectedGeneration: reconciling.generation,
+      recoveryError,
+    });
+    expect(() =>
+      store.completeAbandonedPlacementMoveSourceToLocal({
+        operationId: begun.intent.operationId,
+        sessionId: active.sessionId,
+        expectedGeneration: failed.generation,
+        expectedRecoveryError: "different abandonment",
+      }),
+    ).toThrow("Cannot complete stale abandoned placement move");
 
-    expect(() => store.getPlacementMove(SESSION.sessionId)).toThrow(
-      "Invalid worker placement move target: gateway",
-    );
+    expect(
+      store.completeAbandonedPlacementMoveSourceToLocal({
+        operationId: begun.intent.operationId,
+        sessionId: active.sessionId,
+        expectedGeneration: failed.generation,
+        expectedRecoveryError: recoveryError,
+      }),
+    ).toMatchObject({ state: "local", generation: failed.generation + 1 });
+    expect(store.getPlacementMove(active.sessionId)).toBeUndefined();
   });
+
+  it("permits draining an active placement with a pending workspace result when abandoning source", () => {
+    const active = advanceToActive();
+    seedAttachedEnvironment({
+      environmentId: active.environmentId,
+      sessionId: active.sessionId,
+      ownerEpoch: active.activeOwnerEpoch,
+    });
+    const claim = store.claimTurn({
+      ...SESSION,
+      owner: {
+        kind: "worker",
+        environmentId: active.environmentId,
+        ownerEpoch: active.activeOwnerEpoch,
+      },
+      claimId: "pending-claim",
+      runId: "pending-run",
+    });
+    store.markWorkspaceResultPending(claim);
+    expect(store.listPendingWorkspaceResults()).toHaveLength(1);
+
+    const source = {
+      generation: active.generation,
+      environmentId: active.environmentId,
+      ownerEpoch: active.activeOwnerEpoch,
+    };
+
+    expect(() =>
+      store.beginPlacementMove({
+        sessionId: active.sessionId,
+        source,
+        target: { kind: "gateway" },
+      }),
+    ).toThrow(`Cannot drain session ${active.sessionId} with a pending cloud workspace result`);
+
+    const begun = store.beginPlacementMove({
+      sessionId: active.sessionId,
+      source,
+      target: { kind: "gateway" },
+      abandonSource: true,
+    });
+
+    expect(begun).toMatchObject({
+      joined: false,
+      placement: { state: "draining" },
+      intent: { abandonSource: true },
+    });
+    expect(store.getPlacementMove(active.sessionId)).toMatchObject({ abandonSource: true });
+  });
+
+  it.each([undefined, "os-a"])(
+    "persists profile choices with OS %s and joins only the exact target",
+    (targetOs) => {
+      const active = advanceToActive();
+      seedAttachedEnvironment({
+        environmentId: active.environmentId,
+        sessionId: active.sessionId,
+        ownerEpoch: active.activeOwnerEpoch,
+      });
+      const source = {
+        generation: active.generation,
+        environmentId: active.environmentId,
+        ownerEpoch: active.activeOwnerEpoch,
+      };
+      const target = {
+        kind: "profile",
+        profileId: "profile-destination",
+        machineClass: "beast",
+        ...(targetOs ? { os: targetOs } : {}),
+      } as const;
+      const begun = store.beginPlacementMove({
+        sessionId: SESSION.sessionId,
+        source,
+        target: {
+          ...target,
+          machineClass: " beast ",
+          ...(targetOs ? { os: ` ${targetOs} ` } : {}),
+        },
+      });
+
+      expect(store.getPlacementMove(SESSION.sessionId)).toMatchObject({ target });
+      expect(
+        database.db
+          .prepare("SELECT target_os FROM worker_session_placement_moves WHERE session_id = ?")
+          .get(SESSION.sessionId),
+      ).toEqual({ target_os: targetOs ?? null });
+      if (targetOs === undefined) {
+        expect(store.getPlacementMove(SESSION.sessionId)?.target).not.toHaveProperty("os");
+      }
+      expect(
+        store.beginPlacementMove({ sessionId: SESSION.sessionId, source, target }),
+      ).toMatchObject({ joined: true, intent: { operationId: begun.intent.operationId, target } });
+      expect(() =>
+        store.beginPlacementMove({
+          sessionId: SESSION.sessionId,
+          source,
+          target: { ...target, machineClass: "fast" },
+        }),
+      ).toThrow("already has a conflicting placement move");
+      expect(() =>
+        store.beginPlacementMove({
+          sessionId: SESSION.sessionId,
+          source,
+          target: { ...target, os: "os-b" },
+        }),
+      ).toThrow("already has a conflicting placement move");
+    },
+  );
+
+  it.each(["target_machine_class", "target_os"])(
+    "rejects %s stored for a non-profile target",
+    (column) => {
+      const active = advanceToActive();
+      seedAttachedEnvironment({
+        environmentId: active.environmentId,
+        sessionId: active.sessionId,
+        ownerEpoch: active.activeOwnerEpoch,
+      });
+      store.beginPlacementMove({
+        sessionId: SESSION.sessionId,
+        source: {
+          generation: active.generation,
+          environmentId: active.environmentId,
+          ownerEpoch: active.activeOwnerEpoch,
+        },
+        target: { kind: "gateway" },
+      });
+      database.db
+        .prepare(
+          `UPDATE worker_session_placement_moves SET ${column} = 'override' WHERE session_id = ?`,
+        )
+        .run(SESSION.sessionId);
+
+      expect(() => store.getPlacementMove(SESSION.sessionId)).toThrow(
+        "Invalid worker placement move target: gateway",
+      );
+    },
+  );
+
+  it.each([{ kind: "gateway" }, { kind: "device", deviceId: "device-1" }] as const)(
+    "rejects OS on a $kind move before creating storage",
+    (target) => {
+      const invalidTarget = { ...target, os: "os-a" };
+      database.db.exec("DROP TABLE worker_session_placement_moves");
+      expect(() =>
+        store.beginPlacementMove({
+          sessionId: SESSION.sessionId,
+          source: { generation: 1, environmentId: "source", ownerEpoch: 1 },
+          target: invalidTarget,
+        }),
+      ).toThrow("operating system requires a profile target");
+      expect(
+        database.db
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'worker_session_placement_moves'")
+          .get(),
+      ).toBeUndefined();
+    },
+  );
+
+  it.each(["", " ", "a".repeat(65)])(
+    "rejects an invalid move OS %j before creating storage",
+    (targetOs) => {
+      database.db.exec("DROP TABLE worker_session_placement_moves");
+      expect(() =>
+        store.beginPlacementMove({
+          sessionId: SESSION.sessionId,
+          source: { generation: 1, environmentId: "source", ownerEpoch: 1 },
+          target: { kind: "profile", profileId: "cloud", os: targetOs },
+        }),
+      ).toThrow(/move operating system/u);
+      expect(
+        database.db
+          .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'worker_session_placement_moves'")
+          .get(),
+      ).toBeUndefined();
+    },
+  );
 
   it("keeps invalid move attempts from creating optional storage", () => {
     database.db.exec("DROP TABLE worker_session_placement_moves");
     const active = advanceToActive();
+    database.db
+      .prepare("DELETE FROM worker_environments WHERE environment_id = ?")
+      .run(active.environmentId);
 
     expect(() =>
       store.beginPlacementMove({
@@ -283,6 +452,14 @@ describe("worker session placement moves", () => {
       target: { kind: "gateway" },
     });
 
+    const observed: Array<string | null | undefined> = [];
+    onTestFinished(
+      sessionChanges.subscribe((change) => {
+        if ("all" in change && change.scope === "worker-placements") {
+          observed.push(store.getPlacementMove(SESSION.sessionId)?.lastError);
+        }
+      }),
+    );
     expect(
       store.recordPlacementMoveError({
         operationId: "move:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -290,6 +467,7 @@ describe("worker session placement moves", () => {
         error: "stale move failed",
       }),
     ).toBe(false);
+    expect(observed).toEqual([]);
     expect(
       store.recordPlacementMoveError({
         operationId: begun.intent.operationId,
@@ -300,6 +478,7 @@ describe("worker session placement moves", () => {
     expect(store.getPlacementMove(SESSION.sessionId)?.lastError).toBe(
       "workspace reconciliation is waiting",
     );
+    expect(observed).toEqual(["workspace reconciliation is waiting"]);
 
     const reconciling = store.startReconcile({
       sessionId: SESSION.sessionId,
@@ -323,6 +502,7 @@ describe("worker session placement moves", () => {
       }),
     ).toMatchObject({ state: "local", generation: reconciling.generation + 1 });
     expect(store.getPlacementMove(SESSION.sessionId)).toBeUndefined();
+    expect(observed).toEqual(["workspace reconciliation is waiting", undefined]);
   });
 
   it("completes a worker move only against the exact attached destination", () => {
@@ -339,7 +519,12 @@ describe("worker session placement moves", () => {
         environmentId: source.environmentId,
         ownerEpoch: source.activeOwnerEpoch,
       },
-      target: { kind: "profile", profileId: "profile-destination", machineClass: "beast" },
+      target: {
+        kind: "profile",
+        profileId: "profile-destination",
+        machineClass: "beast",
+        os: "os-a",
+      },
     });
     const reconciling = store.startReconcile({
       sessionId: SESSION.sessionId,
@@ -385,7 +570,117 @@ describe("worker session placement moves", () => {
     expect(store.getPlacementMove(SESSION.sessionId)).toBeUndefined();
   });
 
-  it("restart-recovers a profile move with its persisted machine class", async () => {
+  it("completes a persisted abandonment only after a later sweep makes its placement local", async () => {
+    const active = advanceToActive();
+    seedAttachedEnvironment({
+      environmentId: active.environmentId,
+      sessionId: active.sessionId,
+      ownerEpoch: active.activeOwnerEpoch,
+    });
+    const begun = store.beginPlacementMove({
+      sessionId: active.sessionId,
+      source: {
+        generation: active.generation,
+        environmentId: active.environmentId,
+        ownerEpoch: active.activeOwnerEpoch,
+      },
+      target: { kind: "gateway" },
+      abandonSource: true,
+    });
+    const reconciling = store.startReconcile({
+      sessionId: active.sessionId,
+      environmentId: active.environmentId,
+      ownerEpoch: active.activeOwnerEpoch,
+      expectedGeneration: begun.placement.generation,
+    });
+    const recoveryError = "Worker result abandoned by forced operator teardown";
+    const failed = store.fail({
+      sessionId: active.sessionId,
+      expectedGeneration: reconciling.generation,
+      recoveryError,
+    });
+    const abandonSource = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("device teardown is still pending"))
+      .mockImplementationOnce(async () =>
+        store.completeAbandonedPlacementMoveSourceToLocal({
+          operationId: begun.intent.operationId,
+          sessionId: active.sessionId,
+          expectedGeneration: failed.generation,
+          expectedRecoveryError: recoveryError,
+        }),
+      );
+    const moves = createWorkerPlacementMoveService({
+      placements: store,
+      environments: { get: () => undefined },
+      runMoveBarrier: async ({ begin }) => begin(),
+      dispatch: vi.fn(),
+      reclaimSource: vi.fn(),
+      validateAbandonSource: vi.fn(),
+      abandonSource,
+      resolveDestination: vi.fn(),
+    });
+
+    await moves.recoverAll();
+
+    expect(store.get(active.sessionId)).toEqual(failed);
+    expect(store.getPlacementMove(active.sessionId)?.lastError).toBe(
+      "device teardown is still pending",
+    );
+    await moves.recoverAll();
+
+    expect(store.get(active.sessionId)).toMatchObject({
+      sessionId: active.sessionId,
+      state: "local",
+      generation: failed.generation + 1,
+    });
+    expect(store.getPlacementMove(active.sessionId)).toBeUndefined();
+    expect(abandonSource).toHaveBeenCalledTimes(2);
+  });
+
+  it("completes an ordinary reconciled move with one durable Gateway placement", async () => {
+    const active = advanceToActive();
+    seedAttachedEnvironment({
+      environmentId: active.environmentId,
+      sessionId: active.sessionId,
+      ownerEpoch: active.activeOwnerEpoch,
+    });
+    const begun = store.beginPlacementMove({
+      sessionId: active.sessionId,
+      source: {
+        generation: active.generation,
+        environmentId: active.environmentId,
+        ownerEpoch: active.activeOwnerEpoch,
+      },
+      target: { kind: "gateway" },
+    });
+    const reconciling = store.startReconcile({
+      sessionId: active.sessionId,
+      environmentId: active.environmentId,
+      ownerEpoch: active.activeOwnerEpoch,
+      expectedGeneration: begun.placement.generation,
+    });
+    const moves = createWorkerPlacementMoveService({
+      placements: store,
+      environments: { get: () => undefined },
+      runMoveBarrier: async ({ begin }) => begin(),
+      dispatch: vi.fn(),
+      reclaimSource: vi.fn(),
+      validateAbandonSource: vi.fn(),
+      abandonSource: vi.fn(),
+      resolveDestination: vi.fn(),
+    });
+
+    await moves.recoverAll();
+
+    const recovered = store.get(active.sessionId);
+    expect(recovered).toMatchObject({ state: "local", generation: reconciling.generation + 1 });
+    expect(store.getPlacementMove(active.sessionId)).toBeUndefined();
+    await moves.recoverAll();
+    expect(store.get(active.sessionId)).toEqual(recovered);
+  });
+
+  it("fails a pending profile move after restart loses request authority", async () => {
     const source = advanceToActive();
     seedAttachedEnvironment({
       environmentId: source.environmentId,
@@ -399,7 +694,12 @@ describe("worker session placement moves", () => {
         environmentId: source.environmentId,
         ownerEpoch: source.activeOwnerEpoch,
       },
-      target: { kind: "profile", profileId: "profile-destination", machineClass: "beast" },
+      target: {
+        kind: "profile",
+        profileId: "profile-destination",
+        machineClass: "beast",
+        os: "os-a",
+      },
     });
     const reconciling = store.startReconcile({
       sessionId: source.sessionId,
@@ -412,23 +712,7 @@ describe("worker session placement moves", () => {
       sessionId: source.sessionId,
       expectedGeneration: reconciling.generation,
     });
-    const requested = store.startDispatch(SESSION);
-    const provisioning = store.transition({
-      sessionId: source.sessionId,
-      from: "requested",
-      to: "provisioning",
-      expectedGeneration: requested.generation,
-      patch: { environmentId: "missing-destination-environment" },
-    });
-    store.fail({
-      sessionId: source.sessionId,
-      expectedGeneration: provisioning.generation,
-      recoveryError: "destination provisioning failed",
-    });
-    const dispatchError = new Error("destination retry reached dispatch");
-    const dispatch = vi.fn(async () => {
-      throw dispatchError;
-    });
+    const dispatch = vi.fn();
     const reclaimSource = vi.fn(async () => {
       throw new Error("failed destination must not reclaim the old source");
     });
@@ -439,6 +723,10 @@ describe("worker session placement moves", () => {
       runMoveBarrier: async ({ begin }) => begin(),
       dispatch,
       reclaimSource,
+      validateAbandonSource: vi.fn(),
+      abandonSource: vi.fn(async () => {
+        throw new Error("unexpected source abandonment");
+      }),
       resolveDestination: async (_identity, target) => {
         if (target.kind !== "profile") {
           throw new Error("expected profile move target");
@@ -447,6 +735,7 @@ describe("worker session placement moves", () => {
           profileId: target.profileId,
           executionMode: "worker-turn",
           machineClass: target.machineClass,
+          os: target.os,
         };
       },
     });
@@ -454,21 +743,13 @@ describe("worker session placement moves", () => {
     await moves.recoverAll();
 
     expect(reclaimSource).not.toHaveBeenCalled();
-    expect(dispatch).toHaveBeenCalledOnce();
-    expect(dispatch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        machineClass: "beast",
-        idempotencyKey: `session-move:${begun.intent.operationId}:dispatch`,
-      }),
-      undefined,
-    );
+    expect(dispatch).not.toHaveBeenCalled();
     expect(restartedStore.get(source.sessionId)).toMatchObject({
-      state: "local",
-      generation: local.generation + 4,
+      state: "failed",
+      generation: local.generation + 1,
+      recoveryError:
+        "Cloud worker move request authority expired after Gateway restart; retry move",
     });
-    expect(restartedStore.getPlacementMove(source.sessionId)).toMatchObject({
-      operationId: begun.intent.operationId,
-      lastError: dispatchError.message,
-    });
+    expect(restartedStore.getPlacementMove(source.sessionId)).toBeUndefined();
   });
 });

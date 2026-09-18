@@ -69,12 +69,55 @@ describe("realtime voice provider resolver", () => {
     });
 
     expect(resolution).toStrictEqual({
+      capabilities: undefined,
       provider: providers[1],
       providerConfig: {
         enabled: true,
         resolved: true,
       },
     });
+  });
+
+  it("skips unavailable providers before resolving auto-selected config", () => {
+    const unavailableResolveConfig = vi.fn(() => {
+      throw new Error("unavailable provider config must not be resolved");
+    });
+    const unavailable: RealtimeVoiceProviderPlugin = {
+      ...providers[0]!,
+      resolveConfig: unavailableResolveConfig,
+      isConfigured: () => true,
+    };
+
+    const resolution = resolveConfiguredRealtimeVoiceProvider({
+      cfg: {},
+      providers: [unavailable, providers[1]!],
+      providerConfigs: {
+        second: { enabled: true },
+      },
+      isProviderAvailable: (provider) => provider.id !== unavailable.id,
+    });
+
+    expect(unavailableResolveConfig).not.toHaveBeenCalled();
+    expect(resolution.provider).toBe(providers[1]);
+  });
+
+  it("preserves the typed availability error when every auto provider is unavailable", () => {
+    class ProviderUnavailableError extends Error {}
+    const unavailable = new ProviderUnavailableError("provider owner is unavailable");
+    const assertProviderAvailable = vi.fn(() => {
+      throw unavailable;
+    });
+
+    expect(() =>
+      resolveConfiguredRealtimeVoiceProvider({
+        cfg: {},
+        providers,
+        isProviderAvailable: () => false,
+        assertProviderAvailable,
+      }),
+    ).toThrow(unavailable);
+    expect(assertProviderAvailable).toHaveBeenCalledOnce();
+    expect(assertProviderAvailable).toHaveBeenCalledWith(providers[0]);
   });
 
   it("passes the host-selected agent to public provider readiness", () => {
@@ -124,6 +167,49 @@ describe("realtime voice provider resolver", () => {
       agentId: "voice-agent",
       cfg: {},
       providerConfig: {},
+    });
+  });
+
+  it.each([
+    { surface: "browser-session", requiredCapabilities: { supportsVideoFrames: true } },
+    { surface: "gateway-relay", autoRespondToAudio: false },
+  ] as const)("normalizes provider config with the $surface session context", (sessionContext) => {
+    const provider: RealtimeVoiceProviderPlugin = {
+      id: "scoped",
+      label: "Scoped voice",
+      resolveConfig: ({
+        rawConfig,
+        agentId,
+        surface,
+        autoRespondToAudio,
+        requiredCapabilities,
+      }) => ({
+        ...rawConfig,
+        model: `${agentId}/${surface}`,
+        autoRespondToAudio,
+        requiredCapabilities,
+      }),
+      isConfigured: ({ providerConfig }) =>
+        providerConfig.model === `voice-agent/${sessionContext.surface}`,
+      createBridge: () => {
+        throw new Error("unused");
+      },
+    };
+
+    const resolution = resolveConfiguredRealtimeVoiceProvider({
+      cfg: {},
+      agentId: "voice-agent",
+      providerConfigs: { scoped: { apiKey: "test-key" } },
+      providers: [provider],
+      ...sessionContext,
+    });
+
+    expect(resolution.providerConfig).toEqual({
+      apiKey: "test-key",
+      model: `voice-agent/${sessionContext.surface}`,
+      autoRespondToAudio: "autoRespondToAudio" in sessionContext ? false : undefined,
+      requiredCapabilities:
+        "requiredCapabilities" in sessionContext ? { supportsVideoFrames: true } : undefined,
     });
   });
 

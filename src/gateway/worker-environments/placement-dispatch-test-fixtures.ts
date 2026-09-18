@@ -1,4 +1,5 @@
 import {
+  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
   WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
   type WorkerAdmissionHandshake,
 } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
@@ -36,19 +37,27 @@ export const REQUEST: WorkerDispatchRequest = {
   executionMode: "worker-turn",
 };
 
+export function seedProvisioningPlacement(
+  store: PlacementStore,
+  environmentId: string,
+  executionMode: WorkerDispatchRequest["executionMode"] = REQUEST.executionMode,
+): WorkerSessionPlacementRecord {
+  const requested = store.startDispatch({ ...REQUEST, executionMode });
+  return store.transition({
+    sessionId: REQUEST.sessionId,
+    from: "requested",
+    to: "provisioning",
+    expectedGeneration: requested.generation,
+    patch: { environmentId },
+  });
+}
+
 export function seedSyncingPlacement(
   store: PlacementStore,
   environmentId: string,
   executionMode: WorkerDispatchRequest["executionMode"] = REQUEST.executionMode,
 ): WorkerSessionPlacementRecord {
-  let current = store.startDispatch({ ...REQUEST, executionMode });
-  current = store.transition({
-    sessionId: REQUEST.sessionId,
-    from: "requested",
-    to: "provisioning",
-    expectedGeneration: current.generation,
-    patch: { environmentId },
-  });
+  let current = seedProvisioningPlacement(store, environmentId, executionMode);
   current = store.transition({
     sessionId: REQUEST.sessionId,
     from: "provisioning",
@@ -104,7 +113,10 @@ export function createDispatchEnvironmentFixtures(generation = 1) {
   const bootstrapReceipt: WorkerAdmissionHandshake = {
     bundleHash: BUNDLE_HASH,
     openclawVersion: "2026.7.2",
-    protocolFeatures: [WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE],
+    protocolFeatures: [
+      WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
+      WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+    ],
   };
   const sshEndpoint: WorkerSshEndpoint = {
     host: "worker.example.test",
@@ -118,7 +130,7 @@ export function createDispatchEnvironmentFixtures(generation = 1) {
     providerId: "fake",
     profileId: "development",
     profileSnapshot,
-    provisionOperationId: "provision-1",
+    provisionOperationId: `provision:${environmentId}`,
     nodeSetupId: null,
     nodeDeviceId: null,
     sharedHost: false,
@@ -129,8 +141,10 @@ export function createDispatchEnvironmentFixtures(generation = 1) {
     updatedAtMs: 1,
     stateChangedAtMs: 1,
     idleSinceAtMs: null,
+    lastActivatedAtMs: null,
+    preparation: null,
     destroyRequestedAtMs: null,
-    leaseId: "lease-1",
+    leaseId: `lease:${environmentId}`,
     sshEndpoint,
     desktop: null,
     desktopAvailable: false,

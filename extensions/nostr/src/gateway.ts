@@ -18,7 +18,7 @@ import {
 } from "openclaw/plugin-sdk/text-chunking";
 import type { PluginRuntime } from "../runtime-api.js";
 import type { ChannelOutboundAdapter, ChannelPlugin } from "./channel-api.js";
-import type { MetricEvent, MetricsSnapshot } from "./metrics.js";
+import type { MetricEvent } from "./metrics.js";
 import { startNostrBus, type NostrBusHandle } from "./nostr-bus.js";
 import { normalizePubkey } from "./nostr-key-utils.js";
 import { getNostrRuntime } from "./runtime.js";
@@ -35,7 +35,6 @@ type NostrOutboundAdapter = Pick<
   sanitizeText: NonNullable<ChannelOutboundAdapter["sanitizeText"]>;
 };
 const activeBuses = new Map<string, NostrBusHandle>();
-const metricsSnapshots = new Map<string, MetricsSnapshot>();
 const ACCESS_GROUP_PREFIX = "accessGroup:";
 
 function normalizeRelayLifecycleKey(relay: string): string {
@@ -135,7 +134,6 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
         : undefined,
     });
 
-  let busHandle: NostrBusHandle | null = null;
   const connectedRelays = new Set<string>();
 
   const authorizeSender = async (input: {
@@ -295,12 +293,8 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
           } else if (event.name === "relay.error") {
             ctx.log?.debug?.(`[${account.accountId}] Relay error: ${event.labels?.relay}`);
           }
-          if (busHandle) {
-            metricsSnapshots.set(account.accountId, busHandle.getMetrics());
-          }
         },
       });
-      busHandle = bus;
       activeBuses.set(account.accountId, bus);
 
       ctx.log?.info?.(
@@ -309,14 +303,11 @@ export const startNostrGatewayAccount: NostrGatewayStart = async (ctx) => {
 
       return {
         stop: async () => {
-          await bus.close();
-          if (busHandle === bus) {
-            busHandle = null;
-          }
+          // Retire before fallible async shutdown so new work cannot reacquire this bus.
           if (activeBuses.get(account.accountId) === bus) {
             activeBuses.delete(account.accountId);
           }
-          metricsSnapshots.delete(account.accountId);
+          await bus.close();
           ctx.log?.info?.(`[${account.accountId}] Nostr provider stopped`);
         },
       };
@@ -368,7 +359,14 @@ export const nostrOutboundAdapter: NostrOutboundAdapter = {
       messageSendingHooks: true,
     },
   },
-  sendText: async ({ cfg, to, text, accountId }) => {
+  sendText: async ({
+    cfg,
+    to,
+    text,
+    accountId,
+    assertDirectAdapterHandoff,
+    onPlatformSendDispatch,
+  }) => {
     const core = getNostrRuntime();
     const aid = accountId ?? resolveDefaultNostrAccountId(cfg);
     const bus = activeBuses.get(aid);
@@ -385,7 +383,10 @@ export const nostrOutboundAdapter: NostrOutboundAdapter = {
       throw new Error("Nostr send requires non-empty text after markdown stripping.");
     }
     const normalizedTo = normalizePubkey(to);
-    const eventId = await bus.sendDm(normalizedTo, message);
+    const eventId = await bus.sendDm(normalizedTo, message, {
+      assertDirectAdapterHandoff,
+      onPlatformSendDispatch,
+    });
     return attachChannelToResult("nostr", {
       to: normalizedTo,
       messageId: eventId,

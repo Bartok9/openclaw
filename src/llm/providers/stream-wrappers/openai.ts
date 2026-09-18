@@ -30,7 +30,10 @@ import {
   type OpenAITextVerbosity,
 } from "../../../agents/openai-text-verbosity.js";
 import { createOpenAIResponsesTransportStreamFn } from "../../../agents/openai-transport-stream.js";
-import { resolveProviderRequestPolicyConfig } from "../../../agents/provider-request-config.js";
+import {
+  getModelProviderRequestRouteFacts,
+  resolveProviderRequestPolicyConfig,
+} from "../../../agents/provider-request-config.js";
 import type { StreamFn } from "../../../agents/runtime/index.js";
 import type { SandboxToolPolicy } from "../../../agents/sandbox.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
@@ -42,12 +45,16 @@ import {
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { streamSimple } from "../../stream.js";
 import type { SimpleStreamOptions } from "../../types.js";
+import {
+  normalizeOpenAIServiceTier,
+  supportsOpenAIResponsesFastMode,
+  type OpenAIServiceTier,
+} from "../openai-fast-mode.js";
 import { mapThinkingLevelToReasoningEffort } from "./reasoning-effort-utils.js";
 import { streamWithPayloadPatch } from "./stream-payload-utils.js";
 
 const log = createSubsystemLogger("llm/providers/stream-wrappers");
 
-type OpenAIServiceTier = "auto" | "default" | "flex" | "priority";
 type DynamicFastMode = boolean | (() => boolean | undefined);
 type OpenClawSimpleStreamOptions = SimpleStreamOptions & {
   openclawCodeModeToolSurface?: boolean;
@@ -88,6 +95,7 @@ function resolveOpenAIRequestCapabilities(model: {
     compat,
     capability: "llm",
     transport: "stream",
+    routeFacts: getModelProviderRequestRouteFacts(model),
   }).capabilities;
 }
 
@@ -276,22 +284,6 @@ function raiseMinimalReasoningForResponsesWebSearchPayload(params: {
   if (nextEffort && nextEffort !== "minimal" && nextEffort !== "none") {
     reasoning.effort = nextEffort;
   }
-}
-
-function normalizeOpenAIServiceTier(value: unknown): OpenAIServiceTier | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const normalized = normalizeOptionalLowercaseString(value);
-  if (
-    normalized === "auto" ||
-    normalized === "default" ||
-    normalized === "flex" ||
-    normalized === "priority"
-  ) {
-    return normalized;
-  }
-  return undefined;
 }
 
 /** @deprecated OpenAI provider-owned stream helper; do not use from third-party plugins. */
@@ -508,13 +500,7 @@ export function createOpenAIFastModeWrapper(
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
-    if (
-      normalizeOpenAIFastMode(enabled) !== true ||
-      (model.api !== "openai-responses" &&
-        model.api !== "openai-chatgpt-responses" &&
-        model.api !== "azure-openai-responses") ||
-      model.provider !== "openai"
-    ) {
+    if (normalizeOpenAIFastMode(enabled) !== true || !supportsOpenAIResponsesFastMode(model)) {
       return underlying(model, context, options);
     }
     const originalOnPayload = options?.onPayload;
@@ -818,6 +804,7 @@ export function createOpenAIAttributionHeadersWrapper(
         baseUrl: readStringValue(model.baseUrl),
         capability: "llm",
         transport: "stream",
+        routeFacts: getModelProviderRequestRouteFacts(model),
         callerHeaders: options?.headers,
         precedence: "defaults-win",
       }).headers,

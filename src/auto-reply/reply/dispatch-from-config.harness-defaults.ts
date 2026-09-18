@@ -1,6 +1,6 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
-import { selectAgentHarness } from "../../agents/harness/selection.js";
+import { resolveAgentHarnessDeliveryDefaults } from "../../agents/harness/selection-decision.js";
 import {
   buildModelAliasIndex,
   resolveDefaultModelForAgent,
@@ -13,6 +13,8 @@ import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { resolveSessionPinnedHarnessId } from "../../sessions/agent-harness-session-key.js";
+import { resolveStoredModelOverride } from "../../sessions/stored-model-overrides.js";
 import {
   sessionDeliveryChannel,
   sessionDeliveryOrigin,
@@ -24,7 +26,7 @@ import {
   loadSessionStoreEntry,
   resolveSessionStorePathCore,
 } from "./dispatch-from-config.runtime.js";
-import { resolveStoredModelOverride } from "./stored-model-override.js";
+import type { ReplyRunVerbosity } from "./get-reply.types.js";
 
 type HarnessSourceVisibleRepliesDefault = "automatic" | "message_tool";
 
@@ -40,6 +42,7 @@ export function createShouldEmitVerboseProgress(params: {
   initialExplicitLevel?: string;
   fallbackLevel: string;
 }) {
+  let runVerbosity: ReplyRunVerbosity | undefined;
   const resolveCurrentExplicitLevel = () => {
     if (params.sessionKey && params.storePath) {
       try {
@@ -57,14 +60,17 @@ export function createShouldEmitVerboseProgress(params: {
     }
     return normalizeVerboseLevel(params.initialExplicitLevel ?? "");
   };
-  const resolveLevel = () => {
-    const explicitLevel = resolveCurrentExplicitLevel();
-    if (explicitLevel) {
-      return explicitLevel;
-    }
-    return normalizeVerboseLevel(params.fallbackLevel) ?? "off";
-  };
+  const resolveLevel = () =>
+    runVerbosity?.verboseLevelOverride ??
+    resolveCurrentExplicitLevel() ??
+    runVerbosity?.resolvedVerboseLevel ??
+    normalizeVerboseLevel(params.fallbackLevel) ??
+    "off";
   return {
+    noteRunVerbosity: (settings: ReplyRunVerbosity) => {
+      // A reused queued dispatcher must clear the previous turn's explicit choice.
+      runVerbosity = settings;
+    },
     shouldEmit: () => resolveLevel() !== "off",
     shouldEmitFull: () => resolveLevel() === "full",
   };
@@ -263,6 +269,7 @@ function resolveHarnessSourceVisibleRepliesDefault(params: {
     });
     const aliasIndex = buildModelAliasIndex({
       cfg: params.cfg,
+      agentId: params.sessionAgentId,
       defaultProvider: defaultModelRef.provider,
     });
     const parentSessionKey = resolveHarnessDefaultParentSessionKey(params);
@@ -294,19 +301,16 @@ function resolveHarnessSourceVisibleRepliesDefault(params: {
         entry: params.entry,
         cfg: params.cfg,
       });
-      const harness = selectAgentHarness({
+      const defaults = resolveAgentHarnessDeliveryDefaults({
         provider: candidate.provider,
         modelId: candidate.model,
         config: params.cfg,
         agentId: params.sessionAgentId,
         sessionKey: params.sessionKey,
-        agentHarnessId:
-          params.entry?.modelSelectionLocked === true ? params.entry.agentHarnessId : undefined,
+        agentHarnessId: resolveSessionPinnedHarnessId(params.entry),
         agentHarnessRuntimeOverride,
       });
-      return (
-        harness.deliveryDefaults?.visibleReplies ?? harness.deliveryDefaults?.sourceVisibleReplies
-      );
+      return defaults?.visibleReplies ?? defaults?.sourceVisibleReplies;
     };
     const selectedModelCandidate =
       turnModelCandidate ?? storedModelCandidate ?? channelModelCandidate;

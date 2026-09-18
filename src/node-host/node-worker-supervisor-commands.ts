@@ -1,12 +1,18 @@
 import type { CloudflareAccessCredentials } from "../../packages/gateway-client/src/cloudflare-access.js";
 import { WORKER_PUBLIC_INGRESS_PATH } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
+import { boundedWorkerErrorWithCode } from "../gateway/worker-environments/worker-error.js";
 import {
   NODE_WORKER_BUNDLE_INSTALL_COMMAND,
   NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE,
+  NODE_WORKER_DESKTOP_LAUNCH_COMMAND,
+  NODE_WORKER_DESKTOP_STREAM_COMMAND,
+  NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
+  NODE_WORKER_PORTAL_STREAM_COMMAND,
   NODE_WORKER_SUPERVISOR_CANCEL_COMMAND,
   NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND,
   NODE_WORKER_SUPERVISOR_STATUS_COMMAND,
   NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+  NODE_WORKER_WORKSPACE_PREPARE_COMMAND,
   NODE_WORKER_WORKSPACE_RETAIN_COMMAND,
 } from "../infra/node-commands.js";
 import {
@@ -15,6 +21,10 @@ import {
   parseNodeWorkerBundleInstallInput,
   type NodeWorkerBundleInstallResult,
 } from "../worker/node-bundle-install-protocol.js";
+import {
+  parseNodeWorkerPreparedWorkspaceInput,
+  type NodeWorkerPreparedWorkspaceResult,
+} from "../worker/node-workspace-prepared-protocol.js";
 import {
   parseNodeWorkerWorkspaceExecInput,
   type NodeWorkerWorkspaceExecResult,
@@ -31,10 +41,13 @@ import {
   parseWorkerConnectionEndpoint,
   type WorkerConnectionEndpoint,
 } from "../worker/worker-connection-endpoint.js";
+import { invokeNodeWorkerDesktopLaunch } from "./desktop-launch-command.js";
+import { invokeNodeWorkerDesktopStream } from "./desktop-stream-command.js";
 import type { NodeWorkerBundleInstallerControl } from "./node-worker-bundle-installer.js";
 import { NodeWorkerCapacityExhaustedError } from "./node-worker-capacity.js";
 import {
   parseNodeWorkerCancelInput,
+  parseNodeWorkerEnvironmentStopInput,
   parseNodeWorkerLaunchInput,
   parseNodeWorkerLookupInput,
   projectNodeWorkerSupervisorReceipt,
@@ -42,6 +55,9 @@ import {
   type NodeWorkerSupervisorReceipt,
 } from "./node-worker-supervisor-contract.js";
 import type { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
+import { invokeNodeWorkerPortalStream } from "./portal-stream-command.js";
+
+const WORKSPACE_TRANSFER_DIAGNOSTIC_MAX_CHARS = 1_024;
 
 type NodeWorkerSupervisorCommandResult =
   | { handled: false }
@@ -52,7 +68,9 @@ type NodeWorkerSupervisorCommandResult =
         | NodeWorkerBundleInstallResult
         | NodeWorkerSupervisorReceipt
         | NodeWorkerWorkspaceExecResult
+        | NodeWorkerPreparedWorkspaceResult
         | NodeWorkerWorkspaceRetainResult
+        | { status: "ready" }
         | null;
     }
   | {
@@ -66,6 +84,17 @@ type NodeWorkerSupervisorCommandResult =
         | typeof NODE_WORKSPACE_TRANSFER_ERROR_CODE;
       message: string;
     };
+
+function workspaceTransferDiagnostic(error: NodeWorkerWorkspaceTransferError): string {
+  if (!error.operation || !error.stage) {
+    return error.message;
+  }
+  const prefix = `workspace-transfer-failed: operation=${error.operation} stage=${error.stage}: `;
+  return `${prefix}${boundedWorkerErrorWithCode(
+    error.cause ?? error,
+    WORKSPACE_TRANSFER_DIAGNOSTIC_MAX_CHARS - prefix.length,
+  )}`;
+}
 
 function resolveWorkerConnectionEndpoint(params: {
   gatewayUrl?: string;
@@ -118,17 +147,24 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
     params.command === NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND ||
     params.command === NODE_WORKER_SUPERVISOR_STATUS_COMMAND ||
     params.command === NODE_WORKER_SUPERVISOR_CANCEL_COMMAND ||
+    params.command === NODE_WORKER_ENVIRONMENT_STOP_COMMAND ||
     params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND ||
-    params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND;
+    params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND ||
+    params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND ||
+    params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND ||
+    params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND ||
+    params.command === NODE_WORKER_PORTAL_STREAM_COMMAND;
   if (!recognized) {
     return { handled: false };
   }
   if (
     (params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND && !params.bundleInstaller) ||
     (params.command === NODE_WORKER_WORKSPACE_EXEC_COMMAND && !params.workspace) ||
+    (params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND && !params.workspace) ||
     (params.command === NODE_WORKER_WORKSPACE_RETAIN_COMMAND && !params.supervisor) ||
     (params.command !== NODE_WORKER_BUNDLE_INSTALL_COMMAND &&
       params.command !== NODE_WORKER_WORKSPACE_EXEC_COMMAND &&
+      params.command !== NODE_WORKER_WORKSPACE_PREPARE_COMMAND &&
       params.command !== NODE_WORKER_WORKSPACE_RETAIN_COMMAND &&
       !params.supervisor)
   ) {
@@ -140,6 +176,16 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
     };
   }
   try {
+    if (params.command === NODE_WORKER_WORKSPACE_PREPARE_COMMAND) {
+      return {
+        handled: true,
+        ok: true,
+        payload: await params.workspace!.prepare(
+          parseNodeWorkerPreparedWorkspaceInput(params.paramsJSON),
+          params.signal,
+        ),
+      };
+    }
     if (params.command === NODE_WORKER_BUNDLE_INSTALL_COMMAND) {
       if (!params.gatewayUrl) {
         throw new Error("node worker gateway connection unavailable");
@@ -228,6 +274,42 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
             : workspace,
       };
     }
+    if (params.command === NODE_WORKER_DESKTOP_STREAM_COMMAND) {
+      await invokeNodeWorkerDesktopStream({
+        paramsJSON: params.paramsJSON,
+        gatewayUrl: params.gatewayUrl,
+        gatewayTlsFingerprint: params.gatewayTlsFingerprint,
+        gatewayCloudflareAccess: params.gatewayCloudflareAccess,
+        signal: params.signal,
+      });
+      return { handled: true, ok: true, payload: null };
+    }
+    if (params.command === NODE_WORKER_PORTAL_STREAM_COMMAND) {
+      await invokeNodeWorkerPortalStream({
+        paramsJSON: params.paramsJSON,
+        gatewayUrl: params.gatewayUrl,
+        gatewayTlsFingerprint: params.gatewayTlsFingerprint,
+        gatewayCloudflareAccess: params.gatewayCloudflareAccess,
+        signal: params.signal,
+      });
+      return { handled: true, ok: true, payload: null };
+    }
+    if (params.command === NODE_WORKER_DESKTOP_LAUNCH_COMMAND) {
+      return {
+        handled: true,
+        ok: true,
+        payload: await invokeNodeWorkerDesktopLaunch({
+          paramsJSON: params.paramsJSON,
+          signal: params.signal,
+        }),
+      };
+    }
+    if (params.command === NODE_WORKER_ENVIRONMENT_STOP_COMMAND) {
+      await params.supervisor!.stopEnvironment(
+        parseNodeWorkerEnvironmentStopInput(params.paramsJSON),
+      );
+      return { handled: true, ok: true, payload: null };
+    }
     const receipt =
       params.command === NODE_WORKER_SUPERVISOR_LAUNCH_COMMAND
         ? await params.supervisor!.launch(
@@ -260,8 +342,9 @@ export async function invokeNodeWorkerSupervisorCommand(params: {
             : transferFailure
               ? NODE_WORKSPACE_TRANSFER_ERROR_CODE
               : "UNAVAILABLE",
-      message:
-        invalid || bundleInstallFailure || capacityFailure || transferFailure
+      message: transferFailure
+        ? workspaceTransferDiagnostic(error)
+        : invalid || bundleInstallFailure || capacityFailure
           ? error.message
           : "node worker supervisor command failed",
     };

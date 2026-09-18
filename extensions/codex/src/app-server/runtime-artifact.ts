@@ -4,12 +4,15 @@ import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentHarnessRuntimeArtifactBinding } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { isPathInside } from "openclaw/plugin-sdk/file-access-runtime";
 import {
   resolveWindowsExecutablePath,
   resolveWindowsSpawnProgram,
 } from "openclaw/plugin-sdk/windows-spawn";
 import type { CodexAppServerClient, CodexAppServerRuntimeIdentity } from "./client.js";
 import type { CodexAppServerStartOptions } from "./config.js";
+import { resolvePackagedCodexNativeCommand } from "./managed-binary.js";
+import type { CodexAppServerSpawnIdentity } from "./spawn-identity.js";
 import { resolveCodexAppServerSpawnEnv } from "./transport-stdio.js";
 
 const ARTIFACT_ID_PREFIX = "codex-app-server:v1:";
@@ -46,14 +49,6 @@ const SAFE_NODE_OPTIONS_NUMERIC_FLAGS = new Set([
 ]);
 const SAFE_NODE_OPTIONS_DNS_RESULT_ORDERS = new Set(["ipv4first", "ipv6first", "verbatim"]);
 const ARTIFACT_BINDINGS_SYMBOL = Symbol.for("openclaw.codexAppServerRuntimeArtifactBindings");
-
-type CodexRuntimeArtifactSpawnIdentity = Readonly<{
-  command: string;
-  argsFingerprint: string;
-  commandSource?: CodexAppServerStartOptions["commandSource"];
-  managedCommandOrder?: CodexAppServerStartOptions["managedCommandOrder"];
-  nativeCommand?: string;
-}>;
 
 type CodexRuntimeFilesystemDescriptor = Readonly<{
   version: 1;
@@ -223,14 +218,6 @@ async function listPackageFiles(params: {
   return files;
 }
 
-function pathIsWithin(rootPath: string, candidatePath: string): boolean {
-  const relative = path.relative(rootPath, candidatePath);
-  return (
-    relative === "" ||
-    (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
-  );
-}
-
 function assertSafeNodeOptions(env: NodeJS.ProcessEnv): void {
   for (const [rawKey, value] of Object.entries(env)) {
     const key = rawKey.toUpperCase();
@@ -376,7 +363,7 @@ async function hashSelectedArtifactFiles(
     }
   }
   const externalFiles = [...new Set(allFiles)]
-    .filter((filePath) => !packageRoot || !pathIsWithin(packageRoot, filePath))
+    .filter((filePath) => !packageRoot || !isPathInside(packageRoot, filePath))
     .toSorted(compareArtifactNames);
   const budget: ArtifactHashBudget = { fileCount: 0, totalBytes: 0n };
   const hash = createHash("sha256");
@@ -517,7 +504,7 @@ async function resolvePackageRoot(nativePath: string): Promise<string | undefine
       return undefined;
     }
     const root = await fs.realpath(candidate);
-    return pathIsWithin(root, nativePath) ? root : undefined;
+    return isPathInside(root, nativePath) ? root : undefined;
   } catch {
     return undefined;
   }
@@ -552,7 +539,7 @@ function readEffectiveSpawnEnvironmentValue(
 
 async function captureFilesystemDescriptor(params: {
   startOptions: CodexAppServerStartOptions;
-  spawnIdentity: CodexRuntimeArtifactSpawnIdentity;
+  spawnIdentity: Readonly<CodexAppServerSpawnIdentity>;
   signal?: AbortSignal;
 }): Promise<CodexRuntimeFilesystemDescriptor> {
   throwIfAborted(params.signal);
@@ -568,6 +555,8 @@ async function captureFilesystemDescriptor(params: {
   const spawnCwd = path.resolve(params.startOptions.cwd ?? process.cwd());
   const commandPath = await resolveCommandPath(params.startOptions.command, env, spawnCwd);
   const commandRealPath = await fs.realpath(commandPath);
+  let nativeCommand = params.spawnIdentity.nativeCommand;
+  let nativeCandidate = commandRealPath;
   let invocationPaths: string[];
   if (process.platform === "win32") {
     const program = resolveWindowsSpawnProgram({
@@ -577,11 +566,16 @@ async function captureFilesystemDescriptor(params: {
       execPath: process.execPath,
       packageName: "@openai/codex",
     });
-    if (program.resolution === "node-entrypoint" && !params.spawnIdentity.nativeCommand) {
+    const entrypoint = program.leadingArgv[0];
+    if (program.resolution === "node-entrypoint" && entrypoint && !nativeCommand) {
+      nativeCommand = resolvePackagedCodexNativeCommand(await fs.realpath(entrypoint));
+    }
+    if (program.resolution === "node-entrypoint" && !nativeCommand) {
       throw new Error(
         "Codex runtime cannot attest a custom Node launcher without its native target",
       );
     }
+    nativeCandidate = program.command;
     const invocationCandidates = [commandRealPath, program.command, ...program.leadingArgv];
     invocationPaths = [];
     for (const candidate of invocationCandidates) {
@@ -589,22 +583,21 @@ async function captureFilesystemDescriptor(params: {
       invocationPaths.push(await fs.realpath(resolved));
     }
   } else {
+    nativeCommand ??= resolvePackagedCodexNativeCommand(commandRealPath);
     invocationPaths = await resolvePosixInvocationPaths({
       commandRealPath,
       env,
       cwd: spawnCwd,
-      nativeCommand: params.spawnIdentity.nativeCommand,
+      nativeCommand,
     });
   }
   invocationPaths = [...new Set(invocationPaths)].toSorted(compareArtifactNames);
   if (invocationPaths.length > MAX_ARTIFACT_INVOCATION_PATHS) {
     throw new Error("Codex runtime launcher exceeds the bounded invocation file count");
   }
-  const nativeCandidate = params.spawnIdentity.nativeCommand ?? invocationPaths[0];
-  if (!nativeCandidate) {
-    throw new Error("Codex runtime did not resolve a native executable");
-  }
-  const nativePath = await fs.realpath(await resolveCommandPath(nativeCandidate, env, spawnCwd));
+  const nativePath = await fs.realpath(
+    await resolveCommandPath(nativeCommand ?? nativeCandidate, env, spawnCwd),
+  );
   const packageRoot = await resolvePackageRoot(nativePath);
   const configuredCodeModeHost = readEffectiveSpawnEnvironmentValue(
     env,
@@ -786,7 +779,7 @@ function fingerprintBinding(
 /** Captures exact candidate bytes immediately before app-server startup. */
 export async function captureCodexAppServerRuntimeArtifactBeforeStart(params: {
   startOptions: CodexAppServerStartOptions;
-  spawnIdentity: CodexRuntimeArtifactSpawnIdentity;
+  spawnIdentity: Readonly<CodexAppServerSpawnIdentity>;
   signal?: AbortSignal;
 }): Promise<CodexAppServerRuntimeArtifactCapture> {
   const descriptor = await captureFilesystemDescriptor(params);
@@ -798,7 +791,7 @@ export async function captureCodexAppServerRuntimeArtifactBeforeStart(params: {
 export async function finalizeCodexAppServerRuntimeArtifact(params: {
   before: CodexAppServerRuntimeArtifactCapture;
   startOptions: CodexAppServerStartOptions;
-  spawnIdentity: CodexRuntimeArtifactSpawnIdentity;
+  spawnIdentity: Readonly<CodexAppServerSpawnIdentity>;
   runtimeIdentity: CodexAppServerRuntimeIdentity | undefined;
   signal?: AbortSignal;
 }): Promise<AgentHarnessRuntimeArtifactBinding> {

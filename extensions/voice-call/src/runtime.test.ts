@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 // Voice Call tests cover runtime plugin behavior.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   resolveTwilioAuthToken: vi.fn(),
   validateProviderConfig: vi.fn(),
   managerInitialize: vi.fn(),
+  managerStop: vi.fn(),
   managerGetCall: vi.fn(),
   webhookStart: vi.fn(),
   webhookStop: vi.fn(),
@@ -76,6 +78,7 @@ vi.mock("./config.js", () => ({
 vi.mock("./manager.js", () => ({
   CallManager: class {
     initialize = mocks.managerInitialize;
+    stop = mocks.managerStop;
     getCall = mocks.managerGetCall;
   },
 }));
@@ -234,6 +237,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     );
     mocks.validateProviderConfig.mockReturnValue({ valid: true, errors: [] });
     mocks.managerInitialize.mockResolvedValue(undefined);
+    mocks.managerStop.mockResolvedValue(undefined);
     mocks.managerGetCall.mockReset();
     mocks.webhookStart.mockResolvedValue("http://127.0.0.1:3334/voice/webhook");
     mocks.webhookStop.mockResolvedValue(undefined);
@@ -269,18 +273,59 @@ describe("createVoiceCallRuntime lifecycle", () => {
     mocks.cleanupTailscaleExposure.mockResolvedValue(undefined);
   });
 
+  it("explains the missing phone-call owner before provisioning a runtime", async () => {
+    await expect(
+      createVoiceCallRuntime({
+        config: createBaseConfig(),
+        coreConfig: {
+          agents: { ownership: "explicit", entries: { operator: {}, support: {} } },
+        },
+        agentRuntime: {} as never,
+      }),
+    ).rejects.toThrow("Set plugins.entries.voice-call.config.agentId to a configured agent ID.");
+    expect(mocks.webhookCtorArgs).toHaveLength(0);
+    expect(mocks.managerInitialize).not.toHaveBeenCalled();
+    expect(mocks.startTunnel).not.toHaveBeenCalled();
+  });
+
+  it.each<{ name: string; coreConfig: OpenClawConfig; agentId?: string }>([
+    { name: "sole named agent", coreConfig: { agents: { entries: { operator: {} } } } },
+    {
+      name: "explicit fleet owner",
+      coreConfig: {
+        agents: { ownership: "explicit", entries: { operator: {}, support: {} } },
+      },
+      agentId: "OPERATOR",
+    },
+    {
+      name: "legacy default owner",
+      coreConfig: { agents: { list: [{ id: "support" }, { id: "operator", default: true }] } },
+    },
+  ])("preserves the $name for phone-call startup", async ({ coreConfig, agentId }) => {
+    const runtime = await createVoiceCallRuntime({
+      config: { ...createBaseConfig(), agentId },
+      coreConfig,
+      agentRuntime: {} as never,
+    });
+    expect(runtime.config.agentId).toBe("operator");
+    await runtime.stop();
+  });
+
   it("cleans up tunnel, tailscale, and webhook server when init fails after start", async () => {
+    const config = createBaseConfig();
+    config.tunnel.provider = "tailscale-funnel";
+    config.tailscale.port = 8443;
     const tunnelStop = vi.fn().mockResolvedValue(undefined);
     mocks.startTunnel.mockResolvedValue({
-      publicUrl: "https://public.example/voice/webhook",
-      provider: "ngrok",
+      publicUrl: "https://public.example:8443/voice/webhook",
+      provider: "tailscale-funnel",
       stop: tunnelStop,
     });
     mocks.managerInitialize.mockRejectedValue(new Error("init failed"));
 
     await expect(
       createVoiceCallRuntime({
-        config: createBaseConfig(),
+        config,
         coreConfig: {},
         agentRuntime: {} as never,
       }),
@@ -288,6 +333,8 @@ describe("createVoiceCallRuntime lifecycle", () => {
 
     expect(mocks.startTunnel).toHaveBeenCalledWith(
       expect.objectContaining({
+        provider: "tailscale-funnel",
+        tailscalePort: 8443,
         streamPaths: [
           {
             localPath: "/voice/stream/realtime",
@@ -334,14 +381,37 @@ describe("createVoiceCallRuntime lifecycle", () => {
       expect(mocks.webhookStop).toHaveBeenCalledTimes(1);
     });
     expect(stopped).toBe(false);
+    expect(mocks.managerStop).not.toHaveBeenCalled();
 
     releaseWebhookStop?.();
     await firstStop;
     expect(stopped).toBe(true);
+    expect(mocks.managerStop).toHaveBeenCalledOnce();
 
     expect(tunnelStop).toHaveBeenCalledTimes(1);
     expect(mocks.cleanupTailscaleExposure).toHaveBeenCalledTimes(1);
     expect(mocks.webhookStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains the manager after transport cleanup fails and preserves the first error", async () => {
+    const transportFailure = new Error("webhook shutdown failed");
+    const drain = createDeferred<void>();
+    mocks.webhookStop.mockRejectedValue(transportFailure);
+    mocks.managerStop.mockReturnValue(drain.promise);
+    const runtime = await createVoiceCallRuntime({
+      config: createBaseConfig(),
+      coreConfig: {},
+      agentRuntime: {} as never,
+    });
+    let settled = false;
+    const stopped = runtime.stop().catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    await vi.waitFor(() => expect(mocks.managerStop).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    drain.reject(new Error("manager drain failed"));
+    expect(await stopped).toBe(transportFailure);
   });
 
   it("passes fullConfig to the webhook server for streaming provider resolution", async () => {
@@ -391,8 +461,8 @@ describe("createVoiceCallRuntime lifecycle", () => {
       } as never,
     });
 
-    const resolveCallRegistration = mocks.realtimeHandlerCtorArgs[0]?.[3];
-    expect(mocks.realtimeHandlerCtorArgs[0]?.[5]).toBe(
+    const resolveCallRegistration = mocks.realtimeHandlerCtorArgs[0]?.[2];
+    expect(mocks.realtimeHandlerCtorArgs[0]?.[4]).toBe(
       mocks.webhookGetStreamDisconnectLifecycle.mock.results[0]?.value,
     );
     expect(mocks.resolveConfiguredRealtimeVoiceProvider).not.toHaveBeenCalled();
@@ -462,7 +532,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     ).resolves.toMatchObject({ config: { agentId: "main" } });
     expect(mocks.resolveConfiguredRealtimeVoiceProvider).not.toHaveBeenCalled();
 
-    const resolveCallRegistration = mocks.realtimeHandlerCtorArgs[0]?.[3];
+    const resolveCallRegistration = mocks.realtimeHandlerCtorArgs[0]?.[2];
     if (typeof resolveCallRegistration !== "function") {
       throw new Error("expected per-call realtime registration resolver");
     }
@@ -617,6 +687,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
       throw new Error("expected realtime handler tools to be an array");
     }
     expect(tools.map((tool) => requireRecord(tool, "realtime tool").name)).toEqual([
+      "openclaw_end_call",
       "openclaw_agent_consult",
       "custom_tool",
     ]);
@@ -651,6 +722,53 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(consultParams.extraSystemPrompt).toContain("one or two bounded read-only queries");
     expect(consultParams.prompt).toContain("Caller: Can you check shipment status?");
     expect(consultParams.prompt).toContain("Caller: Also check the ETA.");
+  });
+
+  it("always exposes the built-in end-call tool without allowing configured replacement", async () => {
+    const config = createBaseConfig();
+    config.realtime.enabled = true;
+    config.realtime.toolPolicy = "none";
+    config.realtime.tools = [
+      {
+        type: "function",
+        name: "openclaw_end_call",
+        description: "Configured replacement",
+        parameters: { type: "object", properties: { callId: { type: "string" } } },
+      },
+      {
+        type: "function",
+        name: "custom_tool",
+        description: "Custom tool",
+        parameters: { type: "object", properties: {} },
+      },
+    ];
+
+    await createVoiceCallRuntime({
+      config,
+      coreConfig: {} as OpenClawConfig,
+      agentRuntime: {} as never,
+    });
+
+    const realtimeHandlerOptions = requireRecord(
+      mocks.realtimeHandlerCtorArgs[0]?.[0],
+      "realtime handler options",
+    );
+    const tools = realtimeHandlerOptions.tools;
+    if (!Array.isArray(tools)) {
+      throw new Error("expected realtime handler tools to be an array");
+    }
+    expect(tools.map((tool) => requireRecord(tool, "realtime tool").name)).toEqual([
+      "openclaw_end_call",
+      "custom_tool",
+    ]);
+    const endCallTool = requireRecord(tools[0], "end-call tool");
+    expect(endCallTool.description).toContain("final words");
+    expect(endCallTool.description).toContain("no further reply");
+    expect(requireRecord(endCallTool.parameters, "end-call parameters")).toEqual({
+      type: "object",
+      properties: {},
+    });
+    expect(mocks.realtimeHandlerRegisterToolHandler).not.toHaveBeenCalled();
   });
 
   it("rejects a realtime consult whose lifecycle owner already aborted", async () => {

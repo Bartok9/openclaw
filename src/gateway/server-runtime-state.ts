@@ -2,7 +2,8 @@
 // Builds one server runtime with lazy plugin route handlers.
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
-import { WebSocketServer } from "ws";
+import type { WebSocketServer } from "ws";
+import { WebSocketServer as NpmWebSocketServer } from "../../packages/gateway-client/src/websocket.js";
 import { resolveSandboxHostPort } from "../agents/sandbox-host.js";
 import { isCoreCanvasHostEnabled } from "../canvas/config.js";
 import { resolveCanvasNodeCapability } from "../canvas/constants.js";
@@ -10,6 +11,7 @@ import type { CliDeps } from "../cli/deps.types.js";
 import type { GatewayTlsRuntime } from "../infra/tls/gateway.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
 import type { PluginRegistry } from "../plugins/registry.js";
+import type { PluginRuntimeCore } from "../plugins/runtime/types-core.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
 import type { ControlUiRootState } from "./control-ui.js";
@@ -47,6 +49,7 @@ import type { ReadinessChecker, StartupChecker } from "./server/readiness.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import type { NodeWorkerBundleTransferHttpCallback } from "./worker-environments/node-worker-bundle-transfer-http.js";
 import type { NodeWorkspaceTransferHttpCallback } from "./worker-environments/node-workspace-transfer-http.js";
+import type { WorkerBootstrapArtifactTransferHttpCallback } from "./worker-environments/worker-bootstrap-artifact-transfer-http.js";
 
 type GatewayPluginRequestHandler = (
   req: IncomingMessage,
@@ -95,14 +98,14 @@ export async function createGatewayHttpTransport(params: {
   getRuntimeConfig?: () => import("../config/config.js").OpenClawConfig;
   bindHost: string;
   port: number;
-  controlUiEnabled: boolean;
+  /** Test-instance listener held since allocation; caller closes it if construction fails. */
+  testListener?: HttpServer;
+  updateCanary?: boolean;
+  controlUiEnabled?: boolean;
   controlUiBasePath: string;
   controlUiRoot?: ControlUiRootState;
-  openAiChatCompletionsEnabled: boolean;
-  openAiChatCompletionsConfig?: import("../config/types.gateway.js").GatewayHttpChatCompletionsConfig;
-  openResponsesEnabled: boolean;
-  openResponsesConfig?: import("../config/types.gateway.js").GatewayHttpResponsesConfig;
-  strictTransportSecurityHeader?: string;
+  openAiChatCompletionsEnabled?: boolean;
+  openResponsesEnabled?: boolean;
   resolvedAuth: ResolvedGatewayAuth;
   getResolvedAuth: () => ResolvedGatewayAuth;
   /** Optional rate limiter for auth brute-force protection. */
@@ -121,9 +124,11 @@ export async function createGatewayHttpTransport(params: {
   logPlugins: ReturnType<typeof createSubsystemLogger>;
   getReadiness?: ReadinessChecker;
   getStartup?: StartupChecker;
+  isStartupPending?: () => boolean;
   isTerminalEnabled: () => boolean;
   handleWatchNodeRequest?: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
   handleNodeWorkerBundleTransferRequest?: NodeWorkerBundleTransferHttpCallback;
+  handleWorkerBootstrapArtifactTransferRequest?: WorkerBootstrapArtifactTransferHttpCallback;
   handleNodeWorkspaceTransferRequest?: NodeWorkspaceTransferHttpCallback;
   workerIngressEnabled?: boolean;
   desktopSessionRegistry?: DesktopSessionRegistry;
@@ -142,12 +147,42 @@ export async function createGatewayHttpTransport(params: {
   getTailscaleIngressEndpoint: () => GatewayTailscaleIngressEndpoint | undefined;
   getMcpAppSandboxPort: () => number | undefined;
   ensureSandboxHostPort: () => Promise<number>;
+  dispatchHookAgentTurn: (
+    pluginId: string,
+    params: Parameters<PluginRuntimeCore["hooks"]["dispatchHookAgentTurn"]>[0],
+  ) => ReturnType<PluginRuntimeCore["hooks"]["dispatchHookAgentTurn"]>;
 }> {
+  if (params.testListener) {
+    const address = params.testListener.address();
+    if (
+      params.gatewayTls?.enabled ||
+      params.bindHost !== "127.0.0.1" ||
+      !address ||
+      typeof address === "string" ||
+      address.address !== params.bindHost ||
+      address.port !== params.port
+    ) {
+      throw new Error("Test Gateway listener must own the configured HTTP loopback endpoint");
+    }
+  }
   const loadRuntimeConfig = params.getRuntimeConfig ?? (() => params.cfg);
   const resolvePluginRouteRegistry = () =>
     params.getPluginRouteRegistry?.() ?? params.pluginRegistry;
 
   let loadedHooksRequestHandler: HooksRequestHandler | null = null;
+  let loadedHookDispatcher:
+    | ReturnType<(typeof import("./server/hooks.js"))["createGatewayHookDispatcher"]>
+    | undefined;
+  const getHookDispatcher = async () => {
+    const { createGatewayHookDispatcher } = await import("./server/hooks.js");
+    return (loadedHookDispatcher ??= createGatewayHookDispatcher({
+      deps: params.deps,
+      logHooks: params.logHooks,
+      ...(params.getGatewayRequestContext
+        ? { resolveGatewayContext: params.getGatewayRequestContext }
+        : {}),
+    }));
+  };
   const handleHooksRequest: HooksRequestHandler = async (req, res) => {
     const hooksConfig = params.hooksConfig();
     if (!hooksConfig) {
@@ -165,11 +200,15 @@ export async function createGatewayHttpTransport(params: {
         const { createGatewayHooksRequestHandler } = await import("./server/hooks.js");
         loadedHooksRequestHandler = createGatewayHooksRequestHandler({
           deps: params.deps,
+          dispatcher: await getHookDispatcher(),
           getHooksConfig: params.hooksConfig,
           getClientIpConfig: params.getHookClientIpConfig,
           bindHost: params.bindHost,
           port: params.port,
           logHooks: params.logHooks,
+          ...(params.getGatewayRequestContext
+            ? { resolveGatewayContext: params.getGatewayRequestContext }
+            : {}),
         });
       }
       return await loadedHooksRequestHandler(req, res);
@@ -269,9 +308,16 @@ export async function createGatewayHttpTransport(params: {
   // Create WebSocketServer first (with noServer: true) so we can attach upgrade handlers
   // before HTTP servers start listening. This prevents a race condition where connections
   // arrive before the upgrade handler is attached, which causes silent 1006 errors.
-  const wss = new WebSocketServer({
+  const wss = new NpmWebSocketServer({
     noServer: true,
     maxPayload: MAX_PREAUTH_PAYLOAD_BYTES,
+    // Yield between buffered frames so one RPC burst cannot monopolize the
+    // event loop before other connections and HTTP probes can run.
+    allowSynchronousEvents: false,
+    // Browsers compress even tiny requests when this extension is negotiated.
+    // Serial inflate callbacks delay each frame behind busy event-loop turns,
+    // before the bounded request-start scheduler can admit the burst.
+    perMessageDeflate: false,
   });
   const preauthConnectionBudget = createPreauthConnectionBudget();
 
@@ -287,17 +333,16 @@ export async function createGatewayHttpTransport(params: {
   const createGatewayListener = (
     ingressTransport: GatewayIngressTransport,
     tlsOptions: GatewayTlsRuntime["tlsOptions"] | undefined,
+    testListener?: HttpServer,
   ): HttpServer => {
     const httpServer = createGatewayHttpServer({
+      testListener,
       clients: params.clients,
       controlUiEnabled: params.controlUiEnabled,
       controlUiBasePath: params.controlUiBasePath,
       controlUiRoot: params.controlUiRoot,
       openAiChatCompletionsEnabled: params.openAiChatCompletionsEnabled,
-      openAiChatCompletionsConfig: params.openAiChatCompletionsConfig,
       openResponsesEnabled: params.openResponsesEnabled,
-      openResponsesConfig: params.openResponsesConfig,
-      strictTransportSecurityHeader: params.strictTransportSecurityHeader,
       handleWatchNodeRequest: params.handleWatchNodeRequest,
       handleHooksRequest,
       handleMcpOAuthCallbackRequest,
@@ -310,10 +355,13 @@ export async function createGatewayHttpTransport(params: {
       rateLimiter: params.rateLimiter,
       joinRateLimiter: params.joinRateLimiter,
       handleNodeWorkerBundleTransferRequest: params.handleNodeWorkerBundleTransferRequest,
+      handleWorkerBootstrapArtifactTransferRequest:
+        params.handleWorkerBootstrapArtifactTransferRequest,
       handleNodeWorkspaceTransferRequest: params.handleNodeWorkspaceTransferRequest,
       getReadiness: params.getReadiness,
       getStartup: params.getStartup,
       getRuntimeConfig: loadRuntimeConfig,
+      getGatewayRequestContext: params.getGatewayRequestContext,
       isStartupPluginRuntimeReady: params.isStartupPluginRuntimeReady,
       isTerminalEnabled: params.isTerminalEnabled,
       tlsOptions,
@@ -338,15 +386,17 @@ export async function createGatewayHttpTransport(params: {
       desktopSessionRegistry: params.desktopSessionRegistry,
       nodeDesktopStreamBroker: params.nodeDesktopStreamBroker,
       getGatewayRequestContext: params.getGatewayRequestContext,
+      isStartupPending: params.isStartupPending,
       ingressTransport,
       reportUnattributableProxy,
     });
     return httpServer;
   };
-  for (const _ of bindHosts) {
+  for (const host of bindHosts) {
     const httpServer = createGatewayListener(
       { kind: "ordinary" },
       params.gatewayTls?.enabled ? params.gatewayTls.tlsOptions : undefined,
+      host === params.bindHost ? params.testListener : undefined,
     );
     gatewayHttpServers.push(httpServer);
     httpServers.push(httpServer);
@@ -368,6 +418,9 @@ export async function createGatewayHttpTransport(params: {
   let startListeningPromise: Promise<void> | null = null;
   let startListeningComplete = false;
   const startSandboxHost = async (): Promise<number> => {
+    if (params.updateCanary) {
+      throw new Error("Sandbox host is disabled during update validation");
+    }
     if (sandboxHostStartPromise) {
       return await sandboxHostStartPromise;
     }
@@ -381,6 +434,7 @@ export async function createGatewayHttpTransport(params: {
       const sandboxServers = bindHosts.map(() =>
         createSandboxHostHttpServer(
           params.gatewayTls?.enabled ? params.gatewayTls.tlsOptions : undefined,
+          resolvePluginRouteRegistry,
         ),
       );
       // Register before binding so normal runtime cleanup closes a partially
@@ -491,12 +545,14 @@ export async function createGatewayHttpTransport(params: {
         // helpers. A collision must fail startup instead of sending credentials to it.
         const requiredLoopbackAlias = host === requiredAlias;
         try {
-          await listenGatewayHttpServer({
-            httpServer: server,
-            bindHost: host,
-            port: params.port,
-            retryEaddrinuse: !requiredLoopbackAlias,
-          });
+          if (server !== params.testListener) {
+            await listenGatewayHttpServer({
+              httpServer: server,
+              bindHost: host,
+              port: params.port,
+              retryEaddrinuse: !requiredLoopbackAlias,
+            });
+          }
           boundHosts.add(host);
         } catch (err) {
           if (host === bindHosts[0] || requiredLoopbackAlias) {
@@ -511,7 +567,8 @@ export async function createGatewayHttpTransport(params: {
       if (httpBindHosts.length === 0) {
         throw new Error("Gateway HTTP server failed to start");
       }
-      if (params.cfg.mcp?.apps?.enabled === true) {
+      // Published updaters retain the live sandbox port but already pass --update-canary.
+      if (!params.updateCanary && params.cfg.mcp?.apps?.enabled === true) {
         await startSandboxHost();
       }
       startListeningComplete = true;
@@ -529,5 +586,7 @@ export async function createGatewayHttpTransport(params: {
     getTailscaleIngressEndpoint: () => tailscaleIngressEndpoint,
     getMcpAppSandboxPort: () => mcpAppSandboxPort,
     ensureSandboxHostPort,
+    dispatchHookAgentTurn: async (pluginId, hookParams) =>
+      await (await getHookDispatcher()).dispatchHookAgentTurn(hookParams, pluginId),
   };
 }

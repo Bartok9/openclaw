@@ -1,33 +1,41 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 /**
  * Requester-agent handoff and direct delivery for subagent announcements.
  */
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { completionRequiresMessageToolDelivery } from "../../../auto-reply/reply/completion-delivery-policy.js";
 import { stringifyRouteThreadId } from "../../../plugin-sdk/channel-route.js";
 import { defaultRuntime } from "../../../runtime.js";
 import {
+  INTERNAL_PROVENANCE_SOURCE_CHANNEL,
   isAgentMediatedCompletionSourceTool,
-  shouldPreserveUserFacingSessionStateForInputProvenance,
 } from "../../../sessions/input-provenance.js";
 import { isCronRunSessionKey } from "../../../sessions/session-key-utils.js";
+import type { UserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.types.js";
 import { sessionDeliveryChannel } from "../../../utils/delivery-context.shared.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
   isGatewayMessageChannel,
   normalizeMessageChannel,
 } from "../../../utils/message-channel.js";
+import { normalizeAgentRunTerminalDeliverySnapshot } from "../../agent-run-terminal-delivery.js";
 import {
   getAgentCommandDeliveryFailure,
   getGatewayAgentResult,
   hasCommittedOutboundDeliveryEvidence,
-  hasPayloadOutcomeSendEvidence,
+  getAutomaticDeliveryEvidence,
 } from "../../embedded-agent-runner/delivery-evidence.js";
 import {
   hasIntentionalSilentAgentPayload,
   hasVisibleAgentPayload,
 } from "../../embedded-agent-runner/message-visibility.js";
 import type { EmbeddedAgentQueueMessageOptions } from "../../embedded-agent-runner/run-state.js";
-import { AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION } from "../../internal-event-contract.js";
+import {
+  AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION,
+  hasFailedSubagentNoOutputCompletion,
+  hasVisibleCompletionResult,
+} from "../../internal-event-contract.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
 import {
   formatActiveWakeFailure,
@@ -37,10 +45,11 @@ import {
 } from "./subagent-announce-active-wake.js";
 import {
   deliverCompletionDirect,
-  hasFailedSubagentNoOutputCompletion,
   hasMessagingToolDeliveryToSource,
   isDirectMessageDeliveryTarget,
   isGatewayAgentRunPending,
+  resolvePrivateCompletionDeliveryResult,
+  runAnnounceAgentCall,
 } from "./subagent-announce-completion-delivery.js";
 import {
   hasAnnounceSendEvidence,
@@ -53,44 +62,31 @@ import {
   summarizeDeliveryError,
 } from "./subagent-announce-delivery-retry.js";
 import {
-  dispatchSubagentAnnounceAgent,
   getSubagentAnnounceRuntimeConfig,
-  isSubagentRequesterSessionAbandoned,
+  resolveSubagentRequesterSessionAbandonment,
   loadRequesterSessionEntry,
   resolveExternalBestEffortDeliveryTarget,
   resolveQueueSettings,
 } from "./subagent-announce-delivery.runtime.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
-import type { SubagentCompletionToolHandoffRegistration } from "./subagent-announce-handoff.js";
 import {
   resolveCompletionDeliveryOrigins,
   type DeliveryContext,
 } from "./subagent-announce-origin.js";
 import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
 
-async function runAnnounceAgentCall(params: {
-  agentParams: Record<string, unknown>;
-  delegatedToolPolicyHandoff?: SubagentCompletionToolHandoffRegistration;
-  expectFinal?: boolean;
-  timeoutMs?: number;
-}): Promise<unknown> {
-  return await dispatchSubagentAnnounceAgent(params.agentParams, {
-    expectFinal: params.expectFinal,
-    forceSyntheticClient: shouldPreserveUserFacingSessionStateForInputProvenance(
-      params.agentParams.inputProvenance,
-    ),
-    delegatedToolPolicyHandoff: params.delegatedToolPolicyHandoff,
-    timeoutMs: params.timeoutMs,
-  });
-}
+const REQUESTER_FINAL_VISIBLE_TEXT_MAX_CHARS = 12_000;
 
 export async function sendSubagentAnnounceDirectly(params: {
   requesterSessionKey: string;
   requesterAgentId?: string;
+  requesterRunTimeoutSeconds?: number;
   targetRequesterSessionKey: string;
   triggerMessage: string;
   internalEvents?: AgentInternalEvent[];
   expectsCompletionMessage: boolean;
+  completionTarget?: "parent";
+  completionRequesterSessionId?: string;
   requireVisibleReply?: boolean;
   bestEffortDeliver?: boolean;
   directIdempotencyKey: string;
@@ -98,20 +94,20 @@ export async function sendSubagentAnnounceDirectly(params: {
   directOrigin?: DeliveryContext;
   requesterSessionOrigin?: DeliveryContext;
   sourceSessionKey?: string;
-  sourceChannel?: string;
   sourceTool?: string;
   isSourceSessionEffectsAllowed?: () => boolean;
+  isSourceSessionAdmissionAllowed?: () => boolean;
   isCompletionOwnedByRequesterYield?: () => boolean;
   requesterIsSubagent: boolean;
+  createUserTurnTranscriptRecorder?: (sessionId: string) => UserTurnTranscriptRecorder;
   onDeliveryResult?: (delivery: SubagentAnnounceDeliveryResult) => void;
   signal?: AbortSignal;
+  resolveGatewayContext?: import("../../../gateway/server-methods/types.js").GatewayContextResolver;
 }): Promise<SubagentAnnounceDeliveryResult> {
   if (params.signal?.aborted) {
-    return {
-      delivered: false,
-      path: "none",
-    };
+    return { delivered: false, path: "none" };
   }
+  const parentOnly = params.completionTarget === "parent";
   const cfg = getSubagentAnnounceRuntimeConfig();
   const announceTimeoutMs = resolveSubagentAnnounceTimeoutMs(cfg);
   const canonicalRequesterSessionKey = resolveRequesterStoreKey(
@@ -120,10 +116,8 @@ export async function sendSubagentAnnounceDirectly(params: {
     params.requesterAgentId,
   );
   try {
-    // Merge completionDirectOrigin with directOrigin so that missing fields
-    // (channel, to, accountId) fall back to the originating session's
-    // lastChannel / lastTo. Without this, a completion origin that carries a
-    // channel but not a `to` would prevent external delivery.
+    // A partial completion origin must retain the target from the requester's
+    // recorded delivery context or the generated reply becomes undeliverable.
     const { directOrigin, requesterSessionOrigin, effectiveDirectOrigin } =
       resolveCompletionDeliveryOrigins(params);
     const sessionOnlyOrigin = effectiveDirectOrigin?.channel
@@ -133,14 +127,15 @@ export async function sendSubagentAnnounceDirectly(params: {
       params.targetRequesterSessionKey,
       params.requesterAgentId,
     ).entry;
-    const deliveryTarget = !params.requesterIsSubagent
-      ? resolveExternalBestEffortDeliveryTarget({
-          channel: effectiveDirectOrigin?.channel,
-          to: effectiveDirectOrigin?.to,
-          accountId: effectiveDirectOrigin?.accountId,
-          threadId: effectiveDirectOrigin?.threadId,
-        })
-      : { deliver: false };
+    const deliveryTarget =
+      !parentOnly && !params.requesterIsSubagent
+        ? resolveExternalBestEffortDeliveryTarget({
+            channel: effectiveDirectOrigin?.channel,
+            to: effectiveDirectOrigin?.to,
+            accountId: effectiveDirectOrigin?.accountId,
+            threadId: effectiveDirectOrigin?.threadId,
+          })
+        : { deliver: false };
     const normalizedSessionOnlyOriginChannel = !params.requesterIsSubagent
       ? normalizeMessageChannel(sessionOnlyOrigin?.channel)
       : undefined;
@@ -162,14 +157,23 @@ export async function sendSubagentAnnounceDirectly(params: {
       subagentCompletionEvents[0]?.childSessionKey === params.sourceSessionKey
         ? subagentCompletionEvents[0]
         : undefined;
+    const hasFailedTrustedSubagentCompletion =
+      trustedCompletionEvent !== undefined && trustedCompletionEvent.status !== "ok";
     const hasRequiredSubagentNoOutputCompletion =
       params.expectsCompletionMessage &&
       isSubagentCompletion &&
-      (trustedCompletionEvent?.result.trim() === "(no output)" ||
+      ((trustedCompletionEvent !== undefined &&
+        !hasVisibleCompletionResult(trustedCompletionEvent)) ||
         hasFailedSubagentNoOutputCompletion(params.internalEvents));
+    const hasSuccessfulTrustedSubagentNoOutputCompletion =
+      hasRequiredSubagentNoOutputCompletion && trustedCompletionEvent?.status === "ok";
+    const textCompletionDirectDeliveryKind = hasFailedTrustedSubagentCompletion
+      ? "failed_notice"
+      : "completed_result";
     const agentMediatedCompletion =
       params.expectsCompletionMessage && isAgentMediatedCompletionSourceTool(sourceToolId);
     const completionRouteRequiresMessageToolDelivery =
+      !parentOnly &&
       params.expectsCompletionMessage &&
       completionRequiresMessageToolDelivery({
         cfg,
@@ -192,9 +196,26 @@ export async function sendSubagentAnnounceDirectly(params: {
       params.requesterAgentId,
     );
     if (
-      params.expectsCompletionMessage &&
-      isSubagentRequesterSessionAbandoned(canonicalRequesterSessionKey, requesterActivity.sessionId)
+      parentOnly &&
+      (!params.completionRequesterSessionId ||
+        requesterActivity.sessionId !== params.completionRequesterSessionId)
     ) {
+      return {
+        delivered: false,
+        path: "none",
+        reason: "completion_handoff_unavailable",
+        error: "private completion requester session is unavailable or replaced",
+        terminal: true,
+        disposition: "intentional_non_delivery",
+      };
+    }
+    const requesterAbandonment = params.expectsCompletionMessage
+      ? resolveSubagentRequesterSessionAbandonment(
+          canonicalRequesterSessionKey,
+          requesterActivity.sessionId,
+        )
+      : undefined;
+    if (requesterAbandonment === "timeout") {
       return {
         delivered: false,
         path: "none",
@@ -202,10 +223,21 @@ export async function sendSubagentAnnounceDirectly(params: {
         error: "requester session abandoned after timeout",
       };
     }
+    if (requesterAbandonment === "recovering_timeout") {
+      return {
+        delivered: false,
+        path: "none",
+        reason: "completion_handoff_pending",
+        error: "requester timeout recovery is still settling",
+        disposition: "retryable",
+      };
+    }
     const isCompletionDeliveryAllowed = () =>
       params.isSourceSessionEffectsAllowed?.() !== false &&
       !(params.expectsCompletionMessage && params.isCompletionOwnedByRequesterYield?.());
-    if (!isCompletionDeliveryAllowed()) {
+    const isCompletionAdmissionAllowed = () =>
+      isCompletionDeliveryAllowed() && params.isSourceSessionAdmissionAllowed?.() !== false;
+    if (!isCompletionAdmissionAllowed()) {
       // sessions_yield owns the post-turn synthesis. Starting or steering a
       // requester turn here would replay the original fanout during handoff.
       return {
@@ -216,7 +248,9 @@ export async function sendSubagentAnnounceDirectly(params: {
         disposition: "intentional_non_delivery",
       };
     }
-    const tryTextCompletionDirectDelivery = () =>
+    const tryTextCompletionDirectDelivery = (
+      contentKind: "completed_result" | "failed_notice" = "completed_result",
+    ) =>
       deliverCompletionDirect({
         cfg,
         requesterSessionKey: canonicalRequesterSessionKey,
@@ -224,12 +258,19 @@ export async function sendSubagentAnnounceDirectly(params: {
         directIdempotencyKey: params.directIdempotencyKey,
         deliveryTarget,
         internalEvents: params.internalEvents,
+        contentKind,
+        signal: params.signal,
         onDeliveryResult: params.onDeliveryResult,
         isSourceSessionEffectsAllowed: isCompletionDeliveryAllowed,
       });
-    const completionSourceReplyDeliveryMode = requiresMessageToolDelivery
-      ? "message_tool_only"
-      : undefined;
+    // Synthetic requester-settle turns must not inherit a tool-only mode that suppresses the final.
+    const completionSourceReplyDeliveryMode = parentOnly
+      ? "automatic"
+      : requiresMessageToolDelivery
+        ? "message_tool_only"
+        : params.requireVisibleReply && deliveryTarget.deliver
+          ? "automatic"
+          : undefined;
     const shouldDeliverAgentFinal = deliveryTarget.deliver && !requiresMessageToolDelivery;
     const requesterQueueSettings = resolveQueueSettings({
       cfg,
@@ -240,6 +281,7 @@ export async function sendSubagentAnnounceDirectly(params: {
       sessionEntry: requesterEntry,
     });
     if (
+      !parentOnly &&
       params.expectsCompletionMessage &&
       requesterActivity.sessionId &&
       requesterActivity.isActive
@@ -254,6 +296,13 @@ export async function sendSubagentAnnounceDirectly(params: {
           ? { debounceMs: requesterQueueSettings.debounceMs }
           : {}),
         waitForTranscriptCommit: true,
+        ...(params.createUserTurnTranscriptRecorder
+          ? {
+              userTurnTranscriptRecorder: params.createUserTurnTranscriptRecorder(
+                requesterActivity.sessionId,
+              ),
+            }
+          : {}),
       };
       // Ordinary subagent and harness handoffs must wait through compaction
       // and transcript retries before treating an active wake as failed.
@@ -263,6 +312,7 @@ export async function sendSubagentAnnounceDirectly(params: {
         wakeOptions,
         params.signal,
         isCompletionDeliveryAllowed,
+        params.isSourceSessionAdmissionAllowed,
       );
       if (isSourceOwnerChangedWake(wakeOutcome)) {
         return sourceOwnerChangedResult();
@@ -298,38 +348,31 @@ export async function sendSubagentAnnounceDirectly(params: {
       };
     }
     if (params.signal?.aborted) {
-      return {
-        delivered: false,
-        path: "none",
-      };
+      return { delivered: false, path: "none" };
     }
-    const directAgentThreadId = shouldDeliverAgentFinal
-      ? stringifyRouteThreadId(deliveryTarget.threadId)
+    const directAgentOrigin = shouldDeliverAgentFinal
+      ? deliveryTarget
       : sessionOnlyOriginChannel
-        ? stringifyRouteThreadId(sessionOnlyOrigin?.threadId)
+        ? sessionOnlyOrigin
         : undefined;
+    // A private completion gets its own serialized turn. Steering into a public
+    // turn would inherit that turn's delivery policy and expose child output.
     const directAgentParams: Record<string, unknown> = {
+      ...(parentOnly ? { expectedExistingSessionId: params.completionRequesterSessionId } : {}),
       sessionKey: canonicalRequesterSessionKey,
+      timeout: params.requesterRunTimeoutSeconds,
       message: params.triggerMessage,
       deliver: shouldDeliverAgentFinal,
       bestEffortDeliver: params.bestEffortDeliver,
       internalEvents: params.internalEvents,
       channel: shouldDeliverAgentFinal ? deliveryTarget.channel : sessionOnlyOriginChannel,
-      accountId: shouldDeliverAgentFinal
-        ? deliveryTarget.accountId
-        : sessionOnlyOriginChannel
-          ? sessionOnlyOrigin?.accountId
-          : undefined,
-      to: shouldDeliverAgentFinal
-        ? deliveryTarget.to
-        : sessionOnlyOriginChannel
-          ? sessionOnlyOrigin?.to
-          : undefined,
-      threadId: directAgentThreadId,
+      accountId: directAgentOrigin?.accountId,
+      to: directAgentOrigin?.to,
+      threadId: stringifyRouteThreadId(directAgentOrigin?.threadId),
       inputProvenance: {
         kind: "inter_session",
         sourceSessionKey: params.sourceSessionKey,
-        sourceChannel: params.sourceChannel ?? INTERNAL_MESSAGE_CHANNEL,
+        sourceChannel: INTERNAL_PROVENANCE_SOURCE_CHANNEL,
         sourceTool: params.sourceTool ?? "subagent_announce",
       },
       ...(completionSourceReplyDeliveryMode
@@ -344,13 +387,14 @@ export async function sendSubagentAnnounceDirectly(params: {
           ? "completion direct announce agent call"
           : "direct announce agent call",
         signal: params.signal,
-        isAttemptAllowed: isCompletionDeliveryAllowed,
+        isAttemptAllowed: isCompletionAdmissionAllowed,
         run: async () => {
-          if (!isCompletionDeliveryAllowed()) {
+          if (!isCompletionAdmissionAllowed()) {
             throw new SourceOwnerChangedError();
           }
           return await runAnnounceAgentCall({
             agentParams: directAgentParams,
+            ...(parentOnly ? { privateCompletion: true as const } : {}),
             delegatedToolPolicyHandoff:
               isSubagentCompletion &&
               trustedCompletionEvent &&
@@ -368,7 +412,15 @@ export async function sendSubagentAnnounceDirectly(params: {
                   }
                 : undefined,
             expectFinal: true,
-            timeoutMs: announceTimeoutMs,
+            signal: params.signal,
+            // Individual private delivery retains its cleanup owner until the
+            // lifecycle deadline; settle batches can observe and replay admission.
+            timeoutMs: parentOnly && isSubagentCompletion ? undefined : announceTimeoutMs,
+            isExecutionAllowed: isCompletionDeliveryAllowed,
+            ...(params.isSourceSessionAdmissionAllowed
+              ? { isSourceSessionAdmissionAllowed: isCompletionAdmissionAllowed }
+              : {}),
+            resolveGatewayContext: params.resolveGatewayContext,
           });
         },
       });
@@ -379,16 +431,24 @@ export async function sendSubagentAnnounceDirectly(params: {
       if (err instanceof SourceOwnerChangedError) {
         return sourceOwnerChangedResult();
       }
-      if (isPermanentAnnounceDeliveryError(err) && hasAnnounceSendEvidence(err)) {
+      if (hasAnnounceSendEvidence(err)) {
         throw err;
       }
+      if (params.signal?.aborted) {
+        return { delivered: false, path: "none" };
+      }
+      const directCompletionFallbackKind = hasFailedTrustedSubagentCompletion
+        ? "failed_notice"
+        : isIncompleteAnnounceAgentResultError(err)
+          ? "completed_result"
+          : undefined;
       if (
         params.expectsCompletionMessage &&
         (shouldDeliverAgentFinal || subagentDirectMessageCompletionRequiresMessageTool) &&
         isSubagentCompletion &&
-        isIncompleteAnnounceAgentResultError(err)
+        directCompletionFallbackKind
       ) {
-        const textDelivery = await tryTextCompletionDirectDelivery();
+        const textDelivery = await tryTextCompletionDirectDelivery(directCompletionFallbackKind);
         if (textDelivery) {
           return textDelivery;
         }
@@ -399,49 +459,117 @@ export async function sendSubagentAnnounceDirectly(params: {
       throw err;
     }
 
-    const directAnnounceStillPending = isGatewayAgentRunPending(directAnnounceResponse);
-    if (directAnnounceStillPending) {
-      return {
-        delivered: true,
-        path: "direct",
-      };
+    if (isGatewayAgentRunPending(directAnnounceResponse)) {
+      return parentOnly
+        ? {
+            delivered: false,
+            path: "direct",
+            reason: "requester_turn_pending",
+            disposition: "retryable",
+          }
+        : { delivered: true, path: "direct" };
     }
 
     const directAnnounceResult = getGatewayAgentResult(directAnnounceResponse);
-    const directDeliveryFailure =
-      (shouldDeliverAgentFinal || requiresMessageToolDelivery) && directAnnounceResult
-        ? getAgentCommandDeliveryFailure(directAnnounceResult)
-        : undefined;
-    if (directDeliveryFailure) {
-      return {
-        delivered: false,
-        path: "direct",
-        error: directDeliveryFailure,
-        ...(directAnnounceResult && hasPayloadOutcomeSendEvidence(directAnnounceResult)
-          ? { disposition: "ambiguous" as const }
-          : {}),
-      };
+    const directAnnounceRecord = asOptionalRecord(directAnnounceResponse);
+    if (parentOnly) {
+      return resolvePrivateCompletionDeliveryResult(directAnnounceRecord);
     }
+    const hasFinalMessagingToolDelivery = Boolean(
+      directAnnounceResult &&
+      hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget, {
+        requireFinalReply: true,
+      }),
+    );
     const hasMessagingToolDelivery = Boolean(
       directAnnounceResult &&
       hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget),
     );
-    const completionPayloadVisibility = {
-      includeErrorPayloads: false,
-      includeReasoningPayloads: false,
-    };
-    const hasVisibleGatewayPayload = Boolean(
-      directAnnounceResult &&
-      (hasVisibleAgentPayload(directAnnounceResult, completionPayloadVisibility) ||
-        hasMessagingToolDelivery),
-    );
+    const requiresAutomaticFinalReceipt =
+      shouldDeliverAgentFinal && (params.expectsCompletionMessage || params.requireVisibleReply);
+    const automaticEvidence = getAutomaticDeliveryEvidence(directAnnounceResult ?? {});
+    const directDeliveryFailure =
+      (shouldDeliverAgentFinal || requiresMessageToolDelivery) && directAnnounceResult
+        ? getAgentCommandDeliveryFailure(directAnnounceResult)
+        : undefined;
+    // Automatic-delivery diagnostics and a committed source message are independent facts.
+    // Once the message tool delivered the owed final, the task must settle as delivered.
+    if (
+      directDeliveryFailure &&
+      !(requiresAutomaticFinalReceipt ? hasFinalMessagingToolDelivery : hasMessagingToolDelivery)
+    ) {
+      return {
+        delivered: false,
+        path: "direct",
+        error: directDeliveryFailure,
+        ...(automaticEvidence.mayHaveSent ? { disposition: "ambiguous" as const } : {}),
+      };
+    }
     const hasVisibleNonSilentGatewayPayload = Boolean(
       directAnnounceResult &&
       hasVisibleAgentPayload(directAnnounceResult, {
-        ...completionPayloadVisibility,
+        includeErrorPayloads: false,
+        includeReasoningPayloads: false,
+        requireTerminalContent: true,
         includeSilentReplyPayloads: false,
       }),
     );
+    const terminalDelivery = normalizeAgentRunTerminalDeliverySnapshot(
+      directAnnounceResult?.deliveryStatus,
+    );
+    const automaticFinalDelivered =
+      terminalDelivery?.status === "sent" && terminalDelivery.resultCount > 0;
+    if (
+      requiresAutomaticFinalReceipt &&
+      !hasFinalMessagingToolDelivery &&
+      terminalDelivery?.status === "suppressed" &&
+      // Only genuinely empty output can fall back; another payload may have
+      // been sent or intentionally cancelled by policy.
+      (automaticEvidence.mayHaveSent ||
+        automaticEvidence.suppressionReason !== "no_visible_payload")
+    ) {
+      return {
+        delivered: false,
+        path: "direct",
+        reason: automaticEvidence.mayHaveSent ? undefined : "delivery_suppressed",
+        error: automaticEvidence.mayHaveSent
+          ? "automatic completion delivery could not be confirmed"
+          : (automaticEvidence.suppressionReason ?? "automatic completion delivery suppressed"),
+        disposition: automaticEvidence.mayHaveSent ? "ambiguous" : "intentional_non_delivery",
+        terminal: automaticEvidence.mayHaveSent ? undefined : true,
+      };
+    }
+    if (
+      directAnnounceRecord?.status === "ok" &&
+      directAnnounceResult?.meta?.yielded === true &&
+      !directAnnounceResult.meta.error &&
+      !directAnnounceResult.meta.aborted &&
+      !automaticFinalDelivered
+    ) {
+      if (
+        directAnnounceResult.requesterContinuationSettled === true &&
+        !hasFinalMessagingToolDelivery &&
+        !hasVisibleNonSilentGatewayPayload
+      ) {
+        // Core owns the next wave or observed it complete. Real final evidence
+        // still follows its normal path below.
+        return { delivered: true, path: "direct" };
+      }
+      if (
+        isSubagentCompletion &&
+        params.expectsCompletionMessage &&
+        requiresMessageToolDelivery &&
+        !hasMessagingToolDelivery
+      ) {
+        // A yielded requester still owns pending work, not a tool-running fallback.
+        return {
+          delivered: false,
+          path: "direct",
+          reason: "completion_handoff_pending",
+          disposition: "session_queued",
+        };
+      }
+    }
     const hasIntentionalSilentCompletionReply = Boolean(
       directAnnounceResult && hasIntentionalSilentAgentPayload(directAnnounceResult),
     );
@@ -458,11 +586,11 @@ export async function sendSubagentAnnounceDirectly(params: {
       !hasVisibleNonSilentGatewayPayload &&
       !hasMessagingToolDelivery
     ) {
-      const textDelivery = await tryTextCompletionDirectDelivery();
+      const textDelivery = await tryTextCompletionDirectDelivery(textCompletionDirectDeliveryKind);
       if (textDelivery) {
         return textDelivery;
       }
-      if (hasRequiredSubagentNoOutputCompletion && !hasCompletionSideEffect) {
+      if (hasSuccessfulTrustedSubagentNoOutputCompletion && !hasCompletionSideEffect) {
         return {
           delivered: false,
           path: "direct",
@@ -472,7 +600,7 @@ export async function sendSubagentAnnounceDirectly(params: {
       }
     }
     if (
-      hasRequiredSubagentNoOutputCompletion &&
+      hasSuccessfulTrustedSubagentNoOutputCompletion &&
       !hasVisibleRequiredCompletionReply &&
       hasCompletionSideEffect
     ) {
@@ -492,7 +620,7 @@ export async function sendSubagentAnnounceDirectly(params: {
         subagentDirectMessageCompletionRequiresMessageTool ||
         hasRequiredSubagentNoOutputCompletion)
     ) {
-      if (hasRequiredSubagentNoOutputCompletion) {
+      if (hasSuccessfulTrustedSubagentNoOutputCompletion) {
         return {
           delivered: false,
           path: "direct",
@@ -501,7 +629,9 @@ export async function sendSubagentAnnounceDirectly(params: {
         };
       }
       if (subagentDirectMessageCompletionRequiresMessageTool) {
-        const textDelivery = await tryTextCompletionDirectDelivery();
+        const textDelivery = await tryTextCompletionDirectDelivery(
+          textCompletionDirectDeliveryKind,
+        );
         if (textDelivery) {
           return textDelivery;
         }
@@ -511,47 +641,37 @@ export async function sendSubagentAnnounceDirectly(params: {
         path: "direct",
         reason: "message_tool_delivery_missing",
         error: "completion agent did not use the message tool for message-tool-only delivery",
+        // The requester execution finished; another agent turn can repeat its
+        // effects. Retain the completion for explicit recovery instead.
+        disposition: "permanent_failure",
       };
     }
-    const hasVisibleCompletionReply = Boolean(
-      directAnnounceResult &&
-      ((params.requireVisibleReply
-        ? hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget, {
-            requireFinalReply: true,
-          })
-        : hasMessagingToolDelivery) ||
-        (hasVisibleAgentPayload(
-          params.requireVisibleReply
-            ? {
-                payloads: Array.isArray(directAnnounceResult.payloads)
-                  ? directAnnounceResult.payloads.filter((payload) => {
-                      const flags = payload as Record<string, unknown>;
-                      return (
-                        flags?.isCommentary !== true &&
-                        flags?.isCompactionNotice !== true &&
-                        flags?.isFallbackNotice !== true &&
-                        flags?.isStatusNotice !== true &&
-                        flags?.visible !== false
-                      );
-                    })
-                  : [],
-              }
-            : directAnnounceResult,
-          { ...completionPayloadVisibility, includeSilentReplyPayloads: false },
-        ) &&
-          (!params.requireVisibleReply ||
-            directAnnounceResult.deliveryStatus?.status !== "suppressed"))),
-    );
+    const hasRequesterVisibleFinalDelivery =
+      hasFinalMessagingToolDelivery || (shouldDeliverAgentFinal && automaticFinalDelivered);
+    const hasVisibleCompletionReply =
+      hasRequesterVisibleFinalDelivery ||
+      (!shouldDeliverAgentFinal && !params.requireVisibleReply && hasMessagingToolDelivery) ||
+      // Nested requesters and internal sessions observe the final in their transcript.
+      // Unresolved external origins still require delivery evidence.
+      (!requiresMessageToolDelivery &&
+        hasVisibleNonSilentGatewayPayload &&
+        directAnnounceResult?.deliveryStatus?.status !== "suppressed" &&
+        (params.requesterIsSubagent ||
+          [effectiveDirectOrigin, requesterSessionOrigin].every((origin) =>
+            origin?.channel
+              ? normalizeMessageChannel(origin.channel) === INTERNAL_MESSAGE_CHANNEL
+              : !origin?.to,
+          )));
     const acceptsIntentionalSilentCompletion =
       hasIntentionalSilentCompletionReply && !isSubagentCompletion;
     if (
       !hasVisibleCompletionReply &&
       (params.requireVisibleReply ||
         (params.expectsCompletionMessage &&
-          !shouldDeliverAgentFinal &&
-          !requiresMessageToolDelivery &&
-          !hasCompletionSideEffect &&
-          !acceptsIntentionalSilentCompletion))
+          (shouldDeliverAgentFinal ||
+            (!requiresMessageToolDelivery &&
+              !hasCompletionSideEffect &&
+              !acceptsIntentionalSilentCompletion))))
     ) {
       return {
         delivered: false,
@@ -560,31 +680,36 @@ export async function sendSubagentAnnounceDirectly(params: {
         error: "completion agent did not produce a visible reply",
       };
     }
-    if (
-      params.expectsCompletionMessage &&
-      shouldDeliverAgentFinal &&
-      !isSubagentCompletion &&
-      !hasVisibleGatewayPayload
-    ) {
-      return {
-        delivered: false,
-        path: "direct",
-        reason: "visible_reply_missing",
-        error: "completion agent did not produce a visible reply",
-      };
-    }
+    const requesterVisibleFinalCommitted =
+      !params.requesterIsSubagent &&
+      (hasRequesterVisibleFinalDelivery ||
+        (!params.expectsCompletionMessage &&
+          directAnnounceRecord?.status === "ok" &&
+          hasVisibleNonSilentGatewayPayload &&
+          hasVisibleCompletionReply));
+    const finalAssistantVisibleText =
+      requesterVisibleFinalCommitted &&
+      typeof directAnnounceResult?.meta?.finalAssistantVisibleText === "string"
+        ? truncateUtf16Safe(
+            directAnnounceResult.meta.finalAssistantVisibleText.trim(),
+            REQUESTER_FINAL_VISIBLE_TEXT_MAX_CHARS,
+          )
+        : "";
 
     return {
       delivered: true,
       path: "direct",
+      // Synthetic wakes can commit their final to the requester transcript.
+      // A canceled partial payload or accepted handoff is not that receipt.
+      ...(requesterVisibleFinalCommitted ? { requesterVisibleFinalDelivered: true } : {}),
+      ...(finalAssistantVisibleText ? { finalAssistantVisibleText } : {}),
     };
   } catch (err) {
-    const permanent = isPermanentAnnounceDeliveryError(err);
-    const disposition = permanent
-      ? hasAnnounceSendEvidence(err)
-        ? "ambiguous"
-        : "permanent_failure"
-      : "retryable";
+    const disposition = hasAnnounceSendEvidence(err)
+      ? "ambiguous"
+      : isPermanentAnnounceDeliveryError(err)
+        ? "permanent_failure"
+        : "retryable";
     return {
       delivered: false,
       path: "direct",

@@ -1,11 +1,11 @@
 // Msteams plugin module implements sdk behavior.
-import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { readSecretFile } from "openclaw/plugin-sdk/secret-file";
 import { normalizeBotFrameworkServiceUrl } from "./bot-framework-service-url.js";
 import type { MSTeamsCloudName } from "./cloud.js";
 import { resolveMSTeamsPrivateQaRuntime } from "./qa/private-runtime.js";
 import { MSTEAMS_REQUEST_TIMEOUT_MS } from "./request-timeout.js";
+import { msteamsConnectorHandoffInterceptor } from "./send-handoff.js";
 import type { MSTeamsCredentials, MSTeamsFederatedCredentials } from "./token.js";
 import { buildOpenClawUserAgentFragment } from "./user-agent.js";
 
@@ -278,6 +278,7 @@ async function createMSTeamsApp(
       options?.httpClient ?? {
         headers: { "User-Agent": buildOpenClawUserAgentFragment() },
         timeout: MSTEAMS_REQUEST_TIMEOUT_MS,
+        interceptors: [msteamsConnectorHandoffInterceptor],
       },
     ...(privateQaRuntime
       ? {
@@ -298,7 +299,8 @@ async function createMSTeamsApp(
   };
 
   if (creds.type === "federated") {
-    return await createFederatedApp(creds, App, appOptions);
+    // Teams SDK otherwise lets ambient CLIENT_SECRET override both federated modes.
+    return await createFederatedApp(creds, App, { clientSecret: "", ...appOptions });
   }
   return new App({
     clientId: creds.appId,
@@ -333,11 +335,8 @@ async function createFederatedApp(
   let privateKey: string;
   try {
     privateKey = await readSecretFile(creds.certificatePath, "Microsoft Teams certificate");
-  } catch (err: unknown) {
-    const msg = coerceErrorMessage(err);
-    throw new Error(`Failed to read certificate file at '${creds.certificatePath}': ${msg}`, {
-      cause: err,
-    });
+  } catch {
+    throw new Error("Failed to read certificate file: the configured credential is unavailable.");
   }
 
   return createCertificateApp(creds, privateKey, App, appOptions);
