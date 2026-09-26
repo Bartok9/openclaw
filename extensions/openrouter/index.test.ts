@@ -327,6 +327,47 @@ describe("openrouter provider hooks", () => {
     expect(model?.baseUrl).toBe("https://openrouter.ai/api/v1");
   });
 
+  it("prefers SecretRef-aware usage auth candidates over the sync config/store resolver", async () => {
+    const provider = await registerSingleProviderPlugin(openrouterPlugin);
+    const resolveApiKeyFromConfigAndStore = vi.fn(() => "plaintext-openrouter-key");
+    const resolveApiKeyCandidatesFromConfigAndStore = vi.fn(async () => [
+      "secretref-openrouter-key",
+    ]);
+
+    const auth = await provider.resolveUsageAuth?.({
+      config: {},
+      env: {},
+      provider: "openrouter",
+      resolveApiKeyFromConfigAndStore,
+      resolveApiKeyCandidatesFromConfigAndStore,
+      resolveOAuthToken: async () => null,
+    } as never);
+
+    expect(auth).toEqual({ token: "secretref-openrouter-key" });
+    expect(resolveApiKeyCandidatesFromConfigAndStore).toHaveBeenCalledWith({
+      envDirect: [undefined],
+    });
+    expect(resolveApiKeyFromConfigAndStore).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the sync usage auth resolver when SecretRef candidates are unavailable", async () => {
+    const provider = await registerSingleProviderPlugin(openrouterPlugin);
+    const resolveApiKeyFromConfigAndStore = vi.fn(() => "plaintext-openrouter-key");
+
+    const auth = await provider.resolveUsageAuth?.({
+      config: {},
+      env: { OPENROUTER_API_KEY: "env-openrouter-key" },
+      provider: "openrouter",
+      resolveApiKeyFromConfigAndStore,
+      resolveOAuthToken: async () => null,
+    } as never);
+
+    expect(auth).toEqual({ token: "plaintext-openrouter-key" });
+    expect(resolveApiKeyFromConfigAndStore).toHaveBeenCalledWith({
+      envDirect: ["env-openrouter-key"],
+    });
+  });
+
   it("forwards configured proxy destination and headers to both usage requests", async () => {
     const provider = await registerSingleProviderPlugin(openrouterPlugin);
     const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ data: { usage: 1 } }));
