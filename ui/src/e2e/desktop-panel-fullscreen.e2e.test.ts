@@ -65,7 +65,10 @@ async function openDesktopPanel(page: Page) {
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent("openclaw:command-palette-open"));
   });
-  await page.getByRole("combobox", { name: "Search chats and commands…" }).waitFor();
+  await page
+    .locator("openclaw-command-palette")
+    .getByRole("textbox", { name: "Search or start a task…" })
+    .waitFor();
   await page.getByRole("option", { name: "Desktop", exact: true }).click();
   const panel = page.locator("openclaw-desktop-panel");
   await panel.locator("section[aria-label='Desktop']").waitFor();
@@ -249,7 +252,11 @@ suite.define(() => {
             .poll(async () => (await gateway.getRequests("desktop.observe")).length)
             .toBe(2);
           expect(await page.evaluate(() => document.fullscreenElement !== null)).toBe(true);
-          await panel.locator(".desktop-surface canvas").waitFor();
+          // The authenticated handoff keeps both canvases until the replacement connects.
+          await expect
+            .poll(() => screenHandle?.evaluate((element) => element.isConnected))
+            .toBe(false);
+          await screen.waitFor();
           await expect
             .poll(() => panel.getByRole("button", { name: "Take control", exact: true }).count())
             .toBe(0);

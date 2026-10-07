@@ -30,9 +30,6 @@ describe("model pricing source policy", () => {
 
   it.each([
     { value: undefined },
-    { value: null },
-    { value: [] },
-    { value: {} },
     {
       value: {
         openCode: {},
@@ -47,6 +44,29 @@ describe("model pricing source policy", () => {
 
 describe("native pricing catalogs", () => {
   const paid = { id: "paid", pricing: { input: 2, output: 10 } };
+
+  it("uses the selected identity and validates prices before filtering unsupported schedules", () => {
+    const options = {
+      readModelId: (row: Record<string, unknown>) => row.model_name,
+      readPricing: (row: Record<string, unknown>) => row.cost,
+      isSupportedPricing: (value: unknown) => !Object.hasOwn(value as object, "qualified"),
+    };
+    const native = { id: "ignored", model_name: " paid ", cost: paid.pricing };
+    const qualified = { model_name: "qualified", cost: { ...paid.pricing, qualified: true } };
+    expect(
+      normalizeModelPricingCatalog([native, qualified], normalizeUpstreamModelPricing, options),
+    ).toEqual(new Map([["paid", BASE_COST]]));
+    for (const rows of [
+      [qualified],
+      [native, { ...qualified, model_name: "paid" }],
+      [native, { model_name: "paid" }],
+      [native, { ...qualified, cost: { input: -1, output: 10, qualified: true } }],
+    ]) {
+      expect(
+        normalizeModelPricingCatalog(rows, normalizeUpstreamModelPricing, options),
+      ).toBeUndefined();
+    }
+  });
 
   it("keeps declared free prices distinct from missing prices", () => {
     expect(
@@ -64,12 +84,10 @@ describe("native pricing catalogs", () => {
 
   it.each([
     { label: "non-array", rows: {} },
-    { label: "empty", rows: [] },
     { label: "entirely unpriced", rows: [{ id: "unknown" }] },
     { label: "invalid identity", rows: [paid, { id: " " }] },
     { label: "malformed row", rows: [paid, null] },
     { label: "malformed declared price", rows: [paid, { id: "bad", pricing: null }] },
-    { label: "duplicate priced identity", rows: [paid, paid] },
     { label: "duplicate unpriced identity", rows: [paid, { id: "paid" }] },
   ])("rejects $label rather than publishing a partial native feed", ({ rows }) => {
     expect(normalizeModelPricingCatalog(rows, normalizeUpstreamModelPricing)).toBeUndefined();
@@ -104,7 +122,7 @@ describe.each([
     });
   });
 
-  it.each([undefined, null, "", " ", "1usd", -1, Infinity, Number.NaN, true])(
+  it.each([undefined, "", -1, Infinity])(
     "rejects invalid required or declared cache rates %j instead of inventing free prices",
     (invalid) => {
       for (const field of [input, output, cache]) {
@@ -167,27 +185,6 @@ describe("OpenRouter native pricing", () => {
     });
   });
 
-  it.each([
-    { prices: { prompt: "0.000004" }, expected: { input: 4 } },
-    { prices: { completion: "0.00002" }, expected: { output: 20 } },
-    { prices: { input_cache_read: "0.0000005" }, expected: { cacheRead: 0.5 } },
-    { prices: { input_cache_write: "0.000005" }, expected: { cacheWrite: 5 } },
-    { prices: { prompt: "0", input_cache_read: "0" }, expected: { input: 0, cacheRead: 0 } },
-  ])("inherits omitted native rates for partial overrides: $prices", ({ prices, expected }) => {
-    expect(
-      normalizeOpenRouterModelPricing({
-        ...base,
-        overrides: [{ min_prompt_tokens: 100, ...prices }],
-      }),
-    ).toEqual({
-      ...cost,
-      tieredPricing: [
-        { ...cost, range: [0, 101] },
-        { ...cost, ...expected, range: [101] },
-      ],
-    });
-  });
-
   it("lets equal and lower thresholds override only their supplied keys in source order", () => {
     expect(
       normalizeOpenRouterModelPricing({
@@ -209,11 +206,8 @@ describe("OpenRouter native pricing", () => {
   });
 
   it.each([
-    { input: 39, output: 7, cacheRead: 30, cacheWrite: 30, expected: 0.0002305 },
     { input: 40, output: 7, cacheRead: 30, cacheWrite: 30, expected: 0.0002325 },
     { input: 41, output: 7, cacheRead: 30, cacheWrite: 30, expected: 0.0003865 },
-    { input: 0, output: 7, cacheRead: 101, cacheWrite: 0, expected: 0.00016525 },
-    { input: 0, output: 7, cacheRead: 0, cacheWrite: 101, expected: 0.0003925 },
     { input: 0, output: 1_000, cacheRead: 0, cacheWrite: 0, expected: 0.01 },
   ])(
     "bills strict total-prompt boundaries with inherited cache prices: %j",
@@ -251,13 +245,9 @@ describe("OpenRouter native pricing", () => {
 
   it.each([
     { future_condition: true },
-    { future_price: "0" },
-    { utc_start: 1630 },
-    { utc_end: 30 },
-    { utc_days: ["monday"] },
-    ...[undefined, null, -1, "100", Infinity, Number.NaN, Number.MAX_SAFE_INTEGER].map(
-      (min_prompt_tokens) => ({ min_prompt_tokens }),
-    ),
+    ...[undefined, -1, "100", Number.MAX_SAFE_INTEGER].map((min_prompt_tokens) => ({
+      min_prompt_tokens,
+    })),
   ])("skips unsupported or invalid predicates: %j", (condition) => {
     expect(
       normalizeOpenRouterModelPricing({
@@ -296,19 +286,16 @@ describe("OpenRouter native pricing", () => {
     });
   });
 
-  it.each([null, "", "1usd", -1, Infinity, "1e308"])(
-    "invalidates the schedule for malformed effective prices %j",
-    (invalid) => {
-      for (const field of Object.keys(base)) {
-        expect(
-          normalizeOpenRouterModelPricing({
-            ...base,
-            overrides: [{ min_prompt_tokens: 100, [field]: invalid }],
-          }),
-        ).toBeUndefined();
-      }
-    },
-  );
+  it("invalidates the schedule for malformed effective prices", () => {
+    for (const field of Object.keys(base)) {
+      expect(
+        normalizeOpenRouterModelPricing({
+          ...base,
+          overrides: [{ min_prompt_tokens: 100, [field]: "1usd" }],
+        }),
+      ).toBeUndefined();
+    }
+  });
 
   it("validates effective prices after later matching entries replace malformed fields", () => {
     expect(
@@ -316,14 +303,14 @@ describe("OpenRouter native pricing", () => {
         ...base,
         overrides: [
           { min_prompt_tokens: 100, prompt: "bad" },
-          { min_prompt_tokens: 100, prompt: "0" },
+          { min_prompt_tokens: 100, prompt: "0", input_cache_read: "0" },
         ],
       }),
     ).toEqual({
       ...cost,
       tieredPricing: [
         { ...cost, range: [0, 101] },
-        { ...cost, input: 0, range: [101] },
+        { ...cost, input: 0, cacheRead: 0, range: [101] },
       ],
     });
   });

@@ -1,28 +1,26 @@
 import type { GatewayBrowserClient, GatewayEventFrame } from "../../api/gateway.ts";
 import { loadSettings } from "../../app/settings.ts";
 import { t } from "../../i18n/index.ts";
+import { bytesToBase64 } from "../../lib/bytes-base64.ts";
 import { formatUiError, formatUiExternalText } from "../../lib/format-error.ts";
 import {
-  bytesToBase64,
   floatToG711Ulaw,
   RealtimeTalkMediaStreamMeter,
   RealtimeTalkPcmInputPump,
-} from "./realtime-talk-audio.ts";
-import {
-  describeRealtimeTalkInputError,
-  RealtimeTalkInputController,
-} from "./realtime-talk-input.ts";
-import { RealtimeTalkLevelSignal } from "./realtime-talk-level.ts";
+} from "./talk/audio.ts";
+import { describeRealtimeTalkInputError, RealtimeTalkInputController } from "./talk/input.ts";
+import { RealtimeTalkLevelSignal } from "./talk/level.ts";
 
 const HOLD_ARM_DELAY_MS = 150,
   HOLD_PROGRESS_MS = 350;
+const FINAL_TRANSCRIPT_MAX_WAIT_MS = 10_000;
 const DICTATION_ENCODING = "g711_ulaw";
 const DICTATION_SAMPLE_RATE_HZ = 8000;
 const MAX_PENDING_AUDIO_SAMPLES = DICTATION_SAMPLE_RATE_HZ * 10;
 
 type DictationPhase = "idle" | "pressing" | "holding" | "connecting" | "recording" | "stopping";
 
-// Transcription relay talk.event payload (src/gateway/talk-transcription-relay.ts):
+// Transcription relay talk.event payload (src/gateway/talk/transcription-relay.ts):
 // the transcriptionSessionId envelope is the relay's emission shape, shared with the
 // Android dictation client; the canonical TalkEvent rides alongside as `talkEvent`.
 type DictationEvent = {
@@ -61,7 +59,7 @@ type ComposerDictationControllerOptions = {
   enabled: boolean;
   dictationAvailable?: boolean;
   realtimeTalkActive: boolean;
-  onCommit: (text: string) => void;
+  onCommit: (text: string, late?: true) => void;
   onError: (message: string, failure: ComposerDictationFailure) => void;
   onStateChange: () => void;
   onTap?: () => void;
@@ -128,6 +126,8 @@ class ComposerDictationSession {
   private stopped = false;
   private discarded = false;
   private failed = false;
+  private gatewayDisconnected = false;
+  private settleLateFinalDrain: ((discard: boolean) => void) | null = null;
 
   constructor(
     private readonly client: GatewayBrowserClient,
@@ -186,13 +186,30 @@ class ComposerDictationSession {
   }
 
   transcriptSnapshot(): string {
-    return this.transcriptIncludingPartial();
+    return [...this.finalTranscripts, this.currentPartial].filter(Boolean).join(" ").trim();
   }
 
-  async finish(): Promise<void> {
+  async finish(drainFinalTranscript = false): Promise<string> {
+    const lateFinal =
+      drainFinalTranscript && !this.gatewayDisconnected ? this.waitForLateFinal() : null;
+    const cleanup = this.stopAndClose(true);
+    if (lateFinal) {
+      // The bounded final result must not inherit stalled create, append, or close RPCs.
+      void cleanup.catch(() => undefined);
+      return lateFinal;
+    }
+    return cleanup.then(() => this.transcriptSnapshot());
+  }
+
+  async cancel(): Promise<void> {
+    this.discarded = true;
+    await this.stopAndClose(false);
+  }
+
+  private async stopAndClose(reportStartFailure: boolean): Promise<void> {
     await this.stopCapture();
     await this.startPromise?.catch((error: unknown) => {
-      if (!isAbortError(error)) {
+      if (reportStartFailure && !isAbortError(error)) {
         this.reportFailure(messageFromError(error));
       }
     });
@@ -200,16 +217,14 @@ class ComposerDictationSession {
     await this.closeRemote();
   }
 
-  async cancel(): Promise<void> {
-    this.discarded = true;
-    await this.stopCapture();
-    await this.startPromise?.catch(() => undefined);
-    await this.appendChain;
-    await this.closeRemote();
+  markGatewayDisconnected(): boolean {
+    this.gatewayDisconnected = true;
+    this.settleLateFinalDrain?.(false);
+    return this.hasTranscript();
   }
 
-  markGatewayDisconnected(): boolean {
-    return this.hasTranscript();
+  cancelPendingFinal(): void {
+    this.settleLateFinalDrain?.(true);
   }
 
   private appendAudio(samples: Float32Array): void {
@@ -261,19 +276,14 @@ class ComposerDictationSession {
     ) {
       return;
     }
-    if (payload.type === "partial" && typeof payload.text === "string") {
-      this.currentPartial = payload.text.trim();
-      this.callbacks.onTranscriptChange();
-      return;
-    }
-    if (payload.type === "transcript" && typeof payload.text === "string") {
+    if (
+      (payload.type === "transcript" || payload.type === "partial") &&
+      typeof payload.text === "string"
+    ) {
       const text = payload.text.trim();
-      if (payload.final !== true) {
+      if (payload.type === "partial" || payload.final !== true) {
         this.currentPartial = text;
-        this.callbacks.onTranscriptChange();
-        return;
-      }
-      if (text) {
+      } else if (text) {
         this.finalTranscripts.push(text);
         this.currentPartial = "";
       }
@@ -306,10 +316,6 @@ class ComposerDictationSession {
     return this.finalTranscripts.length > 0 || Boolean(this.currentPartial);
   }
 
-  private transcriptIncludingPartial(): string {
-    return [...this.finalTranscripts, this.currentPartial].filter(Boolean).join(" ").trim();
-  }
-
   private async stopCapture(): Promise<void> {
     if (this.stopped) {
       return;
@@ -317,7 +323,6 @@ class ComposerDictationSession {
     this.stopped = true;
     this.input.stop();
     this.inputPump.stop();
-    // Retire UI events immediately; queued audio may still drain into remote close.
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.inputMeter?.stop();
@@ -336,6 +341,38 @@ class ComposerDictationSession {
       .catch(() => undefined);
     return this.closePromise;
   }
+
+  private waitForLateFinal(): Promise<string> {
+    return new Promise((resolve) => {
+      const transcripts: string[] = [];
+      let unsubscribe = () => {};
+      const finish = (text: string) => {
+        globalThis.clearTimeout(timer);
+        unsubscribe();
+        this.settleLateFinalDrain = null;
+        resolve(text);
+      };
+      const transcript = () => transcripts.join(" ").trim();
+      const timer = globalThis.setTimeout(() => finish(transcript()), FINAL_TRANSCRIPT_MAX_WAIT_MS);
+      unsubscribe = this.client.addEventListener((frame) => {
+        const payload = eventPayload(frame);
+        if (!payload || payload.transcriptionSessionId !== this.transcriptionSessionId) {
+          return;
+        }
+        if (
+          payload.type === "transcript" &&
+          payload.final === true &&
+          typeof payload.text === "string" &&
+          payload.text.trim()
+        ) {
+          transcripts.push(payload.text.trim());
+        } else if (payload.type === "error" || payload.type === "close") {
+          finish(transcript());
+        }
+      });
+      this.settleLateFinalDrain = (discard) => finish(discard ? "" : transcript());
+    });
+  }
 }
 
 export class ComposerDictationController {
@@ -350,6 +387,7 @@ export class ComposerDictationController {
   private suppressClick = false;
   private suppressedPointerId: number | null = null;
   private suppressClickTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  private pendingCommitSession: ComposerDictationSession | null = null;
   private disposed = false;
 
   constructor(options: ComposerDictationControllerOptions) {
@@ -399,6 +437,9 @@ export class ComposerDictationController {
 
   update(options: ComposerDictationControllerOptions): void {
     this.options = options;
+    if (!options.connected) {
+      this.pendingCommitSession?.markGatewayDisconnected();
+    }
     if (this.phase === "stopping") {
       return;
     }
@@ -424,7 +465,7 @@ export class ComposerDictationController {
     this.pointerTarget = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
     this.pointerBounds = this.pointerTarget?.getBoundingClientRect() ?? null;
     this.pointerTarget?.setPointerCapture?.(event.pointerId);
-    this.pointerTarget?.addEventListener("lostpointercapture", this.handleLostPointerCapture);
+    this.pointerTarget?.addEventListener("lostpointercapture", this.handleDocumentPointerCancel);
     this.suppressClick = true;
     this.suppressedPointerId = event.pointerId;
     this.setPhase("pressing");
@@ -471,6 +512,7 @@ export class ComposerDictationController {
 
   dispose(): void {
     this.disposed = true;
+    this.retirePendingCommit();
     this.clearClickSuppression();
     void this.stop({ commit: false });
   }
@@ -528,16 +570,9 @@ export class ComposerDictationController {
     void this.stop({ commit: false });
   };
 
-  private readonly handleLostPointerCapture = (event: Event): void => {
-    if ((event as PointerEvent).pointerId === this.pointerId) {
-      void this.stop({ commit: false });
-    }
-  };
-
   private readonly handleVisibilityChange = (): void => {
     if (document.visibilityState === "hidden") {
-      this.clearClickSuppression();
-      void this.stop({ commit: false });
+      this.handleWindowBlur();
     }
   };
 
@@ -592,11 +627,12 @@ export class ComposerDictationController {
         }
       },
     });
+    this.retirePendingCommit();
     this.session = session;
     try {
       await session.start();
     } catch (error) {
-      if (this.session !== session || this.disposed || this.isStopping()) {
+      if (this.session !== session || this.disposed || this.finalizing) {
         return;
       }
       this.options.onError(messageFromError(error), { kind: "start", preservesText: false });
@@ -623,16 +659,46 @@ export class ComposerDictationController {
     if (committed) {
       this.options.onCommit(transcript);
     }
-    // UI ownership ends at the operator action. Provider close can be slow, but
-    // it must never retain the composer in a transient finalizing state.
-    const close = options.commit ? session.finish() : session.cancel();
-    void close.catch(() => undefined);
-    return Promise.resolve(committed);
+    if (!options.commit) {
+      void session.cancel().catch(() => undefined);
+      return Promise.resolve(false);
+    }
+    if (committed) {
+      void session.finish().catch(() => undefined);
+      return Promise.resolve(true);
+    }
+    // The composer unlocks immediately, while this exact stopped session keeps
+    // ownership of its bounded final accumulator until a new session supersedes it.
+    this.pendingCommitSession = session;
+    return session
+      .finish(true)
+      .then((lateTranscript) => {
+        const ownsPendingCommit = this.pendingCommitSession === session;
+        if (ownsPendingCommit) {
+          this.pendingCommitSession = null;
+        }
+        if (!ownsPendingCommit || !lateTranscript || !wasActive || this.disposed) {
+          return false;
+        }
+        this.options.onCommit(lateTranscript, true);
+        return true;
+      })
+      .catch(() => {
+        if (this.pendingCommitSession === session) {
+          this.pendingCommitSession = null;
+        }
+        return false;
+      });
   }
 
   private reset(): void {
     this.inputLevel.set(0);
     this.setPhase("idle");
+  }
+
+  private retirePendingCommit(): void {
+    this.pendingCommitSession?.cancelPendingFinal();
+    this.pendingCommitSession = null;
   }
 
   private clearPointerGesture(): void {
@@ -641,7 +707,10 @@ export class ComposerDictationController {
       this.holdTimer = null;
     }
     if (this.pointerId !== null) {
-      this.pointerTarget?.removeEventListener("lostpointercapture", this.handleLostPointerCapture);
+      this.pointerTarget?.removeEventListener(
+        "lostpointercapture",
+        this.handleDocumentPointerCancel,
+      );
       try {
         this.pointerTarget?.releasePointerCapture?.(this.pointerId);
       } catch {
@@ -672,10 +741,6 @@ export class ComposerDictationController {
     document.removeEventListener("pointercancel", this.handleSuppressedPointerRelease);
     this.suppressedPointerId = null;
     this.suppressClick = false;
-  }
-
-  private isStopping(): boolean {
-    return this.phase === "stopping";
   }
 
   private setPhase(phase: DictationPhase): void {

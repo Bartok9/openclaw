@@ -21,7 +21,7 @@ export class CodexTranscriptCheckpoint {
   private lastTimestamp = 0;
   private writing = Promise.resolve();
   private tainted = false;
-  private closed = false;
+  private state: "open" | "closed" | "abandoned" = "open";
 
   constructor(
     private readonly params: EmbeddedRunAttemptParamsV2,
@@ -56,16 +56,21 @@ export class CodexTranscriptCheckpoint {
   };
 
   enqueue = (entry: CodexTranscriptCheckpointEntry): void => {
-    if (this.params.sessionTarget && !this.closed) {
+    if (this.params.sessionTarget && this.state === "open") {
       this.pending.push(entry);
     }
   };
 
+  abandon(): void {
+    this.state = "abandoned";
+    this.pending.length = 0;
+  }
+
   flush(close = false): Promise<void> {
-    if (this.closed) {
+    if (this.state !== "open") {
       return this.writing;
     }
-    this.closed = close;
+    this.state = close ? "closed" : "open";
     this.writing = this.writing.then(async () => {
       // An unfinished commentary item or linked raw patch output owns its place
       // in history. Later work cannot overtake it; teardown records what arrived.
@@ -81,6 +86,7 @@ export class CodexTranscriptCheckpoint {
           ? [
               projectAgentHarnessTranscriptMessageForDisplay({
                 hidden: this.params.trigger === "memory",
+                inputProvenance: this.params.inputProvenance,
                 message: applyCodexTranscriptTaint(message, taint),
               }),
             ]
@@ -88,6 +94,11 @@ export class CodexTranscriptCheckpoint {
       });
       try {
         await codexTranscriptMirrorRuntime.mirror({
+          assertWriteCurrent: () => {
+            if (this.state === "abandoned") {
+              throw new Error("Codex transcript checkpoint was retired before write");
+            }
+          },
           ...this.params.sessionTarget,
           sessionId: this.params.sessionId,
           cwd: this.params.workspaceDir,

@@ -1,25 +1,26 @@
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
-import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.js";
+import { repairCanonicalSessionKeys } from "./doctor-session-canonical-keys.test-support.js";
 
 export const canonicalMemoryTestSupportModuleUrl = import.meta.url;
 
 async function main(): Promise<void> {
-  const [stateDir, storeTemplate] = process.argv.slice(2);
+  const [stateDir, storeTemplate, mode] = process.argv.slice(2);
   if (!stateDir || !storeTemplate) {
     throw new Error("usage: <state-dir> <store-template>");
   }
   process.env.OPENCLAW_STATE_DIR = stateDir;
   const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
   const result = await repairCanonicalSessionKeys({
-    apply: false,
+    apply: mode === "apply",
     cfg: {
-      agents: { list: [{ id: "main", default: true }] },
+      agents: { entries: { main: {} } },
       session: { store: storeTemplate },
     },
     env,
   });
-  process.stdout.write(JSON.stringify(result));
+  // The 160 MiB proof covers repair and result serialization, not unrelated Node shutdown tasks.
+  process.stdout.write(JSON.stringify(result), () => process.exit(0));
 }
 
 // Node resolves the bundle through shared node_modules; compare canonical paths.

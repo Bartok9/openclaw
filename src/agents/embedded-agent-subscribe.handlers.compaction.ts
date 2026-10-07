@@ -1,8 +1,3 @@
-/**
- * Handles embedded-agent compaction lifecycle events. The handlers pause
- * liveness, emit agent events, run hooks, reconcile persisted counts, and
- * clear stale usage after compaction rewrites history.
- */
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { recordSessionCompacted } from "../sessions/session-state-events.js";
@@ -24,6 +19,7 @@ type CompactionStartEvent =
   | {
       type: "compaction_start";
       reason?: unknown;
+      itemId?: string;
     };
 
 // Unknown reasons come from external runtimes or older sessions. Treat them as
@@ -37,9 +33,10 @@ function normalizeCompactionReason(reason: unknown): CompactionReason {
 function emitCompactionAgentEvent(
   ctx: EmbeddedAgentSubscribeContext,
   data:
-    | { phase: "start" }
+    | { phase: "start"; itemId?: string }
     | {
         phase: "end";
+        itemId?: string;
         completed: boolean;
         willRetry: boolean;
         outcome: SessionCompactionEndEvent["outcome"]["status"];
@@ -88,7 +85,6 @@ function runBestEffortCompactionHook(
   });
 }
 
-/** Handles compaction start events from an embedded agent session. */
 export function handleCompactionStart(
   ctx: EmbeddedAgentSubscribeContext,
   evt: CompactionStartEvent,
@@ -104,14 +100,13 @@ export function handleCompactionStart(
     reason,
     consoleMessage: `embedded run ${kind} start: runId=${ctx.params.runId} reason=${reason}`,
   });
-  emitCompactionAgentEvent(ctx, { phase: "start" });
+  emitCompactionAgentEvent(ctx, { phase: "start", ...(evt.itemId ? { itemId: evt.itemId } : {}) });
 
   // Hooks are fire-and-forget so compaction state updates and liveness pauses
   // cannot be delayed by plugin work.
   runBestEffortCompactionHook(ctx, "before");
 }
 
-/** Handles compaction completion, retry, and incomplete events. */
 export function handleCompactionEnd(
   ctx: EmbeddedAgentSubscribeContext,
   evt: SessionCompactionEndEvent,
@@ -122,12 +117,13 @@ export function handleCompactionEnd(
   ctx.state.compactionInFlight = false;
   const completed = outcome.status === "completed";
   const willRetry = completed && outcome.willRetry;
+  let recording: Promise<void> | undefined;
   if (completed) {
     ctx.incrementCompactionCount();
     ctx.noteCompactionTokensAfter(outcome.tokensAfter);
     const observedCompactionCount = ctx.getCompactionCount();
     if (ctx.params.sessionPersistence !== "detached") {
-      recordSessionCompacted({
+      recording = recordSessionCompacted({
         sessionKey: ctx.params.sessionKey,
         operationId: `${ctx.params.runId}:${observedCompactionCount}`,
         agentId: ctx.params.agentId,
@@ -218,6 +214,7 @@ export function handleCompactionEnd(
   }
   emitCompactionAgentEvent(ctx, {
     phase: "end",
+    ...(evt.itemId ? { itemId: evt.itemId } : {}),
     completed,
     willRetry,
     outcome: outcome.status,
@@ -229,4 +226,5 @@ export function handleCompactionEnd(
   if (completed && !willRetry) {
     runBestEffortCompactionHook(ctx, "after");
   }
+  return recording;
 }

@@ -6,18 +6,15 @@ import {
   questionGatewayRuntime,
 } from "openclaw/plugin-sdk/question-gateway-runtime";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
+import { normalizeIMessageGuid } from "./message-guid.js";
 import { resolveIMessageReactionContext } from "./monitor/reaction-context.js";
 import type { IMessagePayload } from "./monitor/types.js";
-
-function normalizeGuid(value: string): string {
-  return value.trim().replace(/^p:\d+\//iu, "");
-}
 
 type IMessageQuestionReactionIdentity = { accountId: string; messageGuid: string };
 
 function buildKey(identity: IMessageQuestionReactionIdentity): string | null {
   const account = identity.accountId.trim();
-  const guid = normalizeGuid(identity.messageGuid);
+  const guid = normalizeIMessageGuid(identity.messageGuid);
   return account && guid ? `${account}:${guid}` : null;
 }
 
@@ -42,11 +39,7 @@ function reactionCandidates(
     return null;
   }
   const guids = Array.from(
-    new Set(
-      [...(reaction.targetGuids ?? []), reaction.targetGuid ?? ""]
-        .map(normalizeGuid)
-        .filter(Boolean),
-    ),
+    new Set((reaction.targetGuids ?? []).map(normalizeIMessageGuid).filter(Boolean)),
   );
   return guids.length > 0 ? { action: reaction.action, emoji: reaction.emoji, guids } : null;
 }
@@ -70,7 +63,7 @@ export function registerIMessageQuestionReactionTargetForDeliveredPayload(params
       typeof result.meta?.imessageMessageGuid === "string"
         ? result.meta.imessageMessageGuid
         : result.messageId;
-    if (/^\d+$/u.test(normalizeGuid(guid))) {
+    if (/^\d+$/u.test(normalizeIMessageGuid(guid))) {
       continue;
     }
     registered =

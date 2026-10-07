@@ -6,6 +6,10 @@ export type CommandLaneSnapshot = {
   queuedCount: number;
   activeCount: number;
   maxConcurrent: number;
+  /** Capacity applies independently to each session or swarm group. */
+  concurrencyScope?: "session" | "swarm";
+  swarmGroupKey?: string;
+  saturatedLaneCount?: number;
   draining: boolean;
   generation: number;
   /** Group this lane belongs to, if any. */
@@ -28,13 +32,33 @@ export type CommandLaneSnapshot = {
  * Public enqueue knobs shared by command-lane callers and narrower injection
  * points that should not import the full queue implementation.
  */
+export type CommandQueueTaskDeadline =
+  | { kind: "bounded"; deadlineAtMs: number }
+  | { kind: "unlimited" };
+
 export type CommandQueueEnqueueOptions = {
+  sessionTarget?: Readonly<{ agentId?: string; sessionKey?: string; sessionId: string }>;
+  /** Enqueue-time provenance for diagnostics only; never used for admission. */
+  taskIdentity?: Readonly<{
+    taskKind: string;
+    sessionKey?: string;
+    runId?: string;
+    requesterSessionKey?: string;
+  }>;
+  /** Owner-resolved capacity, installed atomically with this enqueue. */
+  maxConcurrent?: number;
+  /** Cancels queued admission; the task owns cancellation after it starts. */
+  abortSignal?: AbortSignal;
   /** Called only when this entry remains queued after immediate lane admission. */
   onQueued?: () => void;
   warnAfterMs?: number;
   onWait?: (waitMs: number, queuedAhead: number) => void;
   taskTimeoutMs?: number;
   taskTimeoutProgressAtMs?: () => number | undefined;
+  /** Replaces idle timing with an owner deadline; undefined restores idle timing. */
+  taskTimeoutSubscribe?: (
+    onDeadline: (deadline: CommandQueueTaskDeadline | undefined) => void,
+  ) => () => void;
   taskTimeoutAbortSignal?: AbortSignal;
   taskTimeoutAbortGraceMs?: number;
   /** Ends the task after a caller-owned timeout cleanup grace has already elapsed. */

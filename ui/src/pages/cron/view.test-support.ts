@@ -2,9 +2,8 @@ import { render } from "lit";
 import { expect } from "vitest";
 import type { CronJob } from "../../api/types.ts";
 import { DEFAULT_CRON_FORM } from "../../test-helpers/cron.ts";
+import type { CronProps } from "./view-types.ts";
 import { renderCron } from "./view.ts";
-
-type CronProps = Parameters<typeof renderCron>[0];
 
 export function createCronViewJob(id: string, overrides: Partial<CronJob> = {}): CronJob {
   return {
@@ -23,8 +22,6 @@ export function createCronViewJob(id: string, overrides: Partial<CronJob> = {}):
 
 function createCronViewProps(overrides: Partial<CronProps> = {}): CronProps {
   return {
-    basePath: "",
-    agentId: "main",
     loading: false,
     hasLoaded: true,
     listError: null,
@@ -48,6 +45,7 @@ function createCronViewProps(overrides: Partial<CronProps> = {}): CronProps {
     error: null,
     busy: false,
     form: { ...DEFAULT_CRON_FORM },
+    heartbeatScratch: "",
     fieldErrors: {},
     canSubmit: true,
     editingJob: null,
@@ -57,7 +55,7 @@ function createCronViewProps(overrides: Partial<CronProps> = {}): CronProps {
     channels: [],
     channelLabels: {},
     runs: [],
-    runsTotal: 0,
+    runsState: "ready",
     runsHasMore: false,
     runsLoadingMore: false,
     runsStatuses: [],
@@ -69,6 +67,7 @@ function createCronViewProps(overrides: Partial<CronProps> = {}): CronProps {
     thinkingSuggestions: [],
     timezoneSuggestions: [],
     deliveryToSuggestions: [],
+    failureAlertToSuggestions: [],
     accountSuggestions: [],
     onListTabChange: () => undefined,
     onDetailTabChange: () => undefined,

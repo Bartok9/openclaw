@@ -22,6 +22,7 @@ describe("OpenClaw shell locale preferences", () => {
   beforeEach(() => {
     vi.stubGlobal("localStorage", createStorageMock());
     resetServerUiPrefsSync();
+    patchSettings({ gatewayUrl: "ws://locale.test" });
   });
 
   afterEach(() => {
@@ -52,7 +53,6 @@ describe("OpenClaw shell locale preferences", () => {
         connection: { gatewayUrl: "ws://locale.test" },
         snapshot: { phase: "connected" },
       },
-      navigation: { update: vi.fn() },
       theme: { refresh: refreshTheme },
       runtimeConfig,
     } as unknown as ApplicationContext;
@@ -91,7 +91,6 @@ describe("OpenClaw shell locale preferences", () => {
         connection: { gatewayUrl: "ws://locale.test" },
         snapshot: { phase: "connected" },
       },
-      navigation: { update: vi.fn() },
       theme: { refresh: refreshTheme },
       runtimeConfig,
     } as unknown as ApplicationContext;
@@ -113,6 +112,7 @@ describe("OpenClaw shell locale preferences", () => {
   });
 
   it("publishes authored theme changes when the local mirror needs no patch", () => {
+    patchSettings({ gatewayUrl: "ws://theme.test" });
     const state = {
       configSnapshot: {
         config: { ui: { prefs: { theme: "custom" } } },
@@ -126,7 +126,6 @@ describe("OpenClaw shell locale preferences", () => {
         connection: { gatewayUrl: "ws://theme.test" },
         snapshot: { phase: "connected" },
       },
-      navigation: { update: vi.fn() },
       theme: { recordServerSelection, refresh: vi.fn(), serverSelection: null },
       runtimeConfig,
     } as unknown as ApplicationContext;

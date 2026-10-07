@@ -1,8 +1,6 @@
-// Memory Wiki plugin entrypoint registers its OpenClaw integration.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { definePluginEntry, type OpenClawConfig } from "./api.js";
-import { registerWikiCli } from "./src/cli.js";
 import {
   activateMemoryWikiCompiledCacheOwner,
   configureMemoryWikiCompiledCacheStore,
@@ -11,8 +9,8 @@ import {
   reconcileMemoryWikiCompiledCacheOwner,
   resolveMemoryWikiCompiledCacheOwnerId,
 } from "./src/compiled-cache.js";
+import { memoryWikiConfigSchema } from "./src/config-schema.js";
 import {
-  memoryWikiConfigSchema,
   resolveMemoryWikiAgentConfig,
   resolveMemoryWikiConfig,
   resolveMemoryWikiConfiguredAgentIds,
@@ -188,70 +186,53 @@ export default definePluginEntry({
       resolveConfig,
       resolveSourceSyncSignal: () => sourceSyncAbortController?.signal,
     });
-    api.registerTool(
-      (ctx) => {
-        const resolved = resolveToolContext(ctx.agentId);
-        return resolved
-          ? createWikiStatusTool(resolved.config, resolved.appConfig, {
+    for (const [name, createTool] of [
+      ["wiki_status", createWikiStatusTool],
+      ["wiki_lint", createWikiLintTool],
+      ["wiki_apply", createWikiApplyTool],
+      ["wiki_search", createWikiSearchTool],
+      ["wiki_get", createWikiGetTool],
+    ] as const) {
+      api.registerTool(
+        {
+          contextVersion: 2,
+          create: (ctx) => {
+            const resolved = resolveToolContext(ctx.agentId);
+            if (!resolved) {
+              return null;
+            }
+            return createTool(resolved.config, resolved.appConfig, {
               agentId: resolved.config.agentId ?? ctx.agentId,
+              agentSessionKey: ctx.sessionKey,
+              sandboxed: ctx.sandboxed,
+              conversationRecall: ctx.conversationRecall,
+              memoryContext: {
+                authority: ctx.sessionKey
+                  ? {
+                      kind: "session",
+                      conversationRecall: ctx.conversationRecall,
+                      sessionKey: ctx.sessionKey,
+                      sessionId: ctx.sessionId,
+                      sandboxed: ctx.sandboxed === true,
+                      audience: ctx.memoryAudience,
+                    }
+                  : { kind: "host", operation: "memory-wiki.tool" },
+                assertCurrent() {
+                  ctx.assertInvocationCurrent();
+                  ctx.assertMemoryAudienceCurrent?.();
+                },
+                ...(resolved.signal ? { signal: resolved.signal } : {}),
+              },
               ...(resolved.signal ? { signal: resolved.signal } : {}),
-            })
-          : null;
-      },
-      { name: "wiki_status" },
-    );
-    api.registerTool(
-      (ctx) => {
-        const resolved = resolveToolContext(ctx.agentId);
-        return resolved
-          ? createWikiLintTool(resolved.config, resolved.appConfig, resolved.signal)
-          : null;
-      },
-      { name: "wiki_lint" },
-    );
-    api.registerTool(
-      (ctx) => {
-        const resolved = resolveToolContext(ctx.agentId);
-        return resolved
-          ? createWikiApplyTool(resolved.config, resolved.appConfig, resolved.signal)
-          : null;
-      },
-      { name: "wiki_apply" },
-    );
-    api.registerTool(
-      (ctx) => {
-        const resolved = resolveToolContext(ctx.agentId);
-        if (!resolved) {
-          return null;
-        }
-        return createWikiSearchTool(resolved.config, resolved.appConfig, {
-          agentId: resolved.config.agentId ?? ctx.agentId,
-          agentSessionKey: ctx.sessionKey,
-          sandboxed: ctx.sandboxed,
-          conversationRecall: ctx.conversationRecall,
-          ...(resolved.signal ? { signal: resolved.signal } : {}),
-        });
-      },
-      { name: "wiki_search" },
-    );
-    api.registerTool(
-      (ctx) => {
-        const resolved = resolveToolContext(ctx.agentId);
-        if (!resolved) {
-          return null;
-        }
-        return createWikiGetTool(resolved.config, resolved.appConfig, {
-          agentId: resolved.config.agentId ?? ctx.agentId,
-          agentSessionKey: ctx.sessionKey,
-          sandboxed: ctx.sandboxed,
-          conversationRecall: ctx.conversationRecall,
-          ...(resolved.signal ? { signal: resolved.signal } : {}),
-        });
-      },
-      { name: "wiki_get" },
-    );
+            });
+          },
+        },
+        { name },
+      );
+    }
     api.registerCli(
-      ({ program }) => {
+      async ({ program }) => {
+        const { registerWikiCli } = await import("./src/cli.js");
         registerWikiCli(program, { config, resolveConfig, getAppConfig });
       },
       {

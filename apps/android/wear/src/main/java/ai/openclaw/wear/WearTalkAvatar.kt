@@ -33,7 +33,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.flow.collect
@@ -287,14 +288,8 @@ internal class AndroidWearAnimatorScaleSource(
         }
       }
     val lifecycleObserver =
-      object : DefaultLifecycleObserver {
-        override fun onStart(owner: LifecycleOwner) {
-          refresh()
-        }
-
-        override fun onResume(owner: LifecycleOwner) {
-          refresh()
-        }
+      LifecycleEventObserver { _, event ->
+        if (event == Lifecycle.Event.ON_START || event == Lifecycle.Event.ON_RESUME) refresh()
       }
 
     context.registerReceiver(receiver, IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED))
@@ -350,36 +345,12 @@ private fun DrawScope.drawCanonicalAvatar(
       scale(stretchX, pose.bodyStretch, pivot = Offset(60f, 110f))
       rotate(pose.bodyTilt, pivot = Offset(60f, 60f))
     }) {
-      drawPath(
-        path = BodyPath,
-        brush =
-          Brush.linearGradient(
-            colors = listOf(CoralBright, CoralDark),
-            start = Offset(15f, 10f),
-            end = Offset(105f, 110f),
-          ),
-      )
+      drawCoralPath(BodyPath, Offset(15f, 10f), Offset(105f, 110f))
       withTransform({ rotate(pose.leftClawDegrees, pivot = LeftClawPivot) }) {
-        drawPath(
-          path = LeftClawPath,
-          brush =
-            Brush.linearGradient(
-              colors = listOf(CoralBright, CoralDark),
-              start = Offset(3.125f, 43.67f),
-              end = Offset(26.197f, 65.451f),
-            ),
-        )
+        drawCoralPath(LeftClawPath, Offset(3.125f, 43.67f), Offset(26.197f, 65.451f))
       }
       withTransform({ rotate(pose.rightClawDegrees, pivot = RightClawPivot) }) {
-        drawPath(
-          path = RightClawPath,
-          brush =
-            Brush.linearGradient(
-              colors = listOf(CoralBright, CoralDark),
-              start = Offset(93.803f, 43.67f),
-              end = Offset(116.875f, 65.451f),
-            ),
-        )
+        drawCoralPath(RightClawPath, Offset(93.803f, 43.67f), Offset(116.875f, 65.451f))
       }
 
       val antennaStroke = Stroke(width = 2f, cap = StrokeCap.Round)
@@ -400,6 +371,14 @@ private fun DrawScope.drawCanonicalAvatar(
       drawCanonicalMouth(state, pose.mouthLevel, animationSeconds)
     }
   }
+}
+
+private fun DrawScope.drawCoralPath(
+  path: Path,
+  start: Offset,
+  end: Offset,
+) {
+  drawPath(path, Brush.linearGradient(colors = listOf(CoralBright, CoralDark), start = start, end = end))
 }
 
 private fun DrawScope.drawCanonicalEye(
@@ -482,7 +461,8 @@ internal fun avatarPoseAt(
   var haloPulse = 0.5f + (0.5f * sin(animationSeconds * tau / 2.4f))
 
   when (state) {
-    RealtimeVoiceButtonState.IDLE -> Unit
+    RealtimeVoiceButtonState.IDLE -> {}
+
     RealtimeVoiceButtonState.CONNECTING -> {
       val orbit = animationSeconds * tau / 1.65f
       gaze = Offset(cos(orbit) * 1.05f, sin(orbit) * 0.82f)
@@ -492,6 +472,7 @@ internal fun avatarPoseAt(
       rightClawDegrees = -leftClawDegrees
       haloPulse = 0.5f + (0.5f * sin(animationSeconds * tau / 0.9f))
     }
+
     RealtimeVoiceButtonState.LISTENING -> {
       val attentivePulse = 0.5f + (0.5f * sin(animationSeconds * tau / 1.25f))
       gaze = Offset(0.2f * sin(animationSeconds * tau / 3.2f), 0.34f)
@@ -501,6 +482,7 @@ internal fun avatarPoseAt(
       antennaDegrees = -4f * sin(animationSeconds * tau / 1.45f)
       haloPulse = attentivePulse
     }
+
     RealtimeVoiceButtonState.THINKING -> {
       val orbit = animationSeconds * tau / 2.15f
       gaze = Offset(cos(orbit) * 1.15f, sin(orbit) * 0.92f)
@@ -510,6 +492,7 @@ internal fun avatarPoseAt(
       rightClawDegrees = -10f - (3f * sin(animationSeconds * tau / 2.2f))
       haloPulse = 0.5f + (0.5f * sin(animationSeconds * tau / 1.4f))
     }
+
     RealtimeVoiceButtonState.SPEAKING -> {
       val speechBeat = sin(animationSeconds * tau / 0.72f)
       floatOffset -= mouthLevel * 2.2f
@@ -521,6 +504,7 @@ internal fun avatarPoseAt(
       gaze = Offset(0.18f * sin(animationSeconds * tau / 2.6f), 0.12f)
       haloPulse = (0.25f + (mouthLevel * 0.75f)).coerceIn(0f, 1f)
     }
+
     RealtimeVoiceButtonState.ERROR -> {
       bodyTilt = 2.2f * sin(animationSeconds * tau / 0.42f)
       antennaDroop = 0.72f
@@ -580,11 +564,17 @@ private fun syntheticSpeechMouth(animationSeconds: Float): Float {
 private fun avatarBlinkClosure(animationSeconds: Float): Float {
   val phase = animationSeconds % BLINK_CYCLE_SECONDS
   return when {
-    phase in FIRST_BLINK_START..FIRST_BLINK_END ->
+    phase in FIRST_BLINK_START..FIRST_BLINK_END -> {
       smoothBell((phase - FIRST_BLINK_START) / (FIRST_BLINK_END - FIRST_BLINK_START))
-    phase in SECOND_BLINK_START..SECOND_BLINK_END ->
+    }
+
+    phase in SECOND_BLINK_START..SECOND_BLINK_END -> {
       smoothBell((phase - SECOND_BLINK_START) / (SECOND_BLINK_END - SECOND_BLINK_START))
-    else -> 0f
+    }
+
+    else -> {
+      0f
+    }
   }
 }
 

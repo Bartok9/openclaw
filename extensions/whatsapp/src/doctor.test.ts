@@ -20,7 +20,7 @@ describe("whatsapp doctor compatibility", () => {
   it("reports acknowledgement behavior that the global settings cannot preserve", () => {
     const result = normalizeCompatibilityConfig({
       cfg: {
-        agents: { entries: { main: { default: true, identity: { emoji: "🔥" } } } },
+        agents: { entries: { main: { identity: { emoji: "🔥" } } } },
         channels: {
           whatsapp: {
             ackReaction: {
@@ -78,5 +78,30 @@ describe("whatsapp doctor compatibility", () => {
     expect(result.changes).toStrictEqual([
       "Moved translatable channels.whatsapp.ackReaction settings to messages ack settings.",
     ]);
+  });
+
+  it.each([
+    {
+      name: "normalizes an explicit blank emoji",
+      ackReaction: { emoji: "   ", direct: true, group: "never" } as const,
+      expected:
+        'channels.whatsapp.ackReaction requested acknowledgement emoji "", but the final messages.ackReaction is "🔥".',
+    },
+    {
+      name: "describes an omitted emoji as route-dependent",
+      ackReaction: { direct: true, group: "never" } as const,
+      expected:
+        'channels.whatsapp.ackReaction used a route-dependent agent identity acknowledgement emoji before migration; the final messages.ackReaction is "🔥".',
+    },
+  ])("$name in the migration receipt", ({ ackReaction, expected }) => {
+    const result = normalizeCompatibilityConfig({
+      cfg: {
+        messages: { ackReaction: "🔥", ackReactionScope: "direct" },
+        agents: { entries: { main: { identity: { emoji: "🤖" } } } },
+        channels: { whatsapp: { ackReaction } },
+      },
+    });
+
+    expect(result.changes).toContainEqual(expect.stringContaining(expected));
   });
 });

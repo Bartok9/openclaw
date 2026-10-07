@@ -1,32 +1,22 @@
-// Builds provider catalog entries from plugin manifest metadata.
 import { normalizeModelCatalog } from "@openclaw/model-catalog-core/model-catalog-normalize";
 import { buildModelCatalogRef } from "@openclaw/model-catalog-core/model-catalog-refs";
 import type {
   ModelCatalogCost,
-  ModelCatalogMediaInputConfig,
   ModelCatalogModel,
   ModelCatalogTieredCost,
+  NormalizedModelCatalogRow,
 } from "@openclaw/model-catalog-core/model-catalog-types";
-import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+import {
+  findNormalizedProviderValue,
+  normalizeProviderId,
+} from "@openclaw/model-catalog-core/provider-id";
 import { normalizeConfiguredProviderCatalogModelId } from "@openclaw/model-catalog-core/provider-model-id-normalization";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
-import { copyRecordEntries } from "../shared/safe-record.js";
 import type { ProviderCatalogContext, ProviderCatalogResult, ProviderPlugin } from "./types.js";
-
-function addApiKeyToProvider(
-  provider: ModelProviderConfig,
-  apiKey: string,
-): (ModelProviderConfig & { apiKey: string }) | undefined {
-  try {
-    return { ...provider, apiKey };
-  } catch {
-    return undefined;
-  }
-}
 
 /** Finds a provider catalog template entry by normalized provider and template id. */
 export function findCatalogTemplate(params: {
@@ -34,15 +24,30 @@ export function findCatalogTemplate(params: {
   providerId: string;
   templateIds: readonly string[];
 }) {
-  return params.templateIds
-    .map((templateId) =>
-      params.entries.find(
-        (entry) =>
-          normalizeProviderId(entry.provider) === normalizeProviderId(params.providerId) &&
-          normalizeLowercaseStringOrEmpty(entry.id) === normalizeLowercaseStringOrEmpty(templateId),
-      ),
-    )
-    .find((entry) => entry !== undefined);
+  let selected: (typeof params.entries)[number] | undefined;
+  params.templateIds.some((templateId) => {
+    selected = params.entries.find(
+      (entry) =>
+        normalizeProviderId(entry.provider) === normalizeProviderId(params.providerId) &&
+        normalizeLowercaseStringOrEmpty(entry.id) === normalizeLowercaseStringOrEmpty(templateId),
+    );
+    return selected !== undefined;
+  });
+  return selected;
+}
+
+/** Selects one complete auth result in caller-defined order, including unresolved secret markers. */
+export function resolveFirstProviderCatalogAuth(
+  resolveProviderApiKey: ProviderCatalogContext["resolveProviderApiKey"],
+  providerIds: readonly string[],
+): ReturnType<ProviderCatalogContext["resolveProviderApiKey"]> | undefined {
+  for (const providerId of providerIds) {
+    const auth = resolveProviderApiKey(providerId);
+    if (auth.apiKey || auth.discoveryApiKey) {
+      return auth;
+    }
+  }
+  return undefined;
 }
 
 /** Builds a provider catalog result for providers that share one API key. */
@@ -58,12 +63,9 @@ export async function buildSingleProviderApiKeyCatalog(params: {
     return null;
   }
 
-  const explicitProvider =
-    params.allowExplicitBaseUrl && params.ctx.config.models?.providers
-      ? Object.entries(params.ctx.config.models.providers).find(
-          ([configuredProviderId]) => normalizeProviderId(configuredProviderId) === providerId,
-        )?.[1]
-      : undefined;
+  const explicitProvider = params.allowExplicitBaseUrl
+    ? findNormalizedProviderValue(params.ctx.config.models?.providers, providerId)
+    : undefined;
   const explicitBaseUrl = normalizeOptionalString(explicitProvider?.baseUrl) ?? "";
 
   return {
@@ -72,30 +74,6 @@ export async function buildSingleProviderApiKeyCatalog(params: {
       ...(explicitBaseUrl ? { baseUrl: explicitBaseUrl } : {}),
       apiKey,
     },
-  };
-}
-
-/** Builds a multi-provider catalog result backed by one provider API key. */
-export async function buildPairedProviderApiKeyCatalog(params: {
-  ctx: ProviderCatalogContext;
-  providerId: string;
-  buildProviders: () =>
-    | Record<string, ModelProviderConfig>
-    | Promise<Record<string, ModelProviderConfig>>;
-}): Promise<ProviderCatalogResult> {
-  const apiKey = params.ctx.resolveProviderApiKey(normalizeProviderId(params.providerId)).apiKey;
-  if (!apiKey) {
-    return null;
-  }
-
-  const providers = await params.buildProviders();
-  return {
-    providers: Object.fromEntries(
-      copyRecordEntries<ModelProviderConfig>(providers).flatMap(([id, provider]) => {
-        const providerWithApiKey = addApiKeyToProvider(provider, apiKey);
-        return providerWithApiKey ? [[id, providerWithApiKey]] : [];
-      }),
-    ),
   };
 }
 
@@ -147,8 +125,11 @@ function cloneManifestCatalogCost(cost: ModelCatalogCost): ModelDefinitionConfig
   };
 }
 
-function buildManifestCatalogModelInput(model: ModelCatalogModel): ModelDefinitionConfig["input"] {
-  if (model.input?.includes("document")) {
+function buildManifestCatalogModelInput(
+  model: ModelCatalogModel,
+  filterDocument = false,
+): ModelDefinitionConfig["input"] {
+  if (!filterDocument && model.input?.includes("document")) {
     throw new Error(
       `Manifest modelCatalog row ${model.id} uses unsupported runtime input document`,
     );
@@ -156,43 +137,42 @@ function buildManifestCatalogModelInput(model: ModelCatalogModel): ModelDefiniti
   return model.input?.filter((item): item is "text" | "image" => item !== "document") ?? ["text"];
 }
 
-function cloneManifestCatalogMediaInput(
-  mediaInput?: ModelCatalogMediaInputConfig,
-): ModelDefinitionConfig["mediaInput"] | undefined {
-  if (!mediaInput?.image) {
-    return undefined;
-  }
-  return {
-    image: { ...mediaInput.image },
-  };
-}
-
 function buildManifestCatalogModel(
-  providerId: string,
   model: ModelCatalogModel,
-): ModelDefinitionConfig {
+  options: { providerId?: string; filterDocument?: boolean } = {},
+): ModelDefinitionConfig & Pick<ModelCatalogModel, "contextWindows" | "contextWindowDefault"> {
   if (model.contextWindow === undefined) {
     throw new Error(`Manifest modelCatalog row ${model.id} is missing contextWindow`);
   }
   if (model.maxTokens === undefined) {
     throw new Error(`Manifest modelCatalog row ${model.id} is missing maxTokens`);
   }
-  const id = normalizeConfiguredProviderCatalogModelId(providerId, model.id, new Map());
+  const id = options.providerId
+    ? normalizeConfiguredProviderCatalogModelId(options.providerId, model.id, new Map())
+    : model.id;
   return {
     id,
     name: model.name ?? id,
     ...(model.api ? { api: model.api } : {}),
     ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
     reasoning: model.reasoning ?? false,
-    input: buildManifestCatalogModelInput(model),
+    input: buildManifestCatalogModelInput(model, options.filterDocument),
     cost: cloneManifestCatalogCost(model.cost ?? {}),
     contextWindow: model.contextWindow,
+    ...(model.contextWindows
+      ? { contextWindows: model.contextWindows.map((option) => ({ ...option })) }
+      : {}),
+    ...(model.contextWindowDefault ? { contextWindowDefault: model.contextWindowDefault } : {}),
     ...(model.contextTokens !== undefined ? { contextTokens: model.contextTokens } : {}),
     maxTokens: model.maxTokens,
     ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
     ...(model.headers ? { headers: { ...model.headers } } : {}),
     ...(model.compat ? { compat: { ...model.compat } } : {}),
-    ...(model.mediaInput ? { mediaInput: cloneManifestCatalogMediaInput(model.mediaInput) } : {}),
+    ...(model.mediaInput
+      ? {
+          mediaInput: model.mediaInput.image ? { image: { ...model.mediaInput.image } } : undefined,
+        }
+      : {}),
   };
 }
 
@@ -223,11 +203,29 @@ export function buildManifestModelProviderConfig(params: {
     baseUrl: catalog.baseUrl,
     ...(catalog.api ? { api: catalog.api } : {}),
     ...(catalog.headers ? { headers: { ...catalog.headers } } : {}),
-    models: catalog.models.map((model) => buildManifestCatalogModel(params.providerId, model)),
+    models: catalog.models.map((model) =>
+      buildManifestCatalogModel(model, { providerId: params.providerId }),
+    ),
   };
 }
 
-export type ManifestProviderCatalogSurface = {
+/** Builds runtime provider config from planner-normalized manifest rows. */
+export function buildEffectiveManifestProviderConfig(
+  rows: readonly NormalizedModelCatalogRow[],
+): ModelProviderConfig | undefined {
+  const firstRow = rows[0];
+  if (!firstRow?.baseUrl || !firstRow.api) {
+    return undefined;
+  }
+  const models = rows.flatMap((row) =>
+    !row.contextWindow || !row.maxTokens
+      ? []
+      : [buildManifestCatalogModel(row, { filterDocument: true })],
+  );
+  return models.length > 0 ? { baseUrl: firstRow.baseUrl, api: firstRow.api, models } : undefined;
+}
+
+type ManifestProviderCatalogSurface = {
   id: string;
   label: string;
   catalog: unknown;

@@ -11,9 +11,10 @@ import {
   attachInternalToolExecutionPreparer,
   getInternalToolExecutionPreparer,
 } from "./runtime/internal-hooks.js";
+import { registerTrustedToolNoStartError } from "./tool-result-error.js";
 
 function throwAbortError(): never {
-  throw createAbortError("Aborted");
+  throw registerTrustedToolNoStartError(createAbortError("Aborted"));
 }
 
 /**
@@ -99,7 +100,9 @@ export function wrapToolWithAbortSignal(
           );
     },
   };
-  copyAgentToolMetadata(tool, wrappedTool);
+  copyAgentToolMetadata(tool, wrappedTool, (source) =>
+    wrapToolWithAbortSignal(source, abortSignal),
+  );
   const sourcePreparer = getInternalToolExecutionPreparer(tool);
   if (sourcePreparer) {
     attachInternalToolExecutionPreparer(wrappedTool, async (params) => {

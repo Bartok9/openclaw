@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readPositiveIntEnv } from "./env-limits.mjs";
+import {
+  resolveOpenClawConfigPath as configPath,
+  resolveOpenClawStateDir as stateDir,
+} from "./openclaw-state-paths.mjs";
 import { readTextFileBounded } from "./text-file-utils.mjs";
 
 const STATE_KEY = "plugins.installedIndex";
@@ -13,29 +17,16 @@ const JSON_ARTIFACT_MAX_BYTES = readPositiveIntEnv(
   1024 * 1024,
 );
 
-function stateDir() {
-  return process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME, ".openclaw");
-}
-
-function configPath() {
-  return process.env.OPENCLAW_CONFIG_PATH || path.join(stateDir(), "openclaw.json");
-}
-
 function readJsonMaybe(file) {
-  let text;
   try {
-    text = readTextFileBounded(file, "plugin index JSON artifact", JSON_ARTIFACT_MAX_BYTES, {
+    const text = readTextFileBounded(file, "plugin index JSON artifact", JSON_ARTIFACT_MAX_BYTES, {
       tailBytes: ERROR_DETAIL_TAIL_BYTES,
     });
+    return JSON.parse(text);
   } catch (error) {
     if (error?.code === "ETOOBIG") {
       throw error;
     }
-    return {};
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
     return {};
   }
 }
@@ -45,10 +36,7 @@ function textTooLargeError(message) {
 }
 
 function parseIndexJsonText(text, label) {
-  const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes > JSON_ARTIFACT_MAX_BYTES) {
-    throw textTooLargeError(`${label} exceeded ${JSON_ARTIFACT_MAX_BYTES} bytes (${bytes} bytes)`);
-  }
+  assertIndexJsonByteLength(Buffer.byteLength(text, "utf8"), label);
   return JSON.parse(text);
 }
 
@@ -211,7 +199,7 @@ export function readPluginInstallIndex(options = {}) {
 }
 
 export function readPluginInstallRecords(options = {}) {
-  return readPluginInstallIndex(options).installRecords ?? {};
+  return readPluginInstallIndex(options).installRecords;
 }
 
 export function writePluginInstallIndexForE2E(index, options = {}) {

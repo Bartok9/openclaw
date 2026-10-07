@@ -1,23 +1,20 @@
+import type { AgentRunTimeoutPhase } from "@openclaw/normalization-core/agent-run-terminal-outcome";
 import { createInlineCodeState } from "../../packages/markdown-core/src/code-spans.js";
 /**
  * Subscribes to embedded-agent sessions and streams formatted replies/events.
  */
 import { formatToolAggregate } from "../auto-reply/tool-meta.js";
-import { emitAgentRunOutputTokens } from "../infra/agent-events.js";
-import type { AssistantMessage } from "../llm/types.js";
+import { createAbortError } from "../infra/abort-signal.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { createDeferredCore, type Deferred } from "../shared/deferred.js";
 import { parseInlineDirectives } from "../utils/directive-tags.js";
 import { isDeliverableMessageChannel, normalizeMessageChannel } from "../utils/message-channel.js";
 import { EmbeddedBlockChunker } from "./embedded-agent-block-chunker.js";
+import { MAX_MESSAGING_HISTORY_ENTRIES } from "./embedded-agent-messaging-history.js";
 import { hasCommittedMessagingToolDeliveryEvidence } from "./embedded-agent-runner/delivery-evidence.js";
 import { mergeEmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
 import { consumeEmbeddedToolReceipt } from "./embedded-agent-runner/tool-send-receipts.js";
 import type { EmbeddedRunLivenessState } from "./embedded-agent-runner/types.js";
-import {
-  createUsageAccumulator,
-  mergeUsageIntoAccumulator,
-  toNormalizedUsage,
-} from "./embedded-agent-runner/usage-accumulator.js";
 import { runBestEffortCallback } from "./embedded-agent-subscribe.callback.js";
 import { createEmbeddedAgentSessionEventHandler } from "./embedded-agent-subscribe.handlers.js";
 import { readPendingToolMediaReply } from "./embedded-agent-subscribe.handlers.messages.replies.js";
@@ -26,6 +23,7 @@ import type {
   EmbeddedAgentSubscribeContext,
   EmbeddedAgentSubscribeState,
 } from "./embedded-agent-subscribe.handlers.types.js";
+import { createEmbeddedModelState } from "./embedded-agent-subscribe.model-state.js";
 import { createReplyDelivery } from "./embedded-agent-subscribe.reply-delivery.js";
 import { createEmbeddedAgentSubscribeState } from "./embedded-agent-subscribe.run-state.js";
 import { createStreamRendering } from "./embedded-agent-subscribe.stream-rendering.js";
@@ -36,10 +34,8 @@ import {
   filterToolResultMediaUrls,
 } from "./embedded-agent-tool-media.js";
 import { stripDowngradedToolCallText } from "./embedded-agent-utils.js";
-import type { AgentRunTimeoutPhase } from "./run-timeout-attribution.js";
-import type { AgentMessage } from "./runtime/index.js";
+import { sessionManagerReadTranscriptStart } from "./sessions/session-manager-current-turn.js";
 import { setSessionModelUsageSink } from "./sessions/session-model-usage.js";
-import { hasNonzeroUsage, hasObservedModelUsage, normalizeUsage, type UsageLike } from "./usage.js";
 
 const embeddedLog = createSubsystemLogger("agent/embedded");
 
@@ -51,15 +47,44 @@ function resolveEmbeddedAgentSessionLogger(messageChannel?: string) {
   return embeddedLog;
 }
 
-export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSessionParams) {
+export function subscribeEmbeddedAgentSession(input: SubscribeEmbeddedAgentSessionParams) {
+  let params = input;
+  const onAgentEvent = params.onAgentEvent;
+  if (onAgentEvent) {
+    let transcriptStartPublished = false;
+    const sessionManager = params.session.sessionManager;
+    params = {
+      ...params,
+      onAgentEvent: (event) => {
+        if (
+          transcriptStartPublished ||
+          (event.stream === "lifecycle" && typeof event.data.phase !== "string")
+        ) {
+          return onAgentEvent(event);
+        }
+        const transcriptStart = sessionManager[sessionManagerReadTranscriptStart]();
+        transcriptStartPublished = true;
+        return onAgentEvent({
+          ...event,
+          transcriptStart,
+        });
+      },
+    };
+  }
   const log = resolveEmbeddedAgentSessionLogger(params.messageChannel);
   const toolResultFormat = params.toolResultFormat ?? "markdown";
   const useMarkdown = toolResultFormat === "markdown";
   const state: EmbeddedAgentSubscribeState = createEmbeddedAgentSubscribeState(params);
-  const usageTotals = createUsageAccumulator();
-  let lastAssistantUsage: ReturnType<typeof normalizeUsage>;
+  const {
+    captureModelEvent,
+    recordAuxiliaryUsage,
+    getUsageTotals,
+    getLastAssistantUsage,
+    getCurrentAttemptAssistant,
+    hasSuccessfulModelResponse,
+  } = createEmbeddedModelState(params, log);
   let compactionCount = 0;
-  let currentAttemptAssistant: AssistantMessage | undefined;
+  let compactionRetry: Deferred | undefined;
   const assistantTexts = state.assistantTexts;
   const toolMetas = state.toolMetas;
   const toolMetaById = state.toolMetaById;
@@ -69,69 +94,43 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   const messagingToolSentTargets = state.messagingToolSentTargets;
   const messagingToolSentMediaUrls = state.messagingToolSentMediaUrls;
   const messagingToolSourceReplyPayloads = state.messagingToolSourceReplyPayloads;
-  const pendingMessagingTexts = state.pendingMessagingTexts;
-  const pendingMessagingTargets = state.pendingMessagingTargets;
   const replyDelivery = createReplyDelivery({ params, state, log });
   const {
-    clearDeferredAssistantEvents,
+    clearAssistantStream,
     clearDeferredBlockReplies,
     emitAssistantStreamData,
     emitBlockReply,
     finalizeAssistantTexts,
-    flushDeferredAssistantEvents,
-    flushDeferredBlockReplies,
+    flushAssistantStream,
+    noteLastAssistant,
+    releaseDeferredReplies,
   } = replyDelivery;
 
-  // ── Messaging tool duplicate detection ──────────────────────────────────────
-  // Track texts sent via messaging tools to suppress duplicate block replies.
-  // Only committed (successful) texts are checked - pending texts are tracked
-  // to support commit logic but not used for suppression (avoiding lost messages on tool failure).
-  // These tools can send messages via sendMessage/threadReply actions (or sessions_send with message).
-  const MAX_MESSAGING_SENT_TEXTS = 200;
-  const MAX_CURRENT_SOURCE_MESSAGING_SENT_TEXTS = 200;
-  const MAX_MESSAGING_SENT_TARGETS = 200;
-  const MAX_MESSAGING_SENT_MEDIA_URLS = 200;
-  const MAX_MESSAGING_SOURCE_REPLY_PAYLOADS = 200;
+  // Suppress duplicate block replies only after confirmed messaging-tool delivery.
   const trimMessagingToolSent = () => {
-    if (messagingToolSentTexts.length > MAX_MESSAGING_SENT_TEXTS) {
-      const overflow = messagingToolSentTexts.length - MAX_MESSAGING_SENT_TEXTS;
+    if (messagingToolSentTexts.length > MAX_MESSAGING_HISTORY_ENTRIES) {
+      const overflow = messagingToolSentTexts.length - MAX_MESSAGING_HISTORY_ENTRIES;
       messagingToolSentTexts.splice(0, overflow);
       messagingToolSentTextsNormalized.splice(0, overflow);
     }
-    if (
-      state.currentSourceMessagingToolSentTextsNormalized.length >
-      MAX_CURRENT_SOURCE_MESSAGING_SENT_TEXTS
-    ) {
-      const overflow =
-        state.currentSourceMessagingToolSentTextsNormalized.length -
-        MAX_CURRENT_SOURCE_MESSAGING_SENT_TEXTS;
-      state.currentSourceMessagingToolSentTextsNormalized.splice(0, overflow);
-    }
-    if (messagingToolSentTargets.length > MAX_MESSAGING_SENT_TARGETS) {
-      const overflow = messagingToolSentTargets.length - MAX_MESSAGING_SENT_TARGETS;
-      messagingToolSentTargets.splice(0, overflow);
-    }
-    if (messagingToolSentMediaUrls.length > MAX_MESSAGING_SENT_MEDIA_URLS) {
-      const overflow = messagingToolSentMediaUrls.length - MAX_MESSAGING_SENT_MEDIA_URLS;
-      messagingToolSentMediaUrls.splice(0, overflow);
-    }
-    if (messagingToolSourceReplyPayloads.length > MAX_MESSAGING_SOURCE_REPLY_PAYLOADS) {
-      const overflow =
-        messagingToolSourceReplyPayloads.length - MAX_MESSAGING_SOURCE_REPLY_PAYLOADS;
-      messagingToolSourceReplyPayloads.splice(0, overflow);
+    for (const history of [
+      state.currentSourceMessagingToolSentTextsNormalized,
+      messagingToolSentTargets,
+      messagingToolSentMediaUrls,
+      messagingToolSourceReplyPayloads,
+    ]) {
+      if (history.length > MAX_MESSAGING_HISTORY_ENTRIES) {
+        history.splice(0, history.length - MAX_MESSAGING_HISTORY_ENTRIES);
+      }
     }
   };
 
   const ensureCompactionPromise = () => {
-    if (!state.compactionRetryPromise) {
-      // Create a single promise that resolves when ALL pending compactions complete
-      // (tracked by pendingCompactionRetry counter, decremented in resolveCompactionRetry)
-      state.compactionRetryPromise = new Promise((resolve, reject) => {
-        state.compactionRetryResolve = resolve;
-        state.compactionRetryReject = reject;
-      });
+    if (!compactionRetry) {
+      // One wait covers both active compaction and queued retries.
+      compactionRetry = createDeferredCore();
       // Prevent unhandled rejection if rejected after all consumers have resolved
-      state.compactionRetryPromise.catch((err: unknown) => {
+      compactionRetry.promise.catch((err: unknown) => {
         log.debug(`compaction promise rejected (no waiter): ${String(err)}`);
       });
     }
@@ -142,14 +141,12 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     ensureCompactionPromise();
   };
 
-  const resolveCompactionPromiseIfIdle = () => {
+  const maybeResolveCompactionWait = () => {
     if (state.pendingCompactionRetry !== 0 || state.compactionInFlight) {
       return;
     }
-    state.compactionRetryResolve?.();
-    state.compactionRetryResolve = undefined;
-    state.compactionRetryReject = undefined;
-    state.compactionRetryPromise = null;
+    compactionRetry?.resolve();
+    compactionRetry = undefined;
   };
 
   const resolveCompactionRetry = () => {
@@ -157,108 +154,9 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
       return;
     }
     state.pendingCompactionRetry -= 1;
-    resolveCompactionPromiseIfIdle();
+    maybeResolveCompactionWait();
   };
 
-  const maybeResolveCompactionWait = () => {
-    resolveCompactionPromiseIfIdle();
-  };
-  const resolveAssistantUsage = (usageLike: unknown) => {
-    const candidates: unknown[] = [usageLike];
-    if (usageLike && typeof usageLike === "object") {
-      const record = usageLike as Record<string, unknown>;
-      const partial =
-        record.partial && typeof record.partial === "object"
-          ? (record.partial as Record<string, unknown>)
-          : undefined;
-      const message =
-        record.message && typeof record.message === "object"
-          ? (record.message as Record<string, unknown>)
-          : undefined;
-      candidates.push(
-        record.usage,
-        record.timings,
-        record.partial,
-        record.message,
-        partial?.usage,
-        partial?.timings,
-        message?.usage,
-        message?.timings,
-      );
-    }
-    for (const candidate of candidates) {
-      const usage = normalizeUsage((candidate ?? undefined) as UsageLike | undefined);
-      if (hasObservedModelUsage(usage)) {
-        return usage;
-      }
-    }
-    return undefined;
-  };
-  const emitRunUsage = (outputTokens: number) => {
-    const lifecycleGeneration = params.lifecycleGeneration;
-    if (!lifecycleGeneration) {
-      return;
-    }
-    const data = emitAgentRunOutputTokens({
-      runId: params.runId,
-      lifecycleGeneration,
-      outputTokens,
-    });
-    if (!data || !params.onAgentEvent) {
-      return;
-    }
-    runBestEffortCallback({
-      label: "usage agent event",
-      log,
-      callback: () => params.onAgentEvent?.({ stream: "usage", data }),
-    });
-  };
-  const commitAssistantUsage = () => {
-    if (state.assistantUsageCommitted || !state.pendingAssistantUsage) {
-      return;
-    }
-    const usage = state.pendingAssistantUsage;
-    mergeUsageIntoAccumulator(usageTotals, usage);
-    state.assistantUsageCommitted = true;
-    // Billing alone cannot replace the latest prompt snapshot or invent output tokens.
-    if (hasNonzeroUsage(usage)) {
-      lastAssistantUsage = { ...usage };
-      emitRunUsage(usage.output ?? 0);
-    }
-  };
-  const recordAssistantUsage = (usageLike: unknown) => {
-    if (state.assistantUsageCommitted) {
-      return;
-    }
-    const usage = resolveAssistantUsage(usageLike);
-    if (!usage) {
-      return;
-    }
-    const pending = state.pendingAssistantUsage;
-    const cost = usage.cost;
-    const next = pending && !hasNonzeroUsage(usage) ? { ...pending, cost } : usage;
-    // Within one call, billing may arrive separately from token counters and
-    // remains authoritative when a later snapshot carries only a catalog estimate.
-    if (
-      pending?.cost?.totalOrigin === "provider-billed" &&
-      cost?.totalOrigin !== "provider-billed"
-    ) {
-      next.cost = pending.cost;
-    }
-    state.pendingAssistantUsage = next;
-  };
-  const recordModelUsage = (usageLike: UsageLike) => {
-    const usage = resolveAssistantUsage(usageLike);
-    if (!usage) {
-      return;
-    }
-    mergeUsageIntoAccumulator(usageTotals, usage);
-    if (hasNonzeroUsage(usage)) {
-      emitRunUsage(usage.output ?? 0);
-    }
-  };
-  const getUsageTotals = () => toNormalizedUsage(usageTotals);
-  const getLastAssistantUsage = () => normalizeUsage(lastAssistantUsage);
   const incrementCompactionCount = () => {
     compactionCount += 1;
   };
@@ -270,7 +168,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   };
 
   const blockChunking = params.blockReplyChunking;
-  const blockChunker = blockChunking ? new EmbeddedBlockChunker(blockChunking) : null;
+  const blockChunker = new EmbeddedBlockChunker(blockChunking);
   // KNOWN: Provider streams are not strictly once-only or perfectly ordered.
   // `text_end` can repeat full content; late `text_end` can arrive after `message_end`.
   // Tests: `src/agents/embedded-agent-subscribe.test.ts` (e.g. late text_end cases).
@@ -365,19 +263,11 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     log,
     blockChunker,
     emitBlockReply: replyDelivery.emitBlockReply,
+    flushAssistantStream,
     pendingBlockReplyTasks: replyDelivery.pendingBlockReplyTasks,
     pushAssistantText: replyDelivery.pushAssistantText,
     shouldSkipAssistantText: replyDelivery.shouldSkipAssistantText,
   });
-  const {
-    consumePartialReplyDirectives,
-    consumeReplyDirectives,
-    emitBlockChunk,
-    emitReasoningStream,
-    flushBlockReplyBuffer,
-    resetAssistantMessageState,
-    stripBlockTags,
-  } = streamRendering;
 
   const resetForCompactionRetry = () => {
     state.hadDeterministicSideEffect =
@@ -391,6 +281,15 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
       state.acceptedSessionSpawns.length > 0 ||
       state.visibleBlockReplyCount > 0;
     assistantTexts.length = 0;
+    state.answerSegments.length = 0;
+    state.inputAnswer = undefined;
+    state.keptAnswer = undefined;
+    state.lastAssistant = undefined;
+    state.lastAssistantTextMessageIndex = -1;
+    state.lastAssistantTextContentIndex = undefined;
+    state.lastAssistantTextItemId = undefined;
+    state.lastAssistantTextNormalized = undefined;
+    state.lastAssistantTextTrimmed = undefined;
     toolMetas.length = 0;
     toolMetaById.clear();
     toolSummaryById.clear();
@@ -408,10 +307,6 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     state.currentSourceMessagingToolSentTextsNormalized.length = 0;
     messagingToolSentTargets.length = 0;
     messagingToolSentMediaUrls.length = 0;
-    pendingMessagingTexts.clear();
-    pendingMessagingTargets.clear();
-    state.heartbeatToolResponse = undefined;
-    state.pendingMessagingMediaUrls.clear();
     state.pendingToolMediaUrls = [];
     state.pendingToolMediaAttachments = [];
     state.pendingToolMediaTrustByUrl.clear();
@@ -419,43 +314,25 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     state.pendingToolAudioAsVoice = false;
     state.pendingToolMediaDeliveryFailed = false;
     state.visibleBlockReplyCount = 0;
-    state.deferBlockReplyDelivery = typeof params.onBeforeTerminalDelivery === "function";
-    clearDeferredAssistantEvents();
+    state.deferBlockReplyDelivery =
+      typeof params.onBeforeTerminalDelivery === "function" &&
+      params.deferTerminalDelivery !== false;
+    clearAssistantStream();
     clearDeferredBlockReplies();
-    state.pendingAssistantReplyDirectives = undefined;
     state.deterministicApprovalPromptPending = false;
     state.deterministicApprovalPromptSent = false;
     state.lastDeliveredBlockReplyText = undefined;
     state.toolExecutionSinceLastBlockReply = false;
-    // Keep prior usage until the retry records its own call or terminal error.
-    currentAttemptAssistant = undefined;
-    state.retryUsage = lastAssistantUsage ?? state.retryUsage;
-    lastAssistantUsage = undefined;
     state.replayState = mergeEmbeddedRunReplayState(state.replayState, params.initialReplayState);
     state.livenessState = "working";
-    resetAssistantMessageState(0);
-  };
-
-  const noteLastAssistant = (msg: AgentMessage) => {
-    if (msg?.role === "assistant") {
-      state.lastAssistant = msg;
-    }
-  };
-  const noteCompletedAssistant = (msg: AgentMessage) => {
-    if (msg?.role === "assistant") {
-      // Context-engine projection may later replace or mutate transcript
-      // objects. Final delivery needs the model event owned by this run.
-      currentAttemptAssistant = structuredClone(msg) as AssistantMessage;
-      lastAssistantUsage ??= msg.stopReason === "error" ? state.retryUsage : undefined;
-      state.retryUsage = undefined;
-    }
+    streamRendering.resetAssistantMessageState(0);
   };
 
   // Re-filter the full raw buffer. Reusing live scanner state would hide the
   // visible prefix when timeout interrupts an open <think> or <final> block.
   const finalizeFlushedAssistantText = (text: string) =>
     stripDowngradedToolCallText(
-      stripBlockTags(
+      streamRendering.stripBlockTags(
         text,
         {
           thinking: false,
@@ -488,6 +365,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   };
 
   const ctx: EmbeddedAgentSubscribeContext = {
+    ...streamRendering,
     params,
     state,
     log,
@@ -497,24 +375,16 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     builtinToolNames: params.builtinToolNames,
     trustedLocalMediaToolNames: params.trustedLocalMediaToolNames,
     noteLastAssistant,
-    noteCompletedAssistant,
     shouldEmitToolResult,
     shouldEmitToolOutput,
     emitToolSummary,
     emitToolOutput,
-    stripBlockTags,
-    emitBlockChunk,
-    flushBlockReplyBuffer,
     emitAssistantStreamData,
     emitBlockReply,
-    flushDeferredAssistantEvents,
-    flushDeferredBlockReplies,
-    clearDeferredAssistantEvents,
+    flushAssistantStream,
+    releaseDeferredReplies,
+    clearAssistantStream,
     clearDeferredBlockReplies,
-    emitReasoningStream,
-    consumeReplyDirectives,
-    consumePartialReplyDirectives,
-    resetAssistantMessageState,
     resetForCompactionRetry,
     finalizeAssistantTexts,
     trimMessagingToolSent,
@@ -524,8 +394,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     noteCompactionRetry,
     resolveCompactionRetry,
     maybeResolveCompactionWait,
-    recordAssistantUsage,
-    commitAssistantUsage,
+    captureModelEvent,
     incrementCompactionCount,
     noteCompactionTokensAfter,
     getUsageTotals,
@@ -535,7 +404,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   };
 
   const sessionUnsubscribe = params.session.subscribe(createEmbeddedAgentSessionEventHandler(ctx));
-  setSessionModelUsageSink(params.session.sessionManager, recordModelUsage);
+  setSessionModelUsageSink(params.session.sessionManager, recordAuxiliaryUsage);
 
   const unsubscribe = () => {
     if (state.unsubscribed) {
@@ -544,20 +413,16 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     // Mark as unsubscribed FIRST to prevent waitForCompactionRetry from creating
     // new un-resolvable promises during teardown.
     state.unsubscribed = true;
+    clearAssistantStream();
     cleanupRunToolStartData(params.runId);
     state.liveEditDiffStateById.clear();
     // Reject pending compaction wait to unblock awaiting code.
     // Don't resolve, as that would incorrectly signal "compaction complete" when it's still in-flight.
-    if (state.compactionRetryPromise) {
+    if (compactionRetry) {
       log.debug(`unsubscribe: rejecting compaction wait runId=${params.runId}`);
-      const reject = state.compactionRetryReject;
-      state.compactionRetryResolve = undefined;
-      state.compactionRetryReject = undefined;
-      state.compactionRetryPromise = null;
-      // Reject with AbortError so it's caught by isAbortError() check in cleanup paths
-      const abortErr = new Error("Unsubscribed during compaction");
-      abortErr.name = "AbortError";
-      reject?.(abortErr);
+      const { reject } = compactionRetry;
+      compactionRetry = undefined;
+      reject(createAbortError("Unsubscribed during compaction"));
     }
     // Cancel any in-flight compaction to prevent resource leaks when unsubscribing.
     // Only abort if compaction is actually running to avoid unnecessary work.
@@ -575,8 +440,10 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
 
   return {
     assistantTexts,
-    getCurrentAttemptAssistant: () =>
-      currentAttemptAssistant ? structuredClone(currentAttemptAssistant) : undefined,
+    answerSegments: state.answerSegments,
+    getCurrentAttemptAssistant,
+    getKeptAnswer: () => state.keptAnswer,
+    hasSuccessfulModelResponse,
     getLastAssistantTextMessageIndex: () =>
       state.lastAssistantTextMessageIndex >= 0 ? state.lastAssistantTextMessageIndex : undefined,
     toolMetas,
@@ -624,6 +491,9 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     getMessagingToolSentMediaUrls: () => messagingToolSentMediaUrls.slice(),
     getMessagingToolSentTargets: () => messagingToolSentTargets.slice(),
     getMessagingToolSourceReplyPayloads: () => messagingToolSourceReplyPayloads.slice(),
+    getSourceReplyDelivered: () => state.sourceReplyDelivered,
+    getSourceReplyDeliveryState: () => state.sourceReplyDeliveryState,
+    endsWithSourceProgress: () => state.lastToolTurnOnlySourceProgress === true,
     getHeartbeatToolResponse: () =>
       state.heartbeatToolResponse ? { ...state.heartbeatToolResponse } : undefined,
     getPendingToolMediaReply: () => readPendingToolMediaReply(state),
@@ -658,25 +528,21 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     waitForCompactionRetry: () => {
       // Reject after unsubscribe so callers treat it as cancellation, not success
       if (state.unsubscribed) {
-        const err = new Error("Unsubscribed during compaction wait");
-        err.name = "AbortError";
-        return Promise.reject(err);
+        return Promise.reject(createAbortError("Unsubscribed during compaction wait"));
       }
       if (state.compactionInFlight || state.pendingCompactionRetry > 0) {
         ensureCompactionPromise();
-        return state.compactionRetryPromise ?? Promise.resolve();
+        return compactionRetry?.promise ?? Promise.resolve();
       }
       return new Promise<void>((resolve, reject) => {
         queueMicrotask(() => {
           if (state.unsubscribed) {
-            const err = new Error("Unsubscribed during compaction wait");
-            err.name = "AbortError";
-            reject(err);
+            reject(createAbortError("Unsubscribed during compaction wait"));
             return;
           }
           if (state.compactionInFlight || state.pendingCompactionRetry > 0) {
             ensureCompactionPromise();
-            void (state.compactionRetryPromise ?? Promise.resolve()).then(resolve, reject);
+            void (compactionRetry?.promise ?? Promise.resolve()).then(resolve, reject);
           } else {
             resolve();
           }

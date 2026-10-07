@@ -1,5 +1,6 @@
 import { stableStringify } from "@openclaw/normalization-core";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { resolveSkillProposalName } from "../../skills/workshop/frontmatter.js";
 import { PROPOSAL_DRAFT_FILE } from "../../skills/workshop/store-record.js";
 import type {
   SkillProposalEvaluation,
@@ -46,22 +47,14 @@ export function listProposalEntries(params: {
       });
     })
     .toSorted((a, b) => {
-      if (a.status === "pending" && b.status !== "pending") {
-        return -1;
-      }
-      if (a.status !== "pending" && b.status === "pending") {
-        return 1;
-      }
-      return b.updatedAt.localeCompare(a.updatedAt);
+      const pendingOrder = Number(b.status === "pending") - Number(a.status === "pending");
+      return pendingOrder || b.updatedAt.localeCompare(a.updatedAt);
     })
     .slice(0, limit);
 }
 
 function normalizeProposalSearchText(value: string): string {
-  return value
-    .toLowerCase()
-    .replaceAll(/[^a-z0-9]+/g, "-")
-    .replaceAll(/^-|-$/g, "");
+  return value.replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "");
 }
 
 export function formatProposalList(proposals: readonly SkillProposalManifestEntry[]): string {
@@ -71,7 +64,7 @@ export function formatProposalList(proposals: readonly SkillProposalManifestEntr
   return proposals
     .map(
       (proposal) =>
-        `- ${proposal.id} [${proposal.status}, ${proposal.kind}, ${proposal.scanState}${proposal.workspaceMismatch ? ", previous workspace" : ""}${proposal.degradedState === "draft-missing" ? ", draft missing — reject and re-propose" : ""}] ${proposal.skillKey}: ${proposal.title}`,
+        `- ${proposal.id} [${proposal.status}, ${proposal.kind}, ${proposal.scanState}${proposal.degradedState === "draft-missing" ? ", draft missing — reject and re-propose" : ""}] ${resolveSkillProposalName(proposal.kind, proposal)}: ${proposal.title}`,
     )
     .join("\n");
 }
@@ -161,7 +154,7 @@ export function formatProposalInspect(
     `Proposal: ${proposal.record.id}`,
     `Status: ${proposal.record.status}`,
     `Kind: ${proposal.record.kind}`,
-    `Skill: ${proposal.record.target.skillKey}`,
+    `Skill: ${resolveSkillProposalName(proposal.record.kind, proposal.record.target)}`,
     `Version: ${proposal.record.proposedVersion}`,
     `Scan: ${proposal.record.scan.state}`,
     ...evaluationLines,

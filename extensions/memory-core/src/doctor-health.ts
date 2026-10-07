@@ -1,7 +1,10 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { HealthCheck } from "openclaw/plugin-sdk/health";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
-import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  asOptionalObjectRecord,
+  normalizeOptionalLowercaseString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   collectVectorProviderFindings,
   type ProviderFailure,
@@ -40,7 +43,6 @@ type MemoryCoreDoctorRegistrationState = Pick<
 
 type MemoryCoreDoctorCheck = HealthCheck & {
   readonly defaultEnabled: false;
-  readonly updateReadiness: "post-plugin";
 };
 
 const registrationsByHost = new WeakMap<
@@ -51,14 +53,19 @@ const registrationsByHost = new WeakMap<
   }
 >();
 
-function resolveSelectedMemoryProvider(
-  config: Parameters<typeof collectVectorProviderFindings>[0]["config"],
-  agentId: string,
-): string | null {
+function resolveSelectedMemoryProvider(config: unknown, agentId: string): string | null {
+  // Doctor still diagnoses raw candidates when an include prevents roster migration.
+  const cfg = asOptionalObjectRecord(config);
+  const agents = asOptionalObjectRecord(cfg?.agents);
+  const legacyList =
+    Object.prototype.propertyIsEnumerable.call(agents ?? {}, "list") && Array.isArray(agents?.list)
+      ? agents.list
+      : [];
   const agent =
-    config.agents?.entries?.[agentId] ?? config.agents?.list?.find((entry) => entry.id === agentId);
-  const defaults = config.memory?.search;
-  const overrides = agent?.memory?.search;
+    asOptionalObjectRecord(asOptionalObjectRecord(agents?.entries)?.[agentId]) ??
+    legacyList.map(asOptionalObjectRecord).find((entry) => entry?.id === agentId);
+  const defaults = asOptionalObjectRecord(asOptionalObjectRecord(cfg?.memory)?.search);
+  const overrides = asOptionalObjectRecord(asOptionalObjectRecord(agent?.memory)?.search);
   if (!(overrides?.enabled ?? defaults?.enabled ?? true)) {
     return null;
   }
@@ -75,7 +82,6 @@ function createManagedLocalEmbeddingSetupCheck(
     kind: "plugin",
     source: "memory-core",
     defaultEnabled: false,
-    updateReadiness: "post-plugin",
     description: "Checks existing semantic indexes for required managed local embedding setup.",
     async detect(ctx) {
       if (!state.memoryCoreActive) {
@@ -92,9 +98,6 @@ function createManagedLocalEmbeddingSetupCheck(
           },
           async (params) => {
             const provider = resolveSelectedMemoryProvider(params.config, params.agentId);
-            if (!provider || provider === "none") {
-              return null;
-            }
             if (provider !== LOCAL_MEMORY_EMBEDDING_PROVIDER_ID) {
               return null;
             }

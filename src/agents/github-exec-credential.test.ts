@@ -6,7 +6,7 @@ import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
 
 const permissions = vi.hoisted(() => ({ inspect: vi.fn(), read: vi.fn() }));
 vi.mock("@openclaw/fs-safe/permissions", () => ({ inspectPathPermissions: permissions.inspect }));
-vi.mock("@openclaw/fs-safe/secure-file", () => ({ readSecureFile: permissions.read }));
+vi.mock("../infra/fs-safe.js", () => ({ readSecureFile: permissions.read }));
 
 import { readGitHubExecToken } from "./github-exec-credential.js";
 
