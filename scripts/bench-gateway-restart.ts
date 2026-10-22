@@ -1,12 +1,13 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import fs, { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { expectDefined } from "../packages/normalization-core/src/expect.js";
 import { writeGatewayRestartIntentSync } from "../src/infra/restart-intent.js";
+import { writeBenchmarkJson } from "./lib/benchmark-harness.mts";
 import { delay, stopChild, type StopChildResult } from "./lib/gateway-bench-child.ts";
 import {
   getFreePort,
@@ -27,6 +28,7 @@ import {
   flushOutputLineBuffers,
   formatMb,
   formatMs,
+  gatewayBenchCpuProfileArgs,
   formatStats,
   hasHelpFlag,
   parseGatewayBenchRuntimeOptions,
@@ -153,6 +155,7 @@ type BenchmarkEvidenceFailure = {
 type CliOptions = GatewayBenchRuntimeOptions & {
   allowFailures: boolean;
   cases: GatewayBenchCase[];
+  cpuProfDir?: string;
   entry: string;
   json: boolean;
   output?: string;
@@ -172,6 +175,7 @@ const DEFAULT_ENTRY = "dist/entry.js";
 const BOOLEAN_FLAGS = new Set(["--allow-failures", "--help", "-h", "--json"]);
 const VALUE_FLAGS = new Set([
   "--case",
+  "--cpu-prof-dir",
   "--entry",
   "--gateway-runtime",
   "--gateway-cpus",
@@ -241,6 +245,7 @@ function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
     ...parseGatewayBenchRuntimeOptions(flags),
     allowFailures: flags.has("--allow-failures"),
     cases: resolveCases(flags.get("--case") ?? []),
+    cpuProfDir: flags.get("--cpu-prof-dir")?.[0],
     entry: resolveGatewayBenchEntry(flags.get("--entry")?.[0], DEFAULT_ENTRY),
     json: flags.has("--json"),
     output: resolveOutputPath(flags.get("--output")?.[0]),
@@ -266,6 +271,7 @@ Usage:
 Options:
   --case <id>              Specific case id to run; repeatable (default: skipChannels)
   --entry <path>           Gateway CLI entry file (default: ${DEFAULT_ENTRY})
+  --cpu-prof-dir <dir>     Write V8 CPU profiles for the Gateway and its workers
   --gateway-runtime <path> Gateway executable (default: the benchmark runtime)
   --gateway-cpus <list>    Linux Gateway-only CPU affinity (comma-separated CPU numbers)
   --runs <n>               Measured process samples per case (default: ${DEFAULT_RUNS})
@@ -632,15 +638,6 @@ function resolveIterationFailure(iteration: RestartIteration): GatewayRestartFai
   return null;
 }
 
-function finalizeRestartIteration(
-  iteration: RestartIteration,
-  childExited: boolean,
-  flushOutputBuffers: () => void,
-): GatewayRestartFailureCode | null {
-  flushOutputBuffers();
-  return childExited ? "restart_child_exited" : resolveIterationFailure(iteration);
-}
-
 function hasRestartReadySignal(iteration: RestartIteration): boolean {
   return (
     typeof iteration.restartTrace["restart.ready.total"] === "number" &&
@@ -705,6 +702,7 @@ async function waitForIterationCondition(
 async function runGatewaySample(
   options: GatewayBenchRuntimeOptions & {
     benchCase: GatewayBenchCase;
+    cpuProfDir?: string;
     entry: string;
     restarts: number;
     postReadyDelayMs: number;
@@ -714,7 +712,7 @@ async function runGatewaySample(
   ensureSupportedRestartPlatform();
   const port = await getFreePort();
   const command = buildGatewayBenchCommand(
-    buildGatewayBenchChildArgs(options.entry, port),
+    buildGatewayBenchChildArgs(options.entry, port, gatewayBenchCpuProfileArgs(options.cpuProfDir)),
     options,
   );
   const root = mkdtempSync(path.join(tmpdir(), "openclaw-gateway-restart-bench-"));
@@ -838,12 +836,10 @@ async function runGatewaySample(
   }
 
   if (failureCode === null) {
-    flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt);
     await waitForIterationCondition(
       () => hasInitialReadyLogs({ initialGatewayReadyLogMs, initialHttpListenLogMs }),
       initialDeadlineAt,
     );
-    flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt);
     if (!hasInitialReadyLogs({ initialGatewayReadyLogMs, initialHttpListenLogMs })) {
       failureCode = "initial_ready_log_timeout";
     }
@@ -920,9 +916,9 @@ async function runGatewaySample(
         iteration.cpuMs == null
           ? null
           : iteration.cpuMs / Math.max(1, performance.now() - signalSentAt);
-      iteration.failureCode = finalizeRestartIteration(iteration, childExited, () =>
-        flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt),
-      );
+      iteration.failureCode = childExited
+        ? "restart_child_exited"
+        : resolveIterationFailure(iteration);
       iterations.push(iteration);
       console.error(
         `[gateway-restart-bench] ${options.benchCase.id} restart ${index}/${options.restarts}: readyz=${formatMs(iteration.readyz.ms)} downtime=${formatMs(iteration.readyz.downtimeMs ?? iteration.healthz.downtimeMs)} restartReady=${formatMs(traceValue(iteration, "restart.ready.total"))} cpu=${formatMs(iteration.cpuMs)} rss=${formatMb(traceValue(iteration, "restart.ready.rssMb", "restart.ready.memory.ready.rssMb") ?? lastSnapshotValue(iteration, "rssMb"))} failure=${iteration.failureCode ?? "none"}`,
@@ -935,13 +931,10 @@ async function runGatewaySample(
   }
 
   currentIteration = null;
-  flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt);
   const exit = await stopChild(child);
   rssSampler.stop();
   const maxRssMb = rssSampler.sample();
-  flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt, {
-    flushPartial: true,
-  });
+  flushOutputLineBuffers(outputBuffers, onLine, performance.now() - sampleStartAt);
   failureCode ??= resolveSampleExitFailure(exit);
   try {
     rmSync(root, { force: true, maxRetries: 3, recursive: true, retryDelay: 100 });
@@ -973,6 +966,7 @@ async function runGatewaySample(
 async function runCase(
   options: GatewayBenchRuntimeOptions & {
     benchCase: GatewayBenchCase;
+    cpuProfDir?: string;
     entry: string;
     postReadyDelayMs: number;
     restarts: number;
@@ -1148,8 +1142,7 @@ async function main() {
     results,
   };
   if (options.output) {
-    mkdirSync(path.dirname(options.output), { recursive: true });
-    writeFileSync(options.output, `${JSON.stringify(payload, null, 2)}\n`);
+    writeBenchmarkJson(payload, options.output);
   }
   const evidenceFailures = collectBenchmarkEvidenceFailures(results);
   if (evidenceFailures.length > 0) {
@@ -1174,7 +1167,6 @@ export const testing = {
   countLsofFileDescriptors,
   createRestartIteration,
   ensureSupportedRestartPlatform,
-  finalizeRestartIteration,
   collectBenchmarkEvidenceFailures,
   hasInitialReadyLogs,
   hasBenchmarkFailures,

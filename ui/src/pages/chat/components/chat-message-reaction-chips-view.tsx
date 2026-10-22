@@ -1,12 +1,15 @@
 import { createMemo, For, Show } from "solid-js";
 import type { MessageReactionSummary } from "../../../../../packages/gateway-protocol/src/index.js";
-import { t } from "../../../lib/reactive/i18n.ts";
+import { registerChatSessionEnglish } from "../../../i18n/locales/en-chat-session.ts";
+import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
 import {
   type MessageReactionOptions,
   messageReactionOptions,
   ownReactionEmoji,
 } from "./chat-message-reaction-model.ts";
 import { MessageReactionPicker } from "./chat-message-reactions-view.tsx";
+
+registerEnglishCatalog(registerChatSessionEnglish);
 
 function reactorsLabel(reaction: MessageReactionSummary, userId: string | null | undefined) {
   const you = t("chat.reactions.you");
@@ -23,22 +26,6 @@ function reactorsLabel(reaction: MessageReactionSummary, userId: string | null |
 }
 
 type ReactionGroup = Parameters<typeof messageReactionOptions>[0];
-export function renderSolidGroupMessageReactions(
-  group: ReactionGroup,
-  actionDetails: { reactionMessageId?: string } | null | undefined,
-  isStreaming: boolean,
-  options: MessageReactionOptions,
-) {
-  return (
-    <GroupMessageReactions
-      group={group}
-      actionDetails={actionDetails}
-      isStreaming={isStreaming}
-      options={options}
-    />
-  );
-}
-
 export function GroupMessageReactions(props: {
   group: ReactionGroup;
   actionDetails: { reactionMessageId?: string } | null | undefined;

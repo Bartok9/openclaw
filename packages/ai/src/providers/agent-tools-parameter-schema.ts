@@ -6,6 +6,7 @@
 import { isRecord as isSchemaRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
+  filterStringEntries,
   normalizeStringEntries,
   uniqueValues,
 } from "@openclaw/normalization-core/string-normalization";
@@ -19,6 +20,7 @@ import {
   truncateToolSchemaDepth,
   wasToolSchemaTruncated,
 } from "./tool-schema-depth.js";
+import { getPublishedRuntimeToolInputSchema } from "./tool-schema-json-projection.js";
 import { createToolSchemaNormalizationCache } from "./tool-schema-normalization-cache.js";
 import { normalizeToolSchema } from "./tool-schema-normalization.js";
 import {
@@ -81,10 +83,7 @@ export type ToolParameterSchemaOptions = {
   modelCompat?: ToolSchemaModelCompat;
 };
 
-const MAX_TOOL_PARAMETER_SCHEMA_CACHE_ENTRIES_PER_SCHEMA = 8;
-const toolParameterSchemaCache = createToolSchemaNormalizationCache<TSchema>(
-  MAX_TOOL_PARAMETER_SCHEMA_CACHE_ENTRIES_PER_SCHEMA,
-);
+const toolParameterSchemaCache = createToolSchemaNormalizationCache<TSchema>();
 
 function isGeminiModelId(modelId: string): boolean {
   return /(?:^|[/:])gemini(?:$|[-/:.])/.test(modelId);
@@ -261,7 +260,11 @@ export function normalizeToolParameterSchema(
   schema: unknown,
   options?: ToolParameterSchemaOptions,
 ): TSchema {
-  const boundedSchema = truncateToolSchemaDepth(schema, options?.toolName);
+  const published = getPublishedRuntimeToolInputSchema(schema);
+  const boundedSchema = published ? schema : truncateToolSchemaDepth(schema, options?.toolName);
+  if (published && wasToolSchemaTruncated(schema)) {
+    reportToolSchemaTruncation(schema, options?.toolName);
+  }
   const normalizedProvider = normalizeLowercaseStringOrEmpty(options?.modelProvider);
   const normalizedModelId = normalizeLowercaseStringOrEmpty(options?.modelId);
   const normalizedToolSchemaProfile = normalizeLowercaseStringOrEmpty(
@@ -417,11 +420,9 @@ export function normalizeToolParameterSchema(
     setOwnSchemaProperty(mergedProperties, key, merged);
   }
 
-  const baseRequired = Array.isArray(schemaRecord.required)
-    ? schemaRecord.required.filter((key) => typeof key === "string")
-    : undefined;
+  const baseRequired = filterStringEntries(schemaRecord.required);
   const mergedRequired =
-    baseRequired && baseRequired.length > 0
+    baseRequired.length > 0
       ? baseRequired
       : objectVariants > 0
         ? Array.from(requiredCounts.entries())

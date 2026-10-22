@@ -16,7 +16,6 @@ import type { MidTurnPrecheckRequest } from "./midturn-precheck.js";
 import {
   PREEMPTIVE_OVERFLOW_ERROR_TEXT,
   buildPrePromptContextBudgetStatus,
-  formatPrePromptPrecheckLog,
   shouldPreemptivelyCompactBeforePrompt,
 } from "./preemptive-compaction.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
@@ -138,6 +137,7 @@ export async function prepareEmbeddedAttemptPromptPreflight(input: {
   attempt: AttemptPromptPreflightParams &
     Pick<EmbeddedRunAttemptParams, "model" | "runtimePlan" | "authProfileId">;
   compactionReplayEnabled: boolean;
+  providerCompactionAtRequestBoundary?: boolean;
   contextEnginePromptAuthority: NonNullable<AssembleResult["promptAuthority"]>;
   contextTokenBudget: number;
   hookMessagesForCurrentPrompt: AgentMessage[];
@@ -170,6 +170,11 @@ export async function prepareEmbeddedAttemptPromptPreflight(input: {
     return { ...input.state };
   }
   if ((input.pendingInputTokens ?? 0) >= input.contextTokenBudget) {
+    if (input.providerCompactionAtRequestBoundary) {
+      log.warn(
+        "ChatGPT V2 compaction unavailable; falling back to client compaction: pending input exceeds the context budget",
+      );
+    }
     return {
       ...input.state,
       preflightRecovery: { route: "compact_only" },
@@ -220,15 +225,12 @@ export async function prepareEmbeddedAttemptPromptPreflight(input: {
     ...(unwindowedMessages ? { unwindowedMessageCount: unwindowedMessages.length } : {}),
   };
   const contextBudgetStatus = buildPrePromptContextBudgetStatus(precheckSummary);
-  log.debug(
-    formatPrePromptPrecheckLog({
-      ...precheckSummary,
-      ...(attempt.sessionKey ? { sessionKey: attempt.sessionKey } : {}),
-      ...(attempt.sessionFile ? { sessionFile: attempt.sessionFile } : {}),
-    }),
-  );
   const checkpointPressure = preemptiveCompaction.compactionReplay;
-  if (checkpointPressure && checkpointPressure.route !== "fits") {
+  if (
+    checkpointPressure &&
+    checkpointPressure.route !== "fits" &&
+    !input.providerCompactionAtRequestBoundary
+  ) {
     // Only the actual canonical window can require recovery; the raw-history
     // maximum above remains diagnostic even when it exceeds this window.
     return {

@@ -5,6 +5,10 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeEach, vi } from "vitest";
 import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
 import type { BoundAgentRunSessionTarget } from "../../agents/run-session-target.types.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../config/types.js";
 import {
   claimAgentRunDelegatedAuthority,
@@ -36,6 +40,7 @@ import {
   attachWorkerTurnExecutionIdentityStore,
   bindWorkerTurnOwner,
   bindWorkerTurnCapabilities,
+  bindWorkerTurnGitHubGrant,
   getWorkerTurnExecutionIdentityCapability,
 } from "./placement-turn-claim-events.js";
 import { createWorkerEnvironmentService, type WorkerEnvironmentService } from "./service.js";
@@ -165,6 +170,8 @@ export function setupWorkerEnvironmentServiceSuite() {
         },
       },
     };
+    // The Gateway publishes its runtime config at startup.
+    setRuntimeConfigSnapshot(testState.config);
     testState.prepareInstallation = vi.fn(async (install) =>
       install === "bundle" ? BUNDLE_ARTIFACT : NPM_ARTIFACT,
     );
@@ -184,6 +191,7 @@ export function setupWorkerEnvironmentServiceSuite() {
       for (const release of testState.releaseTurnOwners) {
         await release();
       }
+      clearRuntimeConfigSnapshot();
     }
     await closeWorkerEnvironmentDatabase();
     await fs.rm(testState.root, { recursive: true, force: true });
@@ -233,6 +241,7 @@ export function createService(
       | "closeNodeBootstrapArtifacts"
       | "createGatewayTools"
       | "executeComputer"
+      | "closeEnvironmentComputers"
       | "providerCallTimeoutMs"
       | "projectNamespace"
       | "resolveSshIdentity"
@@ -547,10 +556,14 @@ export function terminalEvent(identity: WorkerConnectionIdentity, overrides: Liv
 }
 
 export function successfulTranscriptCommit(entryId: string, beforeCommit?: () => Promise<unknown>) {
-  return vi.fn(async () => {
-    await beforeCommit?.();
-    return { ok: true as const, result: { entryIds: [entryId], newLeafId: entryId } };
-  });
+  return vi.fn<NonNullable<WorkerEnvironmentServiceOptions["applyTranscriptCommit"]>>(
+    async ({ onCommitted }) => {
+      await beforeCommit?.();
+      const outcome = { ok: true as const, result: { entryIds: [entryId], newLeafId: entryId } };
+      await onCommitted?.(outcome);
+      return outcome;
+    },
+  );
 }
 
 export function sequencedLiveEvents(ackedSeq = (seq: number) => seq) {
@@ -710,6 +723,8 @@ export async function bindPlacementHarness(
     workerService,
     source,
     releaseSource,
+    bindGitHubGrant: (grant: Parameters<typeof bindWorkerTurnGitHubGrant>[2]) =>
+      bindWorkerTurnGitHubGrant(executionStore, claim, grant),
     bindToolSurface: (surface: Parameters<typeof bindWorkerTurnCapabilities>[2]["toolSurface"]) =>
       bindWorkerTurnCapabilities(executionStore, claim, { toolSurface: surface }),
   };

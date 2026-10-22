@@ -2,7 +2,9 @@ import path from "node:path";
 import { detectMime } from "@openclaw/media-core/mime";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { Command } from "commander";
+import { normalizeImageGenerationResolution } from "../../image-generation/resolution.js";
 import { createEnumOptionParser } from "../../shared/enum-option.js";
+import { parseOptionalPositiveInteger } from "../parse-positive-integer.js";
 import { collectOption } from "../program/helpers.js";
 import { isMissingMediaUnderstandingProvider } from "./media-understanding-result.js";
 import type { CapabilityEnvelope } from "./metadata.js";
@@ -60,7 +62,6 @@ export function registerImageCapabilityCommands(capabilityCommand: Command): voi
               : undefined;
           const {
             resolveCapabilityAgentOption,
-            parseOptionalPositiveInteger,
             parseOptionalTimeoutMs,
             requireProviderModelOverride,
             resolveLocalCapabilityAgent,
@@ -70,7 +71,7 @@ export function registerImageCapabilityCommands(capabilityCommand: Command): voi
           const count = parseOptionalPositiveInteger(opts.count, "--count");
           const size = opts.size as string | undefined;
           const aspectRatio = opts.aspectRatio as string | undefined;
-          const resolution = opts.resolution as "1K" | "2K" | "4K" | undefined;
+          const resolution = normalizeImageGenerationResolution(opts.resolution);
           const outputFormat = parseImageOption(
             opts.outputFormat,
             IMAGE_OUTPUT_FORMATS,

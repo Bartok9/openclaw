@@ -3,20 +3,22 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
+import type { AppSidebarElement } from "../components/app-sidebar.tsx";
 import {
   takeControlUiElementScreenshot,
   takeControlUiViewportScreenshot,
+  waitForControlUiProofSurface,
 } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
-  controlUiBundledSettingsStorageKey,
   controlUiSessionPath,
-  controlUiSessionUrl,
   installMockGateway,
   waitForControlUiRoute,
   waitForControlUiSettingsTakeover,
 } from "../test-helpers/control-ui-e2e.ts";
+import { navigationDrawerToggle } from "../test-helpers/control-ui-navigation.ts";
 import { workboardUi } from "../test-helpers/control-ui-workboard-fixture.ts";
 import { compactCronJobFixture } from "../test-helpers/cron.ts";
+import { seedChatSettings } from "./chat-layout-fixtures.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 import { openSidebarPages, openSidebarPinMenu } from "./sidebar-customization.test-support.ts";
 
@@ -36,10 +38,6 @@ async function trimmedTextContents(locator: Locator): Promise<string[]> {
 
 async function roundedWidth(locator: Locator): Promise<number> {
   return Math.round((await locator.boundingBox())?.width ?? 0);
-}
-
-function visibleDrawerButton(page: Page) {
-  return page.locator(".topbar-nav-toggle:visible, .chat-pane__nav-toggle:visible").first();
 }
 
 async function captureUiProof(page: Page, fileName: string, surface = page.locator(".shell")) {
@@ -84,8 +82,6 @@ async function setThemeMode(page: Page, mode: "dark" | "light") {
     const root = document.documentElement;
     root.dataset.themeMode = nextMode;
     root.dataset.themeResolved = nextMode;
-    root.classList.toggle("wa-light", nextMode === "light");
-    root.classList.toggle("wa-dark", nextMode === "dark");
     root.style.colorScheme = nextMode;
   }, mode);
   await expect.poll(() => page.locator("html").getAttribute("data-theme-mode")).toBe(mode);
@@ -114,23 +110,16 @@ suite.define(() => {
               "workboard.cards.list": { boards, cards: [], statuses: ["todo", "done"] },
             },
           });
-          await page.addInitScript(
-            ({ key, leadEntry }) =>
-              localStorage.setItem(
-                key,
-                JSON.stringify({
-                  sidebarAgentsMode: "roster",
-                  sidebarEntries: ["route:agents-home", leadEntry, "route:cron"],
-                }),
-              ),
-            { key: controlUiBundledSettingsStorageKey(suite.server.baseUrl), leadEntry: entry },
-          );
+          await seedChatSettings(page, suite.server.baseUrl, {
+            sidebarAgentsMode: "roster",
+            railShortcuts: ["route:sessions", entry, "route:cron"],
+          });
           await page.goto(`${suite.server.baseUrl}${route}`);
           if (label === "Workboard") {
             await page.locator(".workboard-page-title", { hasText: "Operations" }).waitFor();
           }
           if (width < 900) {
-            await visibleDrawerButton(page).click();
+            await navigationDrawerToggle(page).click();
           }
           const sidebar = page.locator("openclaw-app-sidebar");
           const row = sidebar.locator('.sidebar-rail__pin[data-sidebar-entry="' + entry + '"]');
@@ -163,7 +152,6 @@ suite.define(() => {
           expect(
             Math.abs(iconBox!.x + iconBox!.width / 2 - (linkBox!.x + linkBox!.width / 2)),
           ).toBeLessThanOrEqual(1);
-          expect(await row.locator(".sidebar-reorder-trigger").count()).toBe(0);
           if (label === "Workboard") {
             const pages = await openSidebarPages(page);
             const operationsEntry = pages.locator(
@@ -406,7 +394,7 @@ suite.define(() => {
       const openSettingsFromIdentity = async () => {
         await identityCard.click();
         await sidebar
-          .locator("wa-dropdown.sidebar-identity-menu")
+          .locator(".sidebar-identity-menu")
           .getByRole("menuitem", { exact: true, name: "Settings" })
           .click();
       };
@@ -631,7 +619,43 @@ suite.define(() => {
         .filter({ has: page.getByRole("link", { name: "Usage", exact: true }) });
       await usage.getByRole("button", { name: "Pin", exact: true }).click();
       await expect.poll(() => trimmedTextContents(pinnedItems)).toEqual(["Usage"]);
+      // A pinned page keeps a filled pin at rest, and hovering the pin keeps the
+      // whole entry, pin included, inside the row highlight.
+      const usagePin = usage.getByRole("button", { name: "Unpin", exact: true });
+      await page.mouse.move(900, 600);
+      await expect
+        .poll(() =>
+          usagePin.evaluate((pin) => ({
+            opacity: getComputedStyle(pin).opacity,
+            filled: getComputedStyle(pin.querySelector("svg")!).fill !== "none",
+          })),
+        )
+        .toEqual({ opacity: "1", filled: true });
+      await usagePin.hover();
+      await expect
+        .poll(() => usage.evaluate((entry) => getComputedStyle(entry).backgroundColor))
+        .not.toBe("rgba(0, 0, 0, 0)");
       await captureUiProof(page, "02-personal-pin.png");
+      // Rail pins match the view buttons: same icon size, and the same fill for
+      // hover and for the current page.
+      const railUsage = pinnedItems.first();
+      const iconWidth = (locator: typeof railUsage) =>
+        locator
+          .locator("svg")
+          .first()
+          .evaluate((svg) => svg.getBoundingClientRect().width);
+      const background = (locator: typeof railUsage) =>
+        locator.evaluate((element) => getComputedStyle(element).backgroundColor);
+      expect(await iconWidth(railUsage)).toBe(await iconWidth(pagesButton));
+      await waitForControlUiProofSurface(pagesButton, []);
+      const pressedBackground = await background(pagesButton);
+      await railUsage.hover();
+      await expect.poll(() => background(railUsage)).toBe(pressedBackground);
+      await railUsage.click();
+      await expect.poll(() => new URL(page.url()).pathname).toBe("/usage");
+      await page.mouse.move(900, 600);
+      await expect.poll(() => background(railUsage)).toBe(pressedBackground);
+      await page.goto(`${suite.server.baseUrl}chat`);
       await page.reload();
       await expect.poll(() => trimmedTextContents(pinnedItems)).toEqual(["Usage"]);
       // The transient selected view resets, but saved personal pins do not.
@@ -652,8 +676,8 @@ suite.define(() => {
       await page.keyboard.press("Escape");
       await expect.poll(() => paletteInput.isVisible()).toBe(false);
 
-      // Collapsing the list retains the personal icon rail; the content chrome
-      // provides the matching expand control.
+      // Collapsing the list retains the personal icon rail; its view buttons
+      // provide the matching expand controls.
       const collapseButton = page.locator('[data-navigation-view][aria-pressed="true"]');
       await collapseButton.click();
       await expect
@@ -670,8 +694,7 @@ suite.define(() => {
       await expect.poll(() => sidebar.isVisible()).toBe(true);
       await expect.poll(() => sidebar.locator(".sidebar-shell").isVisible()).toBe(false);
       await expect.poll(() => sidebar.locator(".sidebar-rail").isVisible()).toBe(true);
-      const navExpand = page.locator(".shell-chrome-controls__nav-toggle");
-      await expect.poll(() => navExpand.isVisible()).toBe(true);
+      await expect.poll(() => pagesButton.isVisible()).toBe(true);
       await page.reload();
       // Sidebar visibility is tab-local and intentionally not persisted; width is.
       await expect.poll(() => collapseButton.isVisible()).toBe(true);
@@ -688,7 +711,7 @@ suite.define(() => {
         .toContain("shell--nav-collapsed");
 
       await page.setViewportSize({ height: 900, width: 900 });
-      const drawerButton = visibleDrawerButton(page);
+      const drawerButton = navigationDrawerToggle(page);
       await expect.poll(() => drawerButton.isVisible()).toBe(true);
       await drawerButton.click();
       await expect
@@ -709,7 +732,7 @@ suite.define(() => {
         )
         .toBe(0);
       // Narrow Chat merges navigation controls into its title bar.
-      await expect.poll(() => page.locator(".chat-pane__header").first().isVisible()).toBe(true);
+      await expect.poll(() => page.locator(".agent-chat__header--mobile").isVisible()).toBe(true);
       await captureUiProof(page, "05-expanded-tablet-drawer.png");
 
       // Widening with the drawer open must not leave its stale state blocking
@@ -734,7 +757,7 @@ suite.define(() => {
         .poll(() => page.locator(".shell").getAttribute("class"))
         .not.toContain("shell--nav-drawer-open");
       await page.setViewportSize({ height: 852, width: 393 });
-      await expect.poll(() => page.locator(".chat-pane__header").first().isVisible()).toBe(true);
+      await expect.poll(() => page.locator(".agent-chat__header--mobile").isVisible()).toBe(true);
       await expect
         .poll(() =>
           page.locator(".shell-nav").evaluate((element) => element.getBoundingClientRect().right),
@@ -754,30 +777,6 @@ suite.define(() => {
     }
   });
 
-  it("opens the start screen from the sidebar action without carrying the active session", async () => {
-    await suite.withPage(
-      {
-        locale: "en-US",
-        serviceWorkers: "block",
-        viewport: { height: 900, width: 1440 },
-      },
-      async ({ page }) => {
-        await installMockGateway(page);
-
-        await page.goto(controlUiSessionUrl(suite.server.baseUrl, "agent:main:work"));
-        await page
-          .locator("openclaw-app-sidebar .sidebar-session-toolbar .sidebar-new-session")
-          .click();
-
-        await expect.poll(() => new URL(page.url()).pathname).toBe("/new");
-        await expect.poll(() => new URL(page.url()).searchParams.get("agent")).toBe("main");
-        await expect.poll(() => new URL(page.url()).searchParams.has("session")).toBe(false);
-        await expect.poll(() => page.locator(".new-session-page").isVisible()).toBe(true);
-        await captureUiProof(page, "07-sidebar-start-screen.png");
-      },
-    );
-  });
-
   it("keeps Home activity and unsent attention stable while rail controls appear", async () => {
     await suite.withPage(
       {
@@ -787,27 +786,9 @@ suite.define(() => {
       },
       async ({ page }) => {
         await installMockGateway(page, {
-          methodResponses: {
-            "sessions.list": {
-              count: 1,
-              defaults: {
-                contextTokens: null,
-                model: "gpt-5.5",
-                modelProvider: "openai",
-              },
-              path: "",
-              sessions: [
-                {
-                  hasActiveRun: true,
-                  key: "main",
-                  kind: "direct",
-                  status: "running",
-                  updatedAt: 100,
-                },
-              ],
-              ts: 100,
-            },
-          },
+          sessions: [
+            { hasActiveRun: true, key: "main", kind: "direct", status: "running", updatedAt: 100 },
+          ],
         });
 
         await page.goto(`${suite.server.baseUrl}chat`);
@@ -815,37 +796,25 @@ suite.define(() => {
         const pages = await openSidebarPages(page);
         await pages
           .locator(".sidebar-pages__entry")
-          .filter({ has: page.getByRole("link", { name: "Agents", exact: true }) })
+          .filter({ has: page.getByRole("link", { name: "Sessions", exact: true }) })
           .getByRole("button", { name: "Pin", exact: true })
           .click();
         await sidebar.getByRole("button", { name: "Sessions", exact: true }).click();
         const home = sidebar.locator(".sidebar-footer-bar__home");
         await expect.poll(() => home.isVisible()).toBe(true);
-        await sidebar.evaluate(async (element) => {
-          const host = element as HTMLElement & {
-            requestUpdate(): void;
-            updateComplete: Promise<unknown>;
-          };
-          // The shell refreshes this snapshot whenever its lazy outbox runtime
-          // loads. Keep the warning fixture stable until geometry is measured.
-          const storedOutboxes = {
+        await sidebar.evaluate((element) => {
+          // This layout fixture supplies the sidebar's declared presentation input.
+          (element as AppSidebarElement).storedOutboxes = {
             total: 1,
             attentionCountForSession: () => 1,
             hasSessionDraft: () => false,
           };
-          Object.defineProperty(host, "storedOutboxes", {
-            configurable: true,
-            get: () => storedOutboxes,
-            set: () => undefined,
-          });
-          host.requestUpdate();
-          await host.updateComplete;
         });
 
         const activity = home.locator(".session-glyph");
         const shortcut = sidebar
-          .locator('.sidebar-rail__pin[data-sidebar-entry="route:agents-home"]')
-          .getByRole("link", { name: "Agents", exact: true });
+          .locator('.sidebar-rail__pin[data-sidebar-entry="route:sessions"]')
+          .getByRole("link", { name: "Sessions", exact: true });
         await expect
           .poll(() => home.locator(".session-glyph--running .session-glyph__ring").count())
           .toBe(1);
@@ -928,7 +897,7 @@ suite.define(() => {
         await gateway.emitGatewayEvent("update.available", {
           schedule: {
             autoEnabled: false,
-            channel: "dev",
+            channel: "beta",
             install: { kind: "git", git: { status: "behind", commitsBehind: 246 } },
             target: {
               kind: "git",
@@ -938,7 +907,7 @@ suite.define(() => {
             },
           },
           updateAvailable: {
-            channel: "dev",
+            channel: "beta",
             commitsBehind: 246,
             currentSha: "1111111111111111111111111111111111111111",
             currentVersion: "2026.8.1",
@@ -977,7 +946,7 @@ suite.define(() => {
           );
         await captureUiProof(page, "09-mobile-attention-closed.png");
 
-        await visibleDrawerButton(page).click();
+        await navigationDrawerToggle(page).click();
         await expect
           .poll(() => page.locator(".shell").getAttribute("class"))
           .toContain("shell--nav-drawer-open");

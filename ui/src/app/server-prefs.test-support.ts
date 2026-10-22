@@ -1,6 +1,8 @@
-import { vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
+import type { UsersPrefsSetParams } from "../../../packages/gateway-protocol/src/schema/users.ts";
 import { GatewayRequestError, type GatewayBrowserClient } from "../api/gateway.ts";
 import type { RuntimeConfigExternalMutationOptions } from "../lib/config/config-gateway-operations.ts";
+import { createStorageMock } from "../test-helpers/storage.ts";
 import { applyServerUiPrefs, refreshProfileAppearancePrefs } from "./server-prefs-reconcile.ts";
 import { pushServerUiPrefs, resetServerUiPrefsSync } from "./server-prefs.ts";
 import { patchSettings } from "./settings.ts";
@@ -8,6 +10,22 @@ import { patchSettings } from "./settings.ts";
 export type RequestMock = ReturnType<
   typeof vi.fn<(method: string, params?: unknown) => Promise<unknown>>
 >;
+
+export function installServerPrefsStorage(scope: string, restoreMocks = false) {
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", createStorageMock());
+    resetServerUiPrefsSync();
+    patchSettings({ gatewayUrl: scope });
+  });
+  afterEach(() => {
+    resetServerUiPrefsSync();
+    vi.useRealTimers();
+    if (restoreMocks) {
+      vi.restoreAllMocks();
+    }
+    vi.unstubAllGlobals();
+  });
+}
 
 export function configWithPrefs(prefs: Record<string, unknown>) {
   return { ui: { prefs } };
@@ -84,11 +102,8 @@ export function createProfilePrefsServer(
         if (method !== "users.prefs.set") {
           throw new Error("unexpected global mutation: " + method);
         }
-        const update = params as {
-          entries: Record<string, unknown>;
-          expectedEntries: Record<string, unknown>;
-        };
-        for (const [key, expected] of Object.entries(update.expectedEntries)) {
+        const update = params as UsersPrefsSetParams;
+        for (const [key, expected] of Object.entries(update.expectedEntries ?? {})) {
           if (JSON.stringify(entries[key] ?? null) !== JSON.stringify(expected)) {
             return { status: "conflict" };
           }
