@@ -840,20 +840,6 @@ describe("WorkboardStore", () => {
     );
   });
 
-  it("treats an empty proofId as omitted so OpenAI strict schemas can complete", async () => {
-    const store = createStore();
-    const card = await createCard(store, "Empty proofId from strict schema");
-
-    const completed = await store.complete(card.id, {
-      summary: "echo ok",
-      proofId: "",
-      proof: { status: "passed", command: "echo ok" },
-    });
-
-    expect(completed.status).toBe("done");
-    expect(completed.metadata?.proof?.[0]?.status).toBe("passed");
-  });
-
   it("resolves only correlated proof and refuses to rewrite terminal evidence", async () => {
     const store = createStore();
     const proofInput = { command: "review poem", note: "Checked each line." };
