@@ -440,6 +440,13 @@ export function buildGatewayCronService(params: {
       resolveGatewayContext: scheduledGatewayContextResolver,
       resolvePluginRegistry: params.resolvePluginRegistry,
     }),
+    runJobPrecheck: async (params) => {
+      const { runCronJobPrecheck } = await import("../cron/job-precheck-run.js");
+      return await runCronJobPrecheck({
+        ...params,
+        config: getRuntimeConfig(),
+      });
+    },
     runCommandJob: async ({ job, abortSignal, deliveryAttemptFence }) => {
       const result = await runCronCommandJob({
         job,

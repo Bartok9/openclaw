@@ -16,6 +16,7 @@ import { isUnknownCronGetMethodError, listCronJobsFromGateway } from "./list-job
 import { createCronOutputCommand } from "./output-mode.js";
 import {
   parseCronDeliveryPolicyOptions,
+  readCronPrecheckCliOptions,
   registerCronMutationOptions,
   resolveCronExecutionPolicyOptions,
 } from "./register.cron-options.js";
@@ -98,6 +99,7 @@ export function registerCronEditCommand(cron: Command) {
       .option("--clear-active-hours", "Remove the entire execution window", false)
       .option("--clear-idle-only", "Remove the per-job idle-only policy", false)
       .option("--clear-trigger", "Remove the condition trigger", false)
+      .option("--clear-precheck", "Remove the host shell precheck", false)
       .option(
         "--clear-thinking",
         "Remove the per-job thinking override (restore normal cron thinking precedence)",
@@ -308,6 +310,35 @@ export function registerCronEditCommand(cron: Command) {
               );
             }
             patch.trigger = { ...existing.trigger, once: true };
+          }
+
+          const precheckCli = readCronPrecheckCliOptions(opts);
+          if (
+            opts.clearPrecheck &&
+            (precheckCli.command !== undefined || precheckCli.timeoutSeconds !== undefined)
+          ) {
+            throw new CronCliError("Use --clear-precheck or precheck options, not both");
+          }
+          if (opts.clearPrecheck) {
+            patch.precheck = null;
+          } else if (precheckCli.command !== undefined) {
+            patch.precheck = {
+              command: precheckCli.command,
+              ...(precheckCli.timeoutSeconds !== undefined
+                ? { timeoutSeconds: precheckCli.timeoutSeconds }
+                : {}),
+            };
+          } else if (precheckCli.timeoutSeconds !== undefined) {
+            const existing = await readExistingCronJob();
+            if (!existing.precheck) {
+              throw new CronCliError(
+                "--precheck-timeout-seconds requires an existing precheck or --precheck",
+              );
+            }
+            patch.precheck = {
+              ...existing.precheck,
+              timeoutSeconds: precheckCli.timeoutSeconds,
+            };
           }
 
           const scheduleRequest = resolveCronEditScheduleRequest(opts);
