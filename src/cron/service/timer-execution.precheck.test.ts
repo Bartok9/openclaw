@@ -73,7 +73,9 @@ describe("executeJobCore precheck", () => {
 
     const disabled = makeState({
       cronConfig: { triggers: { enabled: false } },
-      runJobPrecheck: vi.fn(async () => ({ kind: "work", exitCode: 0 })),
+      runJobPrecheck: vi.fn(
+        async () => ({ kind: "work", exitCode: 0 }) satisfies CronJobPrecheckResult,
+      ),
     });
     await expect(executeJobCore(disabled, job())).resolves.toMatchObject({
       status: "error",
@@ -88,7 +90,7 @@ describe("executeJobCore precheck", () => {
     const state = makeState({
       runJobPrecheck: vi.fn(async () => {
         order.push("precheck");
-        return { kind: "work", exitCode: 0 };
+        return { kind: "work", exitCode: 0 } satisfies CronJobPrecheckResult;
       }),
       runIsolatedAgentJob: vi.fn(async () => {
         order.push("payload");
@@ -109,7 +111,9 @@ describe("executeJobCore precheck", () => {
 
   it("does not start the probe after run authority is rejected", async () => {
     const state = makeState({
-      runJobPrecheck: vi.fn(async () => ({ kind: "work", exitCode: 0 })),
+      runJobPrecheck: vi.fn(
+        async () => ({ kind: "work", exitCode: 0 }) satisfies CronJobPrecheckResult,
+      ),
     });
 
     await expect(

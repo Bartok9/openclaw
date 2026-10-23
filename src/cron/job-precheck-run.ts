@@ -97,7 +97,7 @@ export async function runCronJobPrecheck(
     cfg: params.config,
     agentId: params.job.agentId,
   });
-  let tool = createExecTool({
+  const execTool = createExecTool({
     ...defaults,
     agentId: params.job.agentId,
     config: params.config,
@@ -108,29 +108,25 @@ export async function runCronJobPrecheck(
     timeoutSec: parsed.value.timeoutSeconds,
   });
   const pin = params.job.toolsAllowExecTarget;
-  if (pin) {
-    if (pin.version !== 1 || pin.host !== "gateway") {
-      return { kind: "denied", error: "exec denied: cron exec target is not a gateway pin" };
-    }
-    tool = pinExecToolTarget(tool, {
-      host: "gateway",
-      ...(pin.ask ? { ask: pin.ask } : {}),
-    });
+  if (pin && (pin.version !== 1 || pin.host !== "gateway")) {
+    return { kind: "denied", error: "exec denied: cron exec target is not a gateway pin" };
   }
   // Re-check run authority immediately before the tool can spawn.
   await params.assertRunCurrent?.();
   if (params.abortSignal?.aborted) {
     return { kind: "error", error: "cron precheck aborted" };
   }
+  const execArgs = {
+    command: parsed.value.command,
+    timeoutSeconds: parsed.value.timeoutSeconds,
+  };
   try {
-    const result = await tool.execute(
-      "cron-precheck",
-      {
-        command: parsed.value.command,
-        timeoutSeconds: parsed.value.timeoutSeconds,
-      },
-      params.abortSignal,
-    );
+    const result = pin
+      ? await pinExecToolTarget(execTool, {
+          host: "gateway",
+          ...(pin.ask ? { ask: pin.ask } : {}),
+        }).execute("cron-precheck", execArgs, params.abortSignal)
+      : await execTool.execute("cron-precheck", execArgs, params.abortSignal);
     return classifyExecResult(result, parsed.value);
   } catch (error) {
     const message = error instanceof Error ? error.message : "cron precheck failed";
