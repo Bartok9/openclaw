@@ -322,7 +322,11 @@ export function registerCronEditCommand(cron: Command) {
           if (opts.clearPrecheck) {
             patch.precheck = null;
           } else if (precheckCli.command !== undefined) {
+            // The CLI can change the command and timeout, not exit codes. Replacing
+            // the object would refill defaults and turn a stored no-work code into a run error.
+            const existing = await readExistingCronJob();
             patch.precheck = {
+              ...existing.precheck,
               command: precheckCli.command,
               ...(precheckCli.timeoutSeconds !== undefined
                 ? { timeoutSeconds: precheckCli.timeoutSeconds }
