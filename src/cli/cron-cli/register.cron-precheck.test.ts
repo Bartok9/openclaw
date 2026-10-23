@@ -110,4 +110,54 @@ describe("cron precheck CLI", () => {
       },
     });
   });
+
+  it("keeps stored timeout and exit codes when the precheck command changes", async () => {
+    callGatewayFromCli.mockImplementation(async (method: string) =>
+      method === "cron.get"
+        ? {
+            id: "job-1",
+            precheck: {
+              command: "inbox-has-mail",
+              timeoutSeconds: 90,
+              workExitCodes: [0, 3],
+              noWorkExitCodes: [2, 4],
+            },
+          }
+        : { ok: true },
+    );
+
+    await run(["edit", "job-1", "--precheck", "inbox-has-urgent-mail"]);
+    expectRequest("cron.update", {
+      id: "job-1",
+      patch: {
+        precheck: {
+          command: "inbox-has-urgent-mail",
+          timeoutSeconds: 90,
+          workExitCodes: [0, 3],
+          noWorkExitCodes: [2, 4],
+        },
+      },
+    });
+
+    callGatewayFromCli.mockClear();
+    await run([
+      "edit",
+      "job-1",
+      "--precheck",
+      "inbox-has-urgent-mail",
+      "--precheck-timeout-seconds",
+      "60",
+    ]);
+    expectRequest("cron.update", {
+      id: "job-1",
+      patch: {
+        precheck: {
+          command: "inbox-has-urgent-mail",
+          timeoutSeconds: 60,
+          workExitCodes: [0, 3],
+          noWorkExitCodes: [2, 4],
+        },
+      },
+    });
+  });
 });

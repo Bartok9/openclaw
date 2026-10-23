@@ -164,7 +164,10 @@ export async function assignCronPrecheckPatch(
     return;
   }
   if (precheckCli.command !== undefined) {
+    // A command edit replaces the probe, not the operator's timeout or exit-code map.
+    const existing = await readExisting();
     patch.precheck = {
+      ...existing.precheck,
       command: precheckCli.command,
       ...(precheckCli.timeoutSeconds !== undefined
         ? { timeoutSeconds: precheckCli.timeoutSeconds }
