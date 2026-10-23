@@ -145,5 +145,6 @@ export function canonicalCronPrecheck(value: unknown): unknown {
  * sees the field; dropping it would save a job that runs with no probe.
  */
 export function coerceStoredCronPrecheck(value: unknown): NonNullable<CronJob["precheck"]> {
+  // SAFETY: invalid prechecks stay stored so quarantine can reject them; callers parse before execution.
   return canonicalCronPrecheck(value) as NonNullable<CronJob["precheck"]>;
 }

@@ -65,7 +65,7 @@ function classifyExecResult(
 }
 
 function payloadToolsAllow(job: CronStoredJob): readonly string[] | undefined {
-  const toolsAllow = (job.payload as { toolsAllow?: unknown }).toolsAllow;
+  const toolsAllow: unknown = job.payload.toolsAllow;
   if (toolsAllow === undefined) {
     return undefined;
   }
