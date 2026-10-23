@@ -15,8 +15,8 @@ import { CronCliError } from "./cron-cli-error.js";
 import { isUnknownCronGetMethodError, listCronJobsFromGateway } from "./list-jobs.js";
 import { createCronOutputCommand } from "./output-mode.js";
 import {
+  assignCronPrecheckPatch,
   parseCronDeliveryPolicyOptions,
-  readCronPrecheckCliOptions,
   registerCronMutationOptions,
   resolveCronExecutionPolicyOptions,
 } from "./register.cron-options.js";
@@ -312,34 +312,7 @@ export function registerCronEditCommand(cron: Command) {
             patch.trigger = { ...existing.trigger, once: true };
           }
 
-          const precheckCli = readCronPrecheckCliOptions(opts);
-          if (
-            opts.clearPrecheck &&
-            (precheckCli.command !== undefined || precheckCli.timeoutSeconds !== undefined)
-          ) {
-            throw new CronCliError("Use --clear-precheck or precheck options, not both");
-          }
-          if (opts.clearPrecheck) {
-            patch.precheck = null;
-          } else if (precheckCli.command !== undefined) {
-            patch.precheck = {
-              command: precheckCli.command,
-              ...(precheckCli.timeoutSeconds !== undefined
-                ? { timeoutSeconds: precheckCli.timeoutSeconds }
-                : {}),
-            };
-          } else if (precheckCli.timeoutSeconds !== undefined) {
-            const existing = await readExistingCronJob();
-            if (!existing.precheck) {
-              throw new CronCliError(
-                "--precheck-timeout-seconds requires an existing precheck or --precheck",
-              );
-            }
-            patch.precheck = {
-              ...existing.precheck,
-              timeoutSeconds: precheckCli.timeoutSeconds,
-            };
-          }
+          await assignCronPrecheckPatch(opts, patch, readExistingCronJob);
 
           const scheduleRequest = resolveCronEditScheduleRequest(opts);
           if (scheduleRequest.kind === "direct") {

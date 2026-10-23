@@ -148,6 +148,42 @@ export function readCronPrecheckCliOptions(opts: Record<string, unknown>): {
   };
 }
 
+export async function assignCronPrecheckPatch(
+  opts: Record<string, unknown>,
+  patch: Record<string, unknown>,
+  readExisting: () => Promise<Pick<CronJob, "precheck">>,
+): Promise<void> {
+  const precheckCli = readCronPrecheckCliOptions(opts);
+  const hasPrecheckFlag =
+    precheckCli.command !== undefined || precheckCli.timeoutSeconds !== undefined;
+  if (opts.clearPrecheck && hasPrecheckFlag) {
+    throw new CronCliError("Use --clear-precheck or precheck options, not both");
+  }
+  if (opts.clearPrecheck) {
+    patch.precheck = null;
+    return;
+  }
+  if (precheckCli.command !== undefined) {
+    patch.precheck = {
+      command: precheckCli.command,
+      ...(precheckCli.timeoutSeconds !== undefined
+        ? { timeoutSeconds: precheckCli.timeoutSeconds }
+        : {}),
+    };
+    return;
+  }
+  if (precheckCli.timeoutSeconds === undefined) {
+    return;
+  }
+  const existing = await readExisting();
+  if (!existing.precheck) {
+    throw new CronCliError(
+      "--precheck-timeout-seconds requires an existing precheck or --precheck",
+    );
+  }
+  patch.precheck = { ...existing.precheck, timeoutSeconds: precheckCli.timeoutSeconds };
+}
+
 export async function resolveCronExecutionPolicyOptions(
   opts: Record<string, unknown>,
   loadExistingJob?: () => Promise<CronJob>,
