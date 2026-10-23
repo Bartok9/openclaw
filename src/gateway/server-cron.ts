@@ -76,6 +76,7 @@ import {
   fireStreamJob,
   formatOnExitRunSummary,
   resolveGatewayCronOriginDeliveryContext,
+  runGatewayCronPrecheck,
   runGatewayCronSessionEvent,
 } from "./server-cron-event-dispatch.js";
 import { describeCronInferenceMigration } from "./server-cron-inference.js";
@@ -440,13 +441,7 @@ export function buildGatewayCronService(params: {
       resolveGatewayContext: scheduledGatewayContextResolver,
       resolvePluginRegistry: params.resolvePluginRegistry,
     }),
-    runJobPrecheck: async (request) => {
-      const { runCronJobPrecheck } = await import("../cron/job-precheck-run.js");
-      return await runCronJobPrecheck({
-        ...request,
-        config: getRuntimeConfig(),
-      });
-    },
+    runJobPrecheck: (request) => runGatewayCronPrecheck(request, getRuntimeConfig),
     runCommandJob: async ({ job, abortSignal, deliveryAttemptFence }) => {
       const result = await runCronCommandJob({
         job,
@@ -469,17 +464,12 @@ export function buildGatewayCronService(params: {
       });
       return { ...result, ...completion };
     },
-    sendCronWebhook: async ({ job, event, abortSignal, onDeliveryState, assertCurrent }) => {
-      return await sendGatewayCronWebhook({
-        job,
-        event,
-        abortSignal,
-        onDeliveryState,
-        assertCurrent,
+    sendCronWebhook: (request) =>
+      sendGatewayCronWebhook({
+        ...request,
         webhookToken: params.cfg.cron?.webhookToken,
         ssrfPolicy: webhookSsrfPolicy,
-      });
-    },
+      }),
     runScriptJob: async (request) => {
       const { job, abortSignal, deliveryAttemptFence } = request;
       if (!scriptRuntime || job.payload.kind !== "script") {
