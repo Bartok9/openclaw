@@ -1,22 +1,6 @@
+import { createMemorySearchDeadlineControl } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPausedDeadline } from "./paused-deadline.js";
-
-function createControl() {
-  const listeners = new Set<(action: "pause" | "resume") => void>();
-  return {
-    subscribe(listener: (action: "pause" | "resume") => void) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    report(action: "pause" | "resume") {
-      for (const listener of listeners) {
-        listener(action);
-      }
-    },
-  };
-}
 
 describe("createPausedDeadline", () => {
   afterEach(() => {
@@ -52,7 +36,7 @@ describe("createPausedDeadline", () => {
     vi.spyOn(Date, "now").mockReturnValue(wall);
     const controller = new AbortController();
     let expired = false;
-    const control = createControl();
+    const control = createMemorySearchDeadlineControl();
     const deadline = createPausedDeadline({
       kind: "embedding",
       timeoutMs: 10_000,
